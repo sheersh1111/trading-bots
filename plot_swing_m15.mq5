@@ -1,10 +1,10 @@
 //+------------------------------------------------------------------+
 //| plot_swing_m15.mq5                                               |
 //| M15 swing leg memory (20 completed legs) + optional OBJ_TREND /  |
-//| High–Low labels + M15 FVG memory & rectangles (bar 1 vs bar 3).   |
+//| High–Low labels + M15 FVG memory & rectangles (bar 1 vs bar 3).  |
 //+------------------------------------------------------------------+
 #property copyright ""
-#property version   "1.01"
+#property version   "1.04"
 
 const ENUM_TIMEFRAMES ChartTf = PERIOD_M15;
 
@@ -129,13 +129,13 @@ void ProcessSwingStep(SwingState &swingState, const ENUM_TIMEFRAMES timeframe)
       return;
    }
 
-   double sumRangeTenPriorBars = 0.0;
-   for(int barShiftIndex = 2; barShiftIndex <= 11; barShiftIndex++)
-      sumRangeTenPriorBars +=
+   double sumRangeFivePriorBars = 0.0;
+   for(int barShiftIndex = 2; barShiftIndex <= 6; barShiftIndex++)
+      sumRangeFivePriorBars +=
          (iHigh(_Symbol, timeframe, barShiftIndex) - iLow(_Symbol, timeframe, barShiftIndex));
-   const double averageRangeTenBars = sumRangeTenPriorBars / 10.0;
+   const double averageRangeFiveBars = sumRangeFivePriorBars / 5.0;
 
-   const bool isDecentMovement = (lastClosedBarRange > (averageRangeTenBars * 1.0));
+   const bool isDecentMovement = (lastClosedBarRange > (averageRangeFiveBars * 1.0));
    if(isDecentMovement && candleDirection == swingState.currentSwingLeg.swingDirection)
       swingState.priceAnchorLevel = (lastClosedBarHigh + lastClosedBarLow) / 2.0;
 
