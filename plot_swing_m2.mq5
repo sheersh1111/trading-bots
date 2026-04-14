@@ -3,7 +3,7 @@
 //| M2 BOS-opposite FVG + M15 BOS gate + H4 demand/supply path OR       |
 //+------------------------------------------------------------------+
 #property copyright ""
-#property version   "1.33"
+#property version   "1.38"
 
 #include <Trade\Trade.mqh>
 
@@ -23,6 +23,7 @@ input int  InputMaximumFairValueGapRectangles = 120;
 
 input group "H4 alignment (HTF buffers — visuals + trade gate)"
 input bool   InputEnableHtfTradeGate = true;       // M15 BOS + H4 demand/supply path & price OR
+input bool   InputHtfAllowCounterTrendFvg = false; // If false: M15 BOS must match FVG (no bull-M15 + bear-FVG etc.)
 input double InputH4AlignmentBufferPercentOfChartRange = 3.5; // ±% of H4 chart-range height around levels
 input int    InputH4ChartRangeBarCount = 80;         // H4 bars for height reference (buffer + FVG min-gap)
 input int    InputH4MaxSwingLegsToScan = 6;        // Newest N H4 legs for buffer band drawing
@@ -42,9 +43,12 @@ input color  InputM15SwingTrendLineColor = clrGold;
 input bool   InputDrawM15FairValueGapZones = true; // M15 FVG rectangles (bar 1 vs 3, same min-% as M2)
 
 input group "FVG trade (M2)"
-input bool   InputEnableAutomatedTrading = false;  // Send market/limit orders (false = log only)
+input bool   InputEnableAutomatedTrading = true;   // Send market/limit orders (false = log only)
 input ulong  InputExpertMagicNumber = 940031;
-input double InputRiskUsdPerPosition = 50.0;       // USD risk each for 2R and 3R position
+input double InputRiskPercentPerTrade = 1.0;       // %% of balance for this setup; split 50/50 between 2R and 3R legs
+input double InputFvgStopBufferPercentOfM2Range = 3.0; // SL padding beyond FVG edge / path (%% of M2 range height)
+input int    InputFvgPlanAMaxM2BarShift = 3;      // Plan A while iBarShift(FVG) <= this (then Plan B path SL)
+input int    InputFvgTradeMaxM2BarShift = 24;     // Stop trade attempts when FVG bar is older than this shift
 
 // --- swing structs (detect_swing logic) ---
 struct Swing
@@ -108,13 +112,16 @@ int            globalLiquidityPoolCount = 0;
 
 datetime globalLastSwingTimeframeBarOpenTime = 0;
 int      globalBosMarkedFairValueGapRectangleSequence = 0;
-datetime globalLastProcessedFairValueGapTradeBarTime = 0;
 
 BosOppositeFvgWatch globalBosOppositeFvgWatchList[BosOppositeFvgWatchCapacity];
 int                   globalBosOppositeFvgWatchCount = 0;
 
 BosOppositeFairValueGapMemory globalBosOppositeFairValueGapMemory[BosOppositeFairValueGapMemoryCapacity];
 int                           globalBosOppositeFairValueGapMemoryCount = 0;
+
+#define FvgPlanAStopHitFormationCapacity 64
+datetime globalFvgPlanAStopHitFormations[FvgPlanAStopHitFormationCapacity];
+int      globalFvgPlanAStopHitFormationCount = 0;
 
 struct M15FairValueGapMemory
 {
@@ -208,12 +215,22 @@ bool   GetBosOppositeFairValueGapFromMemoryForBarOpenTime(const datetime barOpen
                                                         double &outPathMaxHighSinceBos);
 
 double CalculateVolumeForFixedUsdRisk(const ENUM_ORDER_TYPE orderType, const double entryPrice,
-                                        const double stopLossPrice, const double riskUsd);
+                                      const double stopLossPrice, const double riskAccountCurrency);
 void   ApplyTradeFillingModeFromSymbol();
 bool   StopsDistanceAllowed(const bool isBuy, const double entryPrice, const double stopLossPrice,
                             const double takeProfitPrice);
 
 void   TryExecuteFairValueGapTradePlan();
+
+double M2FairValueGapStopBufferPrice();
+bool   HasOurFvgOpenPositionOnSymbol();
+bool   HasOurFvgPendingForFormation(const datetime formationTime);
+int    GetOurFvgPendingPlanKindForFormation(const datetime formationTime);
+void   CancelOurFvgPendingOrdersForFormation(const datetime formationTime);
+
+bool   TryParseFormationTimeFromM2FvgOrderComment(const string &comment, datetime &outFormation);
+void   RegisterFvgPlanAStopLossHit(const datetime formationTime);
+bool   IsFvgPlanBSkippedAfterPlanAStopHit(const datetime formationTime);
 
 void   UpdateBosOppositeFvgWatchPathExtremes();
 void   ProcessM15ContextOnNewM15Bar();
@@ -315,6 +332,62 @@ void OnDeinit(const int deinitializationReason)
    ObjectsDeleteAll(0, ChartObjectNamePrefixH4DemandSupply, -1, -1);
    ObjectsDeleteAll(0, ChartObjectNamePrefixHtfDirectionHud, -1, -1);
    ChartRedraw(0);
+}
+
+//+------------------------------------------------------------------+
+void OnTradeTransaction(const MqlTradeTransaction &trans,
+                        const MqlTradeRequest &request,
+                        const MqlTradeResult &result)
+{
+   if(trans.type != TRADE_TRANSACTION_DEAL_ADD)
+      return;
+   if(trans.deal == 0)
+      return;
+   if(!HistoryDealSelect(trans.deal))
+      return;
+   if(HistoryDealGetString(trans.deal, DEAL_SYMBOL) != _Symbol)
+      return;
+   if((ulong)HistoryDealGetInteger(trans.deal, DEAL_MAGIC) != InputExpertMagicNumber)
+      return;
+   if((ENUM_DEAL_REASON)HistoryDealGetInteger(trans.deal, DEAL_REASON) != DEAL_REASON_SL)
+      return;
+   if((ENUM_DEAL_ENTRY)HistoryDealGetInteger(trans.deal, DEAL_ENTRY) != DEAL_ENTRY_OUT)
+      return;
+
+   const string dealComment = HistoryDealGetString(trans.deal, DEAL_COMMENT);
+   datetime     formationTime = 0;
+   if(TryParseFormationTimeFromM2FvgOrderComment(dealComment, formationTime))
+   {
+      RegisterFvgPlanAStopLossHit(formationTime);
+      return;
+   }
+
+   const ulong positionId = (ulong)HistoryDealGetInteger(trans.deal, DEAL_POSITION_ID);
+   if(positionId == 0)
+      return;
+   if(!HistorySelectByPosition(positionId))
+      return;
+   const int dealsTotal = HistoryDealsTotal();
+   for(int i = dealsTotal - 1; i >= 0; i--)
+   {
+      const ulong dealTicket = HistoryDealGetTicket(i);
+      if(dealTicket == 0)
+         continue;
+      if(!HistoryDealSelect(dealTicket))
+         continue;
+      if((ENUM_DEAL_ENTRY)HistoryDealGetInteger(dealTicket, DEAL_ENTRY) != DEAL_ENTRY_IN)
+         continue;
+      if(HistoryDealGetString(dealTicket, DEAL_SYMBOL) != _Symbol)
+         continue;
+      if((ulong)HistoryDealGetInteger(dealTicket, DEAL_MAGIC) != InputExpertMagicNumber)
+         continue;
+      const string openComment = HistoryDealGetString(dealTicket, DEAL_COMMENT);
+      if(TryParseFormationTimeFromM2FvgOrderComment(openComment, formationTime))
+      {
+         RegisterFvgPlanAStopLossHit(formationTime);
+         return;
+      }
+   }
 }
 
 //+------------------------------------------------------------------+
@@ -602,9 +675,6 @@ void SwingCloseM15Context(SwingState &swingState, const ENUM_TIMEFRAMES timefram
 {
    swingState.currentSwingLeg.legEndTime = iTime(_Symbol, timeframe, lastClosedBarShift);
 
-   // M15 leg chart objects (OBJ_TREND + High/Low labels) disabled — swingHistory below still updated.
-   // Re-enable: uncomment block and use InputDrawM15SwingLegVisuals again.
-   /*
    if(InputDrawM15SwingLegVisuals)
    {
       const string chartObjectName =
@@ -636,7 +706,6 @@ void SwingCloseM15Context(SwingState &swingState, const ENUM_TIMEFRAMES timefram
       DrawSwingLegLabel(ChartObjectNamePrefixM15SwingLabelText, swingState.currentSwingLeg.legEndTime,
                         trendLineEndPrice, isUplegSwingDirection);
    }
-   */
 
    if(swingState.swingHistoryCount < 20)
    {
@@ -1966,7 +2035,7 @@ void ApplyTradeFillingModeFromSymbol()
 
 //+------------------------------------------------------------------+
 double CalculateVolumeForFixedUsdRisk(const ENUM_ORDER_TYPE orderType, const double entryPrice,
-                                      const double stopLossPrice, const double riskUsd)
+                                      const double stopLossPrice, const double riskAccountCurrency)
 {
    double profitAtStop = 0.0;
    if(!OrderCalcProfit(orderType, _Symbol, 1.0, entryPrice, stopLossPrice, profitAtStop))
@@ -1976,7 +2045,7 @@ double CalculateVolumeForFixedUsdRisk(const ENUM_ORDER_TYPE orderType, const dou
    if(lossPerLot <= 0.0)
       return 0.0;
 
-   double volume = riskUsd / lossPerLot;
+   double volume = riskAccountCurrency / lossPerLot;
    const double volumeStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
    const double volumeMin  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
    const double volumeMax  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
@@ -2015,6 +2084,153 @@ bool StopsDistanceAllowed(const bool isBuy, const double entryPrice, const doubl
          return false;
    }
    return true;
+}
+
+//+------------------------------------------------------------------+
+double M2FairValueGapStopBufferPrice()
+{
+   const double h = ReferenceChartHeightForFairValueGapFilter(SwingTimeframe);
+   if(h <= 0.0)
+      return 0.0;
+   return h * (InputFvgStopBufferPercentOfM2Range / 100.0);
+}
+
+//+------------------------------------------------------------------+
+bool HasOurFvgOpenPositionOnSymbol()
+{
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      const ulong ticket = PositionGetTicket(i);
+      if(ticket == 0)
+         continue;
+      if(!PositionSelectByTicket(ticket))
+         continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol)
+         continue;
+      if((ulong)PositionGetInteger(POSITION_MAGIC) != InputExpertMagicNumber)
+         continue;
+      return true;
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+bool HasOurFvgPendingForFormation(const datetime formationTime)
+{
+   const string tag = IntegerToString((long)formationTime);
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      const ulong ticket = OrderGetTicket(i);
+      if(ticket == 0)
+         continue;
+      if(!OrderSelect(ticket))
+         continue;
+      if(OrderGetString(ORDER_SYMBOL) != _Symbol)
+         continue;
+      if((ulong)OrderGetInteger(ORDER_MAGIC) != InputExpertMagicNumber)
+         continue;
+      if(StringFind(OrderGetString(ORDER_COMMENT), tag) >= 0)
+         return true;
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+int GetOurFvgPendingPlanKindForFormation(const datetime formationTime)
+{
+   const string tag = IntegerToString((long)formationTime);
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      const ulong ticket = OrderGetTicket(i);
+      if(ticket == 0)
+         continue;
+      if(!OrderSelect(ticket))
+         continue;
+      if(OrderGetString(ORDER_SYMBOL) != _Symbol)
+         continue;
+      if((ulong)OrderGetInteger(ORDER_MAGIC) != InputExpertMagicNumber)
+         continue;
+      const string c = OrderGetString(ORDER_COMMENT);
+      if(StringFind(c, tag) < 0)
+         continue;
+      if(StringFind(c, "PlanA") >= 0)
+         return 0;
+      if(StringFind(c, "PlanB") >= 0)
+         return 1;
+   }
+   return -1;
+}
+
+//+------------------------------------------------------------------+
+void CancelOurFvgPendingOrdersForFormation(const datetime formationTime)
+{
+   const string tag = IntegerToString((long)formationTime);
+   tradeLayer.SetExpertMagicNumber(InputExpertMagicNumber);
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      const ulong ticket = OrderGetTicket(i);
+      if(ticket == 0)
+         continue;
+      if(!OrderSelect(ticket))
+         continue;
+      if(OrderGetString(ORDER_SYMBOL) != _Symbol)
+         continue;
+      if((ulong)OrderGetInteger(ORDER_MAGIC) != InputExpertMagicNumber)
+         continue;
+      if(StringFind(OrderGetString(ORDER_COMMENT), tag) < 0)
+         continue;
+      tradeLayer.OrderDelete(ticket);
+   }
+}
+
+//+------------------------------------------------------------------+
+bool TryParseFormationTimeFromM2FvgOrderComment(const string &comment, datetime &outFormation)
+{
+   outFormation = 0;
+   if(StringFind(comment, "PlanA") < 0)
+      return false;
+   string trimmed = comment;
+   StringTrimRight(trimmed);
+   string parts[];
+   const int n = StringSplit(trimmed, ' ', parts);
+   if(n < 1)
+      return false;
+   const long v = StringToInteger(parts[n - 1]);
+   if(v <= 0)
+      return false;
+   outFormation = (datetime)v;
+   return true;
+}
+
+//+------------------------------------------------------------------+
+void RegisterFvgPlanAStopLossHit(const datetime formationTime)
+{
+   if(formationTime <= 0)
+      return;
+   for(int i = 0; i < globalFvgPlanAStopHitFormationCount; i++)
+   {
+      if(globalFvgPlanAStopHitFormations[i] == formationTime)
+         return;
+   }
+   if(globalFvgPlanAStopHitFormationCount < FvgPlanAStopHitFormationCapacity)
+   {
+      globalFvgPlanAStopHitFormations[globalFvgPlanAStopHitFormationCount++] = formationTime;
+      return;
+   }
+   for(int j = 1; j < FvgPlanAStopHitFormationCapacity; j++)
+      globalFvgPlanAStopHitFormations[j - 1] = globalFvgPlanAStopHitFormations[j];
+   globalFvgPlanAStopHitFormations[FvgPlanAStopHitFormationCapacity - 1] = formationTime;
+}
+
+//+------------------------------------------------------------------+
+bool IsFvgPlanBSkippedAfterPlanAStopHit(const datetime formationTime)
+{
+   for(int i = 0; i < globalFvgPlanAStopHitFormationCount; i++)
+   {
+      if(globalFvgPlanAStopHitFormations[i] == formationTime)
+         return true;
+   }
+   return false;
 }
 
 //+------------------------------------------------------------------+
@@ -2338,6 +2554,13 @@ bool PassesHtfTradeGate(const bool isBullishFairValueGap, const double pathMinLo
       return false;
    }
 
+   // Reaching here => M15 BOS and FVG direction differ ("counter-trend" FVG vs M15).
+   if(!InputHtfAllowCounterTrendFvg)
+   {
+      outReason = "M15 BOS not aligned with FVG (enable InputHtfAllowCounterTrendFvg for counter-trend)";
+      return false;
+   }
+
    if(isBullishFairValueGap && m15 == -1)
    {
       const double p = SymbolInfoDouble(_Symbol, SYMBOL_BID);
@@ -2363,237 +2586,277 @@ bool PassesHtfTradeGate(const bool isBullishFairValueGap, const double pathMinLo
 //+------------------------------------------------------------------+
 void TryExecuteFairValueGapTradePlan()
 {
-   const datetime fairValueGapBarOpenTime = iTime(_Symbol, SwingTimeframe, 1);
-   if(fairValueGapBarOpenTime == globalLastProcessedFairValueGapTradeBarTime)
+   if(HasOurFvgOpenPositionOnSymbol())
       return;
 
-   bool isBullishFairValueGap;
-   double fairValueGapZoneLowPrice;
-   double fairValueGapZoneHighPrice;
-   double bosBarClosePrice;
-   double pathMinLowSinceBos;
-   double pathMaxHighSinceBos;
-   if(!GetBosOppositeFairValueGapFromMemoryForBarOpenTime(fairValueGapBarOpenTime, isBullishFairValueGap,
-                                                          fairValueGapZoneLowPrice,
-                                                          fairValueGapZoneHighPrice,
-                                                          bosBarClosePrice, pathMinLowSinceBos,
-                                                          pathMaxHighSinceBos))
-      return;
+   const datetime lastClosedM2Open = iTime(_Symbol, SwingTimeframe, 1);
 
-   string   htfGateReason = "";
-   const bool htfGateOk =
-      PassesHtfTradeGate(isBullishFairValueGap, pathMinLowSinceBos, pathMaxHighSinceBos, htfGateReason);
-
-   if(InputPrintHtfTradeDecision)
+   for(int memoryIndex = globalBosOppositeFairValueGapMemoryCount - 1; memoryIndex >= 0; memoryIndex--)
    {
-      static datetime s_lastHtfDecisionPrintBar = 0;
-      if(fairValueGapBarOpenTime != s_lastHtfDecisionPrintBar)
+      const datetime formationTime = globalBosOppositeFairValueGapMemory[memoryIndex].fairValueGapBarOpenTime;
+      const int      barShift      = iBarShift(_Symbol, SwingTimeframe, formationTime);
+      if(barShift < 0)
+         continue;
+      if(barShift > InputFvgTradeMaxM2BarShift)
+         continue;
+
+      const bool   isBullishFairValueGap = globalBosOppositeFairValueGapMemory[memoryIndex].isBullishFairValueGap;
+      const double fairValueGapZoneLowPrice  = globalBosOppositeFairValueGapMemory[memoryIndex].fairValueGapZoneLowPrice;
+      const double fairValueGapZoneHighPrice = globalBosOppositeFairValueGapMemory[memoryIndex].fairValueGapZoneHighPrice;
+      const double pathMinLowSinceBos  = globalBosOppositeFairValueGapMemory[memoryIndex].pathMinLowSinceBos;
+      const double pathMaxHighSinceBos = globalBosOppositeFairValueGapMemory[memoryIndex].pathMaxHighSinceBos;
+
+      string   htfGateReason = "";
+      const bool htfGateOk =
+         PassesHtfTradeGate(isBullishFairValueGap, pathMinLowSinceBos, pathMaxHighSinceBos, htfGateReason);
+
+      if(memoryIndex == globalBosOppositeFairValueGapMemoryCount - 1 && InputPrintHtfTradeDecision)
       {
-         s_lastHtfDecisionPrintBar = fairValueGapBarOpenTime;
-         if(htfGateOk)
-            Print("plot_swing_m2: HTF trade: YES");
+         static datetime s_lastHtfPrintFormation = 0;
+         static datetime s_lastHtfPrintBarOpen   = 0;
+         if(formationTime != s_lastHtfPrintFormation || lastClosedM2Open != s_lastHtfPrintBarOpen)
+         {
+            s_lastHtfPrintFormation = formationTime;
+            s_lastHtfPrintBarOpen   = lastClosedM2Open;
+            if(htfGateOk)
+               Print("plot_swing_m2: HTF trade: YES");
+            else
+               Print("plot_swing_m2: HTF trade: NO — ", htfGateReason);
+         }
+      }
+
+      if(!htfGateOk)
+         continue;
+
+      const bool usePlanA = (barShift <= InputFvgPlanAMaxM2BarShift);
+
+      if(!usePlanA && IsFvgPlanBSkippedAfterPlanAStopHit(formationTime))
+         continue;
+
+      if(HasOurFvgPendingForFormation(formationTime))
+      {
+         const int pendingKind = GetOurFvgPendingPlanKindForFormation(formationTime);
+         const int wantKind    = usePlanA ? 0 : 1;
+         if(pendingKind == wantKind)
+            return;
+         CancelOurFvgPendingOrdersForFormation(formationTime);
+      }
+
+      const double higherEndOfFairValueGap = MathMax(fairValueGapZoneLowPrice, fairValueGapZoneHighPrice);
+      const double lowerEndOfFairValueGap  = MathMin(fairValueGapZoneLowPrice, fairValueGapZoneHighPrice);
+      const double buf                     = M2FairValueGapStopBufferPrice();
+
+      double stopLossPrice;
+      if(usePlanA)
+      {
+         if(isBullishFairValueGap)
+            stopLossPrice = lowerEndOfFairValueGap - buf;
          else
-            Print("plot_swing_m2: HTF trade: NO — ", htfGateReason);
-      }
-   }
-
-   if(!htfGateOk)
-      return;
-
-   const double higherEndOfFairValueGap =
-      MathMax(fairValueGapZoneLowPrice, fairValueGapZoneHighPrice);
-   const double lowerEndOfFairValueGap =
-      MathMin(fairValueGapZoneLowPrice, fairValueGapZoneHighPrice);
-
-   const double pointSize = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-   double       stopLossPrice;
-   if(isBullishFairValueGap)
-      stopLossPrice = lowerEndOfFairValueGap - pointSize;
-   else
-      stopLossPrice = higherEndOfFairValueGap + pointSize;
-
-   const double currentBid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   const double currentAsk = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-
-   bool   useMarketOrder = false;
-   double entryPrice     = 0.0;
-
-   // BOS opposite FVG only. Long: bid inside gap -> market @ ask. etc.
-   if(isBullishFairValueGap)
-   {
-      const bool bidInsideFairValueGap =
-         (currentBid >= lowerEndOfFairValueGap && currentBid <= higherEndOfFairValueGap);
-      if(bidInsideFairValueGap)
-      {
-         useMarketOrder = true;
-         entryPrice     = currentAsk;
-      }
-      else if(currentBid > higherEndOfFairValueGap)
-      {
-         useMarketOrder = false;
-         entryPrice     = NormalizeDouble(higherEndOfFairValueGap, _Digits);
+            stopLossPrice = higherEndOfFairValueGap + buf;
       }
       else
       {
-         useMarketOrder = false;
-         entryPrice     = NormalizeDouble(lowerEndOfFairValueGap, _Digits);
+         if(isBullishFairValueGap)
+            stopLossPrice = pathMinLowSinceBos - buf;
+         else
+            stopLossPrice = pathMaxHighSinceBos + buf;
       }
 
-      if(entryPrice <= stopLossPrice)
-         return;
-   }
-   else
-   {
-      // Short: ask inside gap -> market @ bid. Ask below gap -> limit @ lower FVG edge. Ask above gap -> limit @ higher FVG edge.
-      const bool askInsideFairValueGap =
-         (currentAsk >= lowerEndOfFairValueGap && currentAsk <= higherEndOfFairValueGap);
-      if(askInsideFairValueGap)
-      {
-         useMarketOrder = true;
-         entryPrice     = currentBid;
-      }
-      else if(currentAsk < lowerEndOfFairValueGap)
-      {
-         useMarketOrder = false;
-         entryPrice     = NormalizeDouble(lowerEndOfFairValueGap, _Digits);
-      }
-      else
-      {
-         useMarketOrder = false;
-         entryPrice     = NormalizeDouble(higherEndOfFairValueGap, _Digits);
-      }
+      const double currentBid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      const double currentAsk = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
 
-      if(entryPrice >= stopLossPrice)
-         return;
-   }
+      bool   useMarketOrder = false;
+      double entryPrice     = 0.0;
 
-   const double riskPerUnit = MathAbs(entryPrice - stopLossPrice);
-   if(riskPerUnit <= SymbolInfoDouble(_Symbol, SYMBOL_POINT))
-      return;
-
-   double takeProfitTwoRewardMultiple = 0.0;
-   double takeProfitThreeRewardMultiple = 0.0;
-   if(isBullishFairValueGap)
-   {
-      takeProfitTwoRewardMultiple   = NormalizeDouble(entryPrice + 2.0 * riskPerUnit, _Digits);
-      takeProfitThreeRewardMultiple = NormalizeDouble(entryPrice + 3.0 * riskPerUnit, _Digits);
-   }
-   else
-   {
-      takeProfitTwoRewardMultiple   = NormalizeDouble(entryPrice - 2.0 * riskPerUnit, _Digits);
-      takeProfitThreeRewardMultiple = NormalizeDouble(entryPrice - 3.0 * riskPerUnit, _Digits);
-   }
-
-   const double normalizedStopLoss = NormalizeDouble(stopLossPrice, _Digits);
-   const double normalizedEntry    = NormalizeDouble(entryPrice, _Digits);
-
-   if(!StopsDistanceAllowed(isBullishFairValueGap, normalizedEntry, normalizedStopLoss,
-                            takeProfitTwoRewardMultiple))
-   {
-      Print("plot_swing_m2: broker stops level too large for this entry/SL/TP.");
-      return;
-   }
-
-   const ENUM_ORDER_TYPE marketOrderType =
-      isBullishFairValueGap ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
-
-   const double volumeTwoR =
-      CalculateVolumeForFixedUsdRisk(marketOrderType, normalizedEntry, normalizedStopLoss,
-                                     InputRiskUsdPerPosition);
-   const double volumeThreeR =
-      CalculateVolumeForFixedUsdRisk(marketOrderType, normalizedEntry, normalizedStopLoss,
-                                     InputRiskUsdPerPosition);
-   if(volumeTwoR <= 0.0 || volumeThreeR <= 0.0)
-   {
-      Print("plot_swing_m2: volume from USD risk is zero — check symbol / contract size.");
-      return;
-   }
-
-   if(!useMarketOrder)
-   {
-      if(isBullishFairValueGap && normalizedEntry >= currentAsk)
-      {
-         Print("plot_swing_m2: BuyLimit invalid — entry must be below ask. entry=", normalizedEntry,
-               " ask=", currentAsk);
-         return;
-      }
-      if(!isBullishFairValueGap && normalizedEntry <= currentBid)
-      {
-         Print("plot_swing_m2: SellLimit invalid — entry must be above bid. entry=", normalizedEntry,
-               " bid=", currentBid);
-         return;
-      }
-   }
-
-   globalLastProcessedFairValueGapTradeBarTime = fairValueGapBarOpenTime;
-
-   if(!InputEnableAutomatedTrading)
-   {
-      Print("plot_swing_m2: BOS opposite FVG setup OK (log only). bullishFvg=", isBullishFairValueGap,
-            " market=", useMarketOrder, " entry=", normalizedEntry, " sl=", normalizedStopLoss,
-            " tp2R=", takeProfitTwoRewardMultiple, " tp3R=", takeProfitThreeRewardMultiple,
-            " vol2R=", volumeTwoR, " vol3R=", volumeThreeR);
-      return;
-   }
-
-   tradeLayer.SetExpertMagicNumber(InputExpertMagicNumber);
-   tradeLayer.SetDeviationInPoints(30);
-   ApplyTradeFillingModeFromSymbol();
-
-   const string commentTwoR   = "M2 BOS FVG 2R";
-   const string commentThreeR = "M2 BOS FVG 3R";
-
-   bool orderTwoResult   = false;
-   bool orderThreeResult = false;
-
-   if(useMarketOrder)
-   {
       if(isBullishFairValueGap)
       {
-         orderTwoResult =
-            tradeLayer.Buy(volumeTwoR, _Symbol, 0.0, normalizedStopLoss, takeProfitTwoRewardMultiple,
-                           commentTwoR);
-         orderThreeResult =
-            tradeLayer.Buy(volumeThreeR, _Symbol, 0.0, normalizedStopLoss, takeProfitThreeRewardMultiple,
-                           commentThreeR);
+         const bool bidInsideFairValueGap =
+            (currentBid >= lowerEndOfFairValueGap && currentBid <= higherEndOfFairValueGap);
+         if(bidInsideFairValueGap)
+         {
+            useMarketOrder = true;
+            entryPrice     = currentAsk;
+         }
+         else if(currentBid > higherEndOfFairValueGap)
+         {
+            useMarketOrder = false;
+            entryPrice     = NormalizeDouble(higherEndOfFairValueGap, _Digits);
+         }
+         else
+         {
+            useMarketOrder = false;
+            entryPrice     = NormalizeDouble(lowerEndOfFairValueGap, _Digits);
+         }
+
+         if(entryPrice <= stopLossPrice)
+            continue;
       }
       else
       {
-         orderTwoResult =
-            tradeLayer.Sell(volumeTwoR, _Symbol, 0.0, normalizedStopLoss, takeProfitTwoRewardMultiple,
-                            commentTwoR);
-         orderThreeResult =
-            tradeLayer.Sell(volumeThreeR, _Symbol, 0.0, normalizedStopLoss, takeProfitThreeRewardMultiple,
-                            commentThreeR);
+         const bool askInsideFairValueGap =
+            (currentAsk >= lowerEndOfFairValueGap && currentAsk <= higherEndOfFairValueGap);
+         if(askInsideFairValueGap)
+         {
+            useMarketOrder = true;
+            entryPrice     = currentBid;
+         }
+         else if(currentAsk < lowerEndOfFairValueGap)
+         {
+            useMarketOrder = false;
+            entryPrice     = NormalizeDouble(lowerEndOfFairValueGap, _Digits);
+         }
+         else
+         {
+            useMarketOrder = false;
+            entryPrice     = NormalizeDouble(higherEndOfFairValueGap, _Digits);
+         }
+
+         if(entryPrice >= stopLossPrice)
+            continue;
       }
-   }
-   else
-   {
+
+      const double riskPerUnit = MathAbs(entryPrice - stopLossPrice);
+      if(riskPerUnit <= SymbolInfoDouble(_Symbol, SYMBOL_POINT))
+         continue;
+
+      double takeProfitTwoRewardMultiple = 0.0;
+      double takeProfitThreeRewardMultiple = 0.0;
       if(isBullishFairValueGap)
       {
-         orderTwoResult =
-            tradeLayer.BuyLimit(volumeTwoR, normalizedEntry, _Symbol, normalizedStopLoss,
-                                takeProfitTwoRewardMultiple, ORDER_TIME_GTC, 0, commentTwoR);
-         orderThreeResult =
-            tradeLayer.BuyLimit(volumeThreeR, normalizedEntry, _Symbol, normalizedStopLoss,
-                                takeProfitThreeRewardMultiple, ORDER_TIME_GTC, 0, commentThreeR);
+         takeProfitTwoRewardMultiple   = NormalizeDouble(entryPrice + 2.0 * riskPerUnit, _Digits);
+         takeProfitThreeRewardMultiple = NormalizeDouble(entryPrice + 3.0 * riskPerUnit, _Digits);
       }
       else
       {
-         orderTwoResult =
-            tradeLayer.SellLimit(volumeTwoR, normalizedEntry, _Symbol, normalizedStopLoss,
-                                 takeProfitTwoRewardMultiple, ORDER_TIME_GTC, 0, commentTwoR);
-         orderThreeResult =
-            tradeLayer.SellLimit(volumeThreeR, normalizedEntry, _Symbol, normalizedStopLoss,
-                                 takeProfitThreeRewardMultiple, ORDER_TIME_GTC, 0, commentThreeR);
+         takeProfitTwoRewardMultiple   = NormalizeDouble(entryPrice - 2.0 * riskPerUnit, _Digits);
+         takeProfitThreeRewardMultiple = NormalizeDouble(entryPrice - 3.0 * riskPerUnit, _Digits);
       }
-   }
 
-   if(orderTwoResult || orderThreeResult)
-      Print("plot_swing_m2: orders sent. twoR=", orderTwoResult, " threeR=", orderThreeResult);
-   else
-      Print("plot_swing_m2: order send failed. retcode=", tradeLayer.ResultRetcode(), " ",
-            tradeLayer.ResultRetcodeDescription());
+      const double normalizedStopLoss = NormalizeDouble(stopLossPrice, _Digits);
+      const double normalizedEntry    = NormalizeDouble(entryPrice, _Digits);
+
+      if(!StopsDistanceAllowed(isBullishFairValueGap, normalizedEntry, normalizedStopLoss,
+                             takeProfitTwoRewardMultiple))
+      {
+         Print("plot_swing_m2: broker stops level too large for this entry/SL/TP. plan=",
+               (usePlanA ? "A" : "B"), " formation=", formationTime);
+         continue;
+      }
+
+      const ENUM_ORDER_TYPE marketOrderType =
+         isBullishFairValueGap ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+
+      const double accountBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+      if(accountBalance <= 0.0 || InputRiskPercentPerTrade <= 0.0)
+      {
+         Print("plot_swing_m2: risk sizing skipped — balance or InputRiskPercentPerTrade invalid.");
+         continue;
+      }
+      const double riskAccountCurrencyTotal =
+         accountBalance * (InputRiskPercentPerTrade / 100.0);
+      const double riskAccountCurrencyPerLeg = riskAccountCurrencyTotal / 2.0;
+
+      const double volumeTwoR =
+         CalculateVolumeForFixedUsdRisk(marketOrderType, normalizedEntry, normalizedStopLoss,
+                                        riskAccountCurrencyPerLeg);
+      const double volumeThreeR =
+         CalculateVolumeForFixedUsdRisk(marketOrderType, normalizedEntry, normalizedStopLoss,
+                                        riskAccountCurrencyPerLeg);
+      if(volumeTwoR <= 0.0 || volumeThreeR <= 0.0)
+      {
+         Print("plot_swing_m2: volume from risk %% is zero — check symbol / contract size.");
+         continue;
+      }
+
+      if(!useMarketOrder)
+      {
+         if(isBullishFairValueGap && normalizedEntry >= currentAsk)
+         {
+            Print("plot_swing_m2: BuyLimit invalid — entry must be below ask. entry=", normalizedEntry,
+                  " ask=", currentAsk);
+            continue;
+         }
+         if(!isBullishFairValueGap && normalizedEntry <= currentBid)
+         {
+            Print("plot_swing_m2: SellLimit invalid — entry must be above bid. entry=", normalizedEntry,
+                  " bid=", currentBid);
+            continue;
+         }
+      }
+
+      const string planTag            = usePlanA ? "PlanA" : "PlanB";
+      const string formationTag       = IntegerToString((long)formationTime);
+      const string commentTwoR        = "M2 BOS FVG 2R " + planTag + " " + formationTag;
+      const string commentThreeR      = "M2 BOS FVG 3R " + planTag + " " + formationTag;
+
+      if(!InputEnableAutomatedTrading)
+      {
+         Print("plot_swing_m2: BOS opposite FVG (log only). ", planTag, " barShift=", barShift,
+               " risk%%=", InputRiskPercentPerTrade, " perLegAcct=", riskAccountCurrencyPerLeg,
+               " bullishFvg=", isBullishFairValueGap, " market=", useMarketOrder,
+               " entry=", normalizedEntry, " sl=", normalizedStopLoss,
+               " tp2R=", takeProfitTwoRewardMultiple, " tp3R=", takeProfitThreeRewardMultiple,
+               " vol2R=", volumeTwoR, " vol3R=", volumeThreeR);
+         return;
+      }
+
+      tradeLayer.SetExpertMagicNumber(InputExpertMagicNumber);
+      tradeLayer.SetDeviationInPoints(30);
+      ApplyTradeFillingModeFromSymbol();
+
+      bool orderTwoResult   = false;
+      bool orderThreeResult = false;
+
+      if(useMarketOrder)
+      {
+         if(isBullishFairValueGap)
+         {
+            orderTwoResult =
+               tradeLayer.Buy(volumeTwoR, _Symbol, 0.0, normalizedStopLoss, takeProfitTwoRewardMultiple,
+                              commentTwoR);
+            orderThreeResult =
+               tradeLayer.Buy(volumeThreeR, _Symbol, 0.0, normalizedStopLoss, takeProfitThreeRewardMultiple,
+                              commentThreeR);
+         }
+         else
+         {
+            orderTwoResult =
+               tradeLayer.Sell(volumeTwoR, _Symbol, 0.0, normalizedStopLoss, takeProfitTwoRewardMultiple,
+                               commentTwoR);
+            orderThreeResult =
+               tradeLayer.Sell(volumeThreeR, _Symbol, 0.0, normalizedStopLoss, takeProfitThreeRewardMultiple,
+                               commentThreeR);
+         }
+      }
+      else
+      {
+         if(isBullishFairValueGap)
+         {
+            orderTwoResult =
+               tradeLayer.BuyLimit(volumeTwoR, normalizedEntry, _Symbol, normalizedStopLoss,
+                                   takeProfitTwoRewardMultiple, ORDER_TIME_GTC, 0, commentTwoR);
+            orderThreeResult =
+               tradeLayer.BuyLimit(volumeThreeR, normalizedEntry, _Symbol, normalizedStopLoss,
+                                   takeProfitThreeRewardMultiple, ORDER_TIME_GTC, 0, commentThreeR);
+         }
+         else
+         {
+            orderTwoResult =
+               tradeLayer.SellLimit(volumeTwoR, normalizedEntry, _Symbol, normalizedStopLoss,
+                                    takeProfitTwoRewardMultiple, ORDER_TIME_GTC, 0, commentTwoR);
+            orderThreeResult =
+               tradeLayer.SellLimit(volumeThreeR, normalizedEntry, _Symbol, normalizedStopLoss,
+                                    takeProfitThreeRewardMultiple, ORDER_TIME_GTC, 0, commentThreeR);
+         }
+      }
+
+      if(orderTwoResult || orderThreeResult)
+         Print("plot_swing_m2: orders sent. ", planTag, " twoR=", orderTwoResult, " threeR=", orderThreeResult);
+      else
+         Print("plot_swing_m2: order send failed. retcode=", tradeLayer.ResultRetcode(), " ",
+               tradeLayer.ResultRetcodeDescription());
+      return;
+   }
 }
 
 //+------------------------------------------------------------------+
