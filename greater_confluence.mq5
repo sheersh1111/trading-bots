@@ -1,11 +1,11 @@
 //+------------------------------------------------------------------+
 //| greater_confluence.mq5                                           |
-//| Body-only swings (no wick) → H1 BOS → aligned M5 BOS → M5 zone |
+//| Close-only swings (no open / no wick) → H1 BOS → aligned M5 BOS → M5 zone |
 //| → M2 retrace into zone → M2 FVG or M2 BOS leg-start entry marks   |
 //| No order placement (visual verification only).                   |
 //+------------------------------------------------------------------+
 #property copyright ""
-#property version   "1.00"
+#property version   "1.06"
 
 #property description "H1/M5/M2 confluence: body swings, BOS alignment, FVG/leg markers."
 
@@ -30,19 +30,30 @@ input color  InputColorM5ZoneLegStart    = clrOrange;
 input color  InputColorM2FvgEntry        = clrLime;
 input color  InputColorM2LegStartEntry  = clrMagenta;
 
+input color  InputColorH1BosLabelBull  = clrLime;
+input color  InputColorH1BosLabelBear  = clrTomato;
+input color  InputColorH1BosLabelNone  = clrSilver;
+input int    InputH1BosLabelFontSize    = 11;
+
+input bool   InputDrawM5AlignedBosMarkers = true;  // vline + tag when M5 BOS matches H1 direction
+input color  InputColorM5AlignedBosBull   = clrAqua;
+input color  InputColorM5AlignedBosBear   = clrDeepPink;
+
 //--- prefixes (chart objects)
 const string PFX_H1  = "GC_H1_";
 const string PFX_M5  = "GC_M5_";
 const string PFX_M2  = "GC_M2_";
+const string PFX_M5AL = "GC_M5AL_"; // M5 BOS aligned with H1 (verification markers)
 const string PFX_Z5  = "GC_Z5_";
 const string PFX_E2  = "GC_E2_";
+const string OBJ_H1_BOS_UI = "GC_UI_H1BOS";
 
 #define SWING_HIST 32
 
 struct SwingLeg
 {
-   double   legHighPrice;   // max of max(open,close) over the leg (body tops)
-   double   legLowPrice;    // min of min(open,close) over the leg (body bottoms)
+   double   legHighPrice;   // max(close) over the leg
+   double   legLowPrice;    // min(close) over the leg
    datetime legStartTime;
    datetime legEndTime;
    int      swingDirection; // 1 up, -1 down, 0 unset
@@ -86,18 +97,6 @@ datetime g_m5ZoneTimeRight = 0;
 bool     g_waitingRetraceToM5Zone = false;
 bool     g_retraceSeen            = false;
 bool     g_m2EntryMarked          = false;
-
-//+------------------------------------------------------------------+
-double BodyTop(const double openPrice, const double closePrice)
-{
-   return MathMax(openPrice, closePrice);
-}
-
-//+------------------------------------------------------------------+
-double BodyBottom(const double openPrice, const double closePrice)
-{
-   return MathMin(openPrice, closePrice);
-}
 
 //+------------------------------------------------------------------+
 double ReferenceRangeHeight(const ENUM_TIMEFRAMES tf, const int barCount)
@@ -184,11 +183,9 @@ void SwingHistoryPush(BodySwingState &st, const SwingLeg &leg)
 void ProcessBodySwingStep(BodySwingState &st, const ENUM_TIMEFRAMES tf,
                           const string objPrefix, const color swingColor, const bool drawLegs)
 {
-   const double o = iOpen(_Symbol, tf, 1);
    const double c = iClose(_Symbol, tf, 1);
-   const double bodyTop = BodyTop(o, c);
-   const double bodyBot = BodyBottom(o, c);
-   const int    dir     = (c > o) ? 1 : ((c < o) ? -1 : 0);
+   const double prevC = iClose(_Symbol, tf, 2);
+   const int    dir   = (c > prevC) ? 1 : ((c < prevC) ? -1 : 0);
 
    double sumR = 0.0;
    for(int k = 2; k <= 6; k++)
@@ -202,16 +199,16 @@ void ProcessBodySwingStep(BodySwingState &st, const ENUM_TIMEFRAMES tf,
       if(dir == 0)
          return;
       st.currentSwingLeg.swingDirection = dir;
-      st.currentSwingLeg.legHighPrice   = bodyTop;
-      st.currentSwingLeg.legLowPrice    = bodyBot;
+      st.currentSwingLeg.legHighPrice   = c;
+      st.currentSwingLeg.legLowPrice    = c;
       st.currentSwingLeg.legStartTime   = iTime(_Symbol, tf, 1);
       st.currentSwingLeg.legEndTime     = iTime(_Symbol, tf, 1);
-      st.priceAnchorLevel = (bodyTop + bodyBot) / 2.0;
+      st.priceAnchorLevel = c;
       return;
    }
 
    if(decent && dir == st.currentSwingLeg.swingDirection)
-      st.priceAnchorLevel = (bodyTop + bodyBot) / 2.0;
+      st.priceAnchorLevel = c;
 
    int nextDir = st.currentSwingLeg.swingDirection;
    if(st.currentSwingLeg.swingDirection == 1 && c < st.priceAnchorLevel)
@@ -221,19 +218,19 @@ void ProcessBodySwingStep(BodySwingState &st, const ENUM_TIMEFRAMES tf,
 
    if(nextDir == st.currentSwingLeg.swingDirection)
    {
-      if(bodyTop > st.currentSwingLeg.legHighPrice)
-         st.currentSwingLeg.legHighPrice = bodyTop;
-      if(bodyBot < st.currentSwingLeg.legLowPrice)
-         st.currentSwingLeg.legLowPrice = bodyBot;
+      if(c > st.currentSwingLeg.legHighPrice)
+         st.currentSwingLeg.legHighPrice = c;
+      if(c < st.currentSwingLeg.legLowPrice)
+         st.currentSwingLeg.legLowPrice = c;
       st.currentSwingLeg.legEndTime = iTime(_Symbol, tf, 1);
    }
    else
    {
       // Include reversal bar in closed leg; next leg seeds from same pivot time/price.
-      if(bodyTop > st.currentSwingLeg.legHighPrice)
-         st.currentSwingLeg.legHighPrice = bodyTop;
-      if(bodyBot < st.currentSwingLeg.legLowPrice)
-         st.currentSwingLeg.legLowPrice = bodyBot;
+      if(c > st.currentSwingLeg.legHighPrice)
+         st.currentSwingLeg.legHighPrice = c;
+      if(c < st.currentSwingLeg.legLowPrice)
+         st.currentSwingLeg.legLowPrice = c;
       st.currentSwingLeg.legEndTime = iTime(_Symbol, tf, 1);
 
       SwingLeg closed = st.currentSwingLeg;
@@ -277,14 +274,14 @@ void ProcessBodySwingStep(BodySwingState &st, const ENUM_TIMEFRAMES tf,
       if(nd == 1)
       {
          st.currentSwingLeg.legLowPrice  = closed.legLowPrice;
-         st.currentSwingLeg.legHighPrice = bodyTop;
+         st.currentSwingLeg.legHighPrice = c;
       }
       else
       {
          st.currentSwingLeg.legHighPrice = closed.legHighPrice;
-         st.currentSwingLeg.legLowPrice  = bodyBot;
+         st.currentSwingLeg.legLowPrice  = c;
       }
-      st.priceAnchorLevel = (bodyTop + bodyBot) / 2.0;
+      st.priceAnchorLevel = c;
    }
 }
 
@@ -328,6 +325,64 @@ bool TryDetectBosOnLastClosedBar(BodySwingState &st, const ENUM_TIMEFRAMES tf,
 }
 
 //+------------------------------------------------------------------+
+// After warmup, evaluate last closed H1 bar for BOS (same as first live H1 step).
+void TryInitH1BosFromLastClosedBar()
+{
+   bool bull = false;
+   if(!TryDetectBosOnLastClosedBar(g_h1, PERIOD_H1, bull))
+      return;
+   g_h1BosDirection = bull ? 1 : -1;
+   g_h1BosBarTime   = iTime(_Symbol, PERIOD_H1, 1);
+   ResetConfluenceAfterH1Change();
+}
+
+//+------------------------------------------------------------------+
+void EnsureH1BosCornerLabel()
+{
+   if(ObjectFind(0, OBJ_H1_BOS_UI) >= 0)
+      return;
+   if(!ObjectCreate(0, OBJ_H1_BOS_UI, OBJ_LABEL, 0, 0, 0))
+      return;
+   ObjectSetInteger(0, OBJ_H1_BOS_UI, OBJPROP_CORNER, CORNER_RIGHT_UPPER);
+   ObjectSetInteger(0, OBJ_H1_BOS_UI, OBJPROP_ANCHOR, ANCHOR_RIGHT_UPPER);
+   ObjectSetInteger(0, OBJ_H1_BOS_UI, OBJPROP_XDISTANCE, 10);
+   ObjectSetInteger(0, OBJ_H1_BOS_UI, OBJPROP_YDISTANCE, 16);
+   ObjectSetString(0, OBJ_H1_BOS_UI, OBJPROP_FONT, "Tahoma");
+   ObjectSetInteger(0, OBJ_H1_BOS_UI, OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, OBJ_H1_BOS_UI, OBJPROP_HIDDEN, true);
+}
+
+//+------------------------------------------------------------------+
+void RefreshH1BosCornerLabel()
+{
+   EnsureH1BosCornerLabel();
+   const string up = CharToString((ushort)0x2191); // Unicode UPWARDS ARROW
+   const string dn = CharToString((ushort)0x2193); // Unicode DOWNWARDS ARROW
+   string line;
+   color  clr = InputColorH1BosLabelNone;
+   if(g_h1BosDirection == 0 || g_h1BosBarTime == 0)
+   {
+      line = "H1 BOS  --";
+      clr = InputColorH1BosLabelNone;
+   }
+   else if(g_h1BosDirection == 1)
+   {
+      line = StringFormat("%s  H1 BOS  %s", up,
+                          TimeToString(g_h1BosBarTime, TIME_DATE | TIME_MINUTES));
+      clr = InputColorH1BosLabelBull;
+   }
+   else
+   {
+      line = StringFormat("%s  H1 BOS  %s", dn,
+                          TimeToString(g_h1BosBarTime, TIME_DATE | TIME_MINUTES));
+      clr = InputColorH1BosLabelBear;
+   }
+   ObjectSetString(0, OBJ_H1_BOS_UI, OBJPROP_TEXT, line);
+   ObjectSetInteger(0, OBJ_H1_BOS_UI, OBJPROP_COLOR, clr);
+   ObjectSetInteger(0, OBJ_H1_BOS_UI, OBJPROP_FONTSIZE, InputH1BosLabelFontSize);
+}
+
+//+------------------------------------------------------------------+
 // Earliest FVG in time after legStart (scan oldest→newest: high shift s down to 3)
 bool FindFirstM5FvgFromLegStart(const datetime legStartTime, const bool wantBullFvg,
                               bool &outBull, double &outZL, double &outZH,
@@ -366,6 +421,50 @@ bool FindFirstM5FvgFromLegStart(const datetime legStartTime, const bool wantBull
 void ClearM5ZoneObjects()
 {
    ObjectsDeleteAll(0, PFX_Z5, -1, -1);
+}
+
+//+------------------------------------------------------------------+
+// Mark last closed M5 bar where BOS direction matched H1 (for verification).
+void DrawAlignedM5BosMarker(const datetime bosBarTime, const bool bull)
+{
+   if(!InputDrawM5AlignedBosMarkers || bosBarTime <= 0)
+      return;
+
+   const string base = PFX_M5AL + IntegerToString((long)bosBarTime);
+   const color  clr  = bull ? InputColorM5AlignedBosBull : InputColorM5AlignedBosBear;
+
+   const string vname = base + "V";
+   if(ObjectFind(0, vname) < 0)
+   {
+      if(ObjectCreate(0, vname, OBJ_VLINE, 0, bosBarTime, 0))
+      {
+         ObjectSetInteger(0, vname, OBJPROP_COLOR, clr);
+         ObjectSetInteger(0, vname, OBJPROP_STYLE, STYLE_DOT);
+         ObjectSetInteger(0, vname, OBJPROP_WIDTH, 1);
+         ObjectSetInteger(0, vname, OBJPROP_BACK, false);
+         ObjectSetInteger(0, vname, OBJPROP_SELECTABLE, false);
+         ObjectSetInteger(0, vname, OBJPROP_HIDDEN, true);
+      }
+   }
+
+   const double h = iHigh(_Symbol, PERIOD_M5, 1);
+   const double l = iLow(_Symbol, PERIOD_M5, 1);
+   const double labelPrice = bull ? h + (h - l) * 0.05 : l - (h - l) * 0.05;
+
+   const string tname = base + "T";
+   if(ObjectFind(0, tname) < 0)
+   {
+      if(ObjectCreate(0, tname, OBJ_TEXT, 0, bosBarTime, labelPrice))
+      {
+         ObjectSetString(0, tname, OBJPROP_TEXT, bull ? "M5 BOS bull = H1" : "M5 BOS bear = H1");
+         ObjectSetInteger(0, tname, OBJPROP_COLOR, clr);
+         ObjectSetInteger(0, tname, OBJPROP_FONTSIZE, 8);
+         ObjectSetInteger(0, tname, OBJPROP_ANCHOR, bull ? ANCHOR_LOWER : ANCHOR_UPPER);
+         ObjectSetInteger(0, tname, OBJPROP_SELECTABLE, false);
+         ObjectSetInteger(0, tname, OBJPROP_HIDDEN, true);
+      }
+   }
+   ChartRedraw(0);
 }
 
 //+------------------------------------------------------------------+
@@ -471,9 +570,8 @@ void TryMarkM2EntryFvgOrLeg(const int h1Dir, const datetime m2LegStartBeforeBar)
       {
          if((wantBull && m2BullBos) || (!wantBull && !m2BullBos))
          {
-         const double o = iOpen(_Symbol, PERIOD_M2, 1);
          const double c = iClose(_Symbol, PERIOD_M2, 1);
-         const double px = wantBull ? BodyBottom(o, c) : BodyTop(o, c);
+         const double px = c;
          const datetime t = (m2LegStartBeforeBar > 0) ? m2LegStartBeforeBar : g_m2.currentSwingLeg.legStartTime;
          const string name = PFX_E2 + "LEG";
          if(ObjectCreate(0, name, OBJ_ARROW, 0, t, px))
@@ -507,6 +605,8 @@ void ResetConfluenceAfterH1Change()
 }
 
 //+------------------------------------------------------------------+
+// Replay closed bars oldest→newest so swingHistory/current leg match live ProcessBodySwingStep.
+// Must use the same "decent" rule as ProcessBodySwingStep (barRange > avgR * 0.50), or state diverges.
 void WarmupTf(BodySwingState &st, const ENUM_TIMEFRAMES tf, const string pfx, const color clr, const bool draw)
 {
    if(InputWarmupBarsPerTf <= 0)
@@ -514,22 +614,20 @@ void WarmupTf(BodySwingState &st, const ENUM_TIMEFRAMES tf, const string pfx, co
    const int n = (int)MathMin(iBars(_Symbol, tf) - 2, InputWarmupBarsPerTf);
    for(int k = n; k >= 1; k--)
    {
-      const double o = iOpen(_Symbol, tf, k);
       const double c = iClose(_Symbol, tf, k);
-      const double bodyTop = BodyTop(o, c);
-      const double bodyBot = BodyBottom(o, c);
-      const int    dir     = (c > o) ? 1 : ((c < o) ? -1 : 0);
+      const double prevC = iClose(_Symbol, tf, k + 1);
+      const int    dir   = (c > prevC) ? 1 : ((c < prevC) ? -1 : 0);
 
       if(st.currentSwingLeg.swingDirection == 0)
       {
          if(dir == 0)
             continue;
          st.currentSwingLeg.swingDirection = dir;
-         st.currentSwingLeg.legHighPrice   = bodyTop;
-         st.currentSwingLeg.legLowPrice    = bodyBot;
+         st.currentSwingLeg.legHighPrice   = c;
+         st.currentSwingLeg.legLowPrice    = c;
          st.currentSwingLeg.legStartTime   = iTime(_Symbol, tf, k);
          st.currentSwingLeg.legEndTime     = iTime(_Symbol, tf, k);
-         st.priceAnchorLevel = (bodyTop + bodyBot) / 2.0;
+         st.priceAnchorLevel = c;
          continue;
       }
 
@@ -538,9 +636,9 @@ void WarmupTf(BodySwingState &st, const ENUM_TIMEFRAMES tf, const string pfx, co
          sumR += (iHigh(_Symbol, tf, j) - iLow(_Symbol, tf, j));
       const double avgR = sumR / 5.0;
       const double barRange = iHigh(_Symbol, tf, k) - iLow(_Symbol, tf, k);
-      const bool   decent   = (barRange > avgR * 1.0);
+      const bool   decent   = (barRange > avgR * 0.50); // align with ProcessBodySwingStep
       if(decent && dir == st.currentSwingLeg.swingDirection)
-         st.priceAnchorLevel = (bodyTop + bodyBot) / 2.0;
+         st.priceAnchorLevel = c;
 
       int nextDir = st.currentSwingLeg.swingDirection;
       if(st.currentSwingLeg.swingDirection == 1 && c < st.priceAnchorLevel)
@@ -550,18 +648,18 @@ void WarmupTf(BodySwingState &st, const ENUM_TIMEFRAMES tf, const string pfx, co
 
       if(nextDir == st.currentSwingLeg.swingDirection)
       {
-         if(bodyTop > st.currentSwingLeg.legHighPrice)
-            st.currentSwingLeg.legHighPrice = bodyTop;
-         if(bodyBot < st.currentSwingLeg.legLowPrice)
-            st.currentSwingLeg.legLowPrice = bodyBot;
+         if(c > st.currentSwingLeg.legHighPrice)
+            st.currentSwingLeg.legHighPrice = c;
+         if(c < st.currentSwingLeg.legLowPrice)
+            st.currentSwingLeg.legLowPrice = c;
          st.currentSwingLeg.legEndTime = iTime(_Symbol, tf, k);
       }
       else
       {
-         if(bodyTop > st.currentSwingLeg.legHighPrice)
-            st.currentSwingLeg.legHighPrice = bodyTop;
-         if(bodyBot < st.currentSwingLeg.legLowPrice)
-            st.currentSwingLeg.legLowPrice = bodyBot;
+         if(c > st.currentSwingLeg.legHighPrice)
+            st.currentSwingLeg.legHighPrice = c;
+         if(c < st.currentSwingLeg.legLowPrice)
+            st.currentSwingLeg.legLowPrice = c;
          st.currentSwingLeg.legEndTime = iTime(_Symbol, tf, k);
 
          SwingLeg closed = st.currentSwingLeg;
@@ -579,14 +677,14 @@ void WarmupTf(BodySwingState &st, const ENUM_TIMEFRAMES tf, const string pfx, co
          if(nd == 1)
          {
             st.currentSwingLeg.legLowPrice  = closed.legLowPrice;
-            st.currentSwingLeg.legHighPrice = bodyTop;
+            st.currentSwingLeg.legHighPrice = c;
          }
          else
          {
             st.currentSwingLeg.legHighPrice = closed.legHighPrice;
-            st.currentSwingLeg.legLowPrice  = bodyBot;
+            st.currentSwingLeg.legLowPrice  = c;
          }
-         st.priceAnchorLevel = (bodyTop + bodyBot) / 2.0;
+         st.priceAnchorLevel = c;
       }
    }
 }
@@ -602,6 +700,7 @@ int OnInit()
 
    ObjectsDeleteAll(0, PFX_H1, -1, -1);
    ObjectsDeleteAll(0, PFX_M5, -1, -1);
+   ObjectsDeleteAll(0, PFX_M5AL, -1, -1);
    ObjectsDeleteAll(0, PFX_M2, -1, -1);
    ClearM5ZoneObjects();
    ClearM2EntryObjects();
@@ -614,14 +713,19 @@ int OnInit()
    g_lastM5BarOpen = iTime(_Symbol, PERIOD_M5, 0);
    g_lastM2BarOpen = iTime(_Symbol, PERIOD_M2, 0);
 
+   TryInitH1BosFromLastClosedBar();
+   RefreshH1BosCornerLabel();
+
    return(INIT_SUCCEEDED);
 }
 
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
+   ObjectDelete(0, OBJ_H1_BOS_UI);
    ObjectsDeleteAll(0, PFX_H1, -1, -1);
    ObjectsDeleteAll(0, PFX_M5, -1, -1);
+   ObjectsDeleteAll(0, PFX_M5AL, -1, -1);
    ObjectsDeleteAll(0, PFX_M2, -1, -1);
    ClearM5ZoneObjects();
    ClearM2EntryObjects();
@@ -646,6 +750,7 @@ void OnTick()
          g_h1BosBarTime   = iTime(_Symbol, PERIOD_H1, 1);
          ResetConfluenceAfterH1Change();
       }
+      RefreshH1BosCornerLabel();
    }
 
    if(tM5 != g_lastM5BarOpen)
@@ -666,6 +771,8 @@ void OnTick()
                g_m5BosBarTime   = iTime(_Symbol, PERIOD_M5, 1);
                g_m5BosDirection = m5Bull ? 1 : -1;
                g_m5LegStartAtBos = m5LegStartBefore;
+
+               DrawAlignedM5BosMarker(g_m5BosBarTime, m5Bull);
 
                bool    hasFvg;
                bool    fvgBull;
@@ -689,9 +796,8 @@ void OnTick()
                   {
                      g_m5HasMarkedZone = true;
                      g_m5MarkIsFvg     = false;
-                     const double o = iOpen(_Symbol, PERIOD_M5, 1);
                      const double c = iClose(_Symbol, PERIOD_M5, 1);
-                     const double px = (m5Bull ? BodyBottom(o, c) : BodyTop(o, c));
+                     const double px = c;
                      g_m5ZoneLow  = px;
                      g_m5ZoneHigh = px;
                      g_m5ZoneTimeLeft  = g_m5LegStartAtBos;
