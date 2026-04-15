@@ -4,8 +4,8 @@
 //| — H1 and M5 only. No trading.                                    |
 //+------------------------------------------------------------------+
 #property copyright ""
-#property version   "1.00"
-#property description "H1 + M5 swing legs (plot_swing_m2 engine)."
+#property version   "1.01"
+#property description "H1 + M5 swing legs (plot_swing_m2 engine). H1 BOS HUD on M5 bar close."
 
 input bool   InputSwitchChartToM5       = true;
 input int    InputWarmupBarsPerTf       = 500;  // 0 = off
@@ -13,6 +13,12 @@ input bool   InputDrawH1SwingLegs       = true;
 input bool   InputDrawM5SwingLegs       = true;
 input color  InputH1SwingLineColor      = clrDodgerBlue;
 input color  InputM5SwingLineColor      = clrGold;
+
+input bool   InputDrawH1BosHud          = true;
+input color  InputColorH1BosLabelBull   = clrLime;
+input color  InputColorH1BosLabelBear   = clrTomato;
+input color  InputColorH1BosLabelNone   = clrSilver;
+input int    InputH1BosLabelFontSize    = 11;
 
 // --- copied from plot_swing_m2.mq5 (detect_swing-style structs) ---
 struct Swing
@@ -37,11 +43,17 @@ const string PFX_H1_LBL   = "PS_H1_LB_";
 const string PFX_M5_TREND = "PS_M5_SW_";
 const string PFX_M5_LBL   = "PS_M5_LB_";
 
+const string OBJ_H1_BOS_UI = "PS_UI_H1BOS";
+
 SwingState g_h1;
 SwingState g_m5;
 
 datetime g_lastH1BarOpen = 0;
 datetime g_lastM5BarOpen = 0;
+
+// Latest H1 BOS (1 = bull, -1 = bear, 0 = none stored yet); bar time of BOS candle
+int      g_h1BosDirection = 0;
+datetime g_h1BosBarTime   = 0;
 
 //+------------------------------------------------------------------+
 void SwingStartNew(SwingState &swingState, const ENUM_TIMEFRAMES timeframe, const int swingDirection,
@@ -222,6 +234,126 @@ void WarmupSwingState(SwingState &st, const ENUM_TIMEFRAMES tf, const color clr,
 }
 
 //+------------------------------------------------------------------+
+//| Bullish BOS: last closed bar close crosses above latest completed up-leg high. |
+//| Bearish BOS: last closed bar close crosses below latest completed down-leg low. |
+//+------------------------------------------------------------------+
+bool TryDetectBosOnLastClosedBar(SwingState &st, const ENUM_TIMEFRAMES tf, bool &outBullishBos)
+{
+   outBullishBos = false;
+   if(st.swingHistoryCount < 1)
+      return false;
+
+   const double closePrice = iClose(_Symbol, tf, 1);
+   const double prevClose  = iClose(_Symbol, tf, 2);
+   const double pointSize  = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+
+   for(int hi = st.swingHistoryCount - 1; hi >= 0; hi--)
+   {
+      if(st.swingHistory[hi].swingDirection != 1)
+         continue;
+      const double lvl = st.swingHistory[hi].legHighPrice;
+      if(closePrice > lvl + pointSize && prevClose <= lvl + pointSize)
+      {
+         outBullishBos = true;
+         return true;
+      }
+      break;
+   }
+   for(int hi = st.swingHistoryCount - 1; hi >= 0; hi--)
+   {
+      if(st.swingHistory[hi].swingDirection != -1)
+         continue;
+      const double lvl = st.swingHistory[hi].legLowPrice;
+      if(closePrice < lvl - pointSize && prevClose >= lvl - pointSize)
+      {
+         outBullishBos = false;
+         return true;
+      }
+      break;
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+void EnsureH1BosCornerLabel()
+{
+   if(ObjectFind(0, OBJ_H1_BOS_UI) >= 0)
+      return;
+   if(!ObjectCreate(0, OBJ_H1_BOS_UI, OBJ_LABEL, 0, 0, 0))
+      return;
+   ObjectSetInteger(0, OBJ_H1_BOS_UI, OBJPROP_CORNER, CORNER_RIGHT_UPPER);
+   ObjectSetInteger(0, OBJ_H1_BOS_UI, OBJPROP_ANCHOR, ANCHOR_RIGHT_UPPER);
+   ObjectSetInteger(0, OBJ_H1_BOS_UI, OBJPROP_XDISTANCE, 10);
+   ObjectSetInteger(0, OBJ_H1_BOS_UI, OBJPROP_YDISTANCE, 16);
+   ObjectSetString(0, OBJ_H1_BOS_UI, OBJPROP_FONT, "Tahoma");
+   ObjectSetInteger(0, OBJ_H1_BOS_UI, OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, OBJ_H1_BOS_UI, OBJPROP_HIDDEN, true);
+}
+
+//+------------------------------------------------------------------+
+void RefreshH1BosCornerLabel()
+{
+   if(!InputDrawH1BosHud)
+   {
+      ObjectDelete(0, OBJ_H1_BOS_UI);
+      return;
+   }
+   EnsureH1BosCornerLabel();
+   const string up = CharToString((ushort)0x2191);
+   const string dn = CharToString((ushort)0x2193);
+   string line;
+   color  clr = InputColorH1BosLabelNone;
+   if(g_h1BosDirection == 0 || g_h1BosBarTime == 0)
+   {
+      line = "H1 BOS  --";
+      clr = InputColorH1BosLabelNone;
+   }
+   else if(g_h1BosDirection == 1)
+   {
+      line = StringFormat("%s  H1 BOS  %s", up,
+                          TimeToString(g_h1BosBarTime, TIME_DATE | TIME_MINUTES));
+      clr = InputColorH1BosLabelBull;
+   }
+   else
+   {
+      line = StringFormat("%s  H1 BOS  %s", dn,
+                          TimeToString(g_h1BosBarTime, TIME_DATE | TIME_MINUTES));
+      clr = InputColorH1BosLabelBear;
+   }
+   ObjectSetString(0, OBJ_H1_BOS_UI, OBJPROP_TEXT, line);
+   ObjectSetInteger(0, OBJ_H1_BOS_UI, OBJPROP_COLOR, clr);
+   ObjectSetInteger(0, OBJ_H1_BOS_UI, OBJPROP_FONTSIZE, InputH1BosLabelFontSize);
+}
+
+//+------------------------------------------------------------------+
+//| If last closed H1 printed a BOS vs swing history, update globals. |
+//+------------------------------------------------------------------+
+void TryUpdateStoredH1BosFromSwingHistory()
+{
+   bool bull = false;
+   if(TryDetectBosOnLastClosedBar(g_h1, PERIOD_H1, bull))
+   {
+      g_h1BosDirection = bull ? 1 : -1;
+      g_h1BosBarTime   = iTime(_Symbol, PERIOD_H1, 1);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Runs after each completed M5 bar: refresh latest H1 BOS + HUD.   |
+//+------------------------------------------------------------------+
+void OnM5BarCompleted_UpdateH1BosHud()
+{
+   TryUpdateStoredH1BosFromSwingHistory();
+   RefreshH1BosCornerLabel();
+}
+
+//+------------------------------------------------------------------+
+void TryInitH1BosFromLastClosedBar()
+{
+   TryUpdateStoredH1BosFromSwingHistory();
+}
+
+//+------------------------------------------------------------------+
 int OnInit()
 {
    if(InputSwitchChartToM5)
@@ -241,6 +373,11 @@ int OnInit()
    WarmupSwingState(g_h1, PERIOD_H1, InputH1SwingLineColor, PFX_H1_TREND, PFX_H1_LBL, false);
    WarmupSwingState(g_m5, PERIOD_M5, InputM5SwingLineColor, PFX_M5_TREND, PFX_M5_LBL, false);
 
+   g_h1BosDirection = 0;
+   g_h1BosBarTime   = 0;
+   TryInitH1BosFromLastClosedBar();
+   RefreshH1BosCornerLabel();
+
    g_lastH1BarOpen = iTime(_Symbol, PERIOD_H1, 0);
    g_lastM5BarOpen = iTime(_Symbol, PERIOD_M5, 0);
 
@@ -250,6 +387,7 @@ int OnInit()
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
+   ObjectDelete(0, OBJ_H1_BOS_UI);
    ObjectsDeleteAll(0, PFX_H1_TREND, -1, -1);
    ObjectsDeleteAll(0, PFX_H1_LBL, -1, -1);
    ObjectsDeleteAll(0, PFX_M5_TREND, -1, -1);
@@ -267,6 +405,8 @@ void OnTick()
       g_lastH1BarOpen = tH1;
       ProcessSwingStepAtShift(g_h1, PERIOD_H1, 1, InputH1SwingLineColor, PFX_H1_TREND, PFX_H1_LBL,
                               InputDrawH1SwingLegs);
+      TryUpdateStoredH1BosFromSwingHistory();
+      RefreshH1BosCornerLabel();
    }
 
    if(tM5 != g_lastM5BarOpen)
@@ -274,6 +414,7 @@ void OnTick()
       g_lastM5BarOpen = tM5;
       ProcessSwingStepAtShift(g_m5, PERIOD_M5, 1, InputM5SwingLineColor, PFX_M5_TREND, PFX_M5_LBL,
                               InputDrawM5SwingLegs);
+      OnM5BarCompleted_UpdateH1BosHud();
    }
 }
 
