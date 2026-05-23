@@ -5,7 +5,7 @@
 //| plot_swing_h1_m5_copy.mq5.                                       |
 //+------------------------------------------------------------------+
 #property copyright ""
-#property version   "1.08"
+#property version   "1.28"
 
 input bool   InputSwitchChartToM15       = true;
 input int    InputWarmupBars             = 500;  // 0 = off: replay closed M15 bars on attach
@@ -19,13 +19,16 @@ input int    InputM2SwingWarmupBars      = 500; // 0 = off: replay M2 on attach 
 input group "M15 breach → opposite M2 FVG (plot_swing_m2_copy)"
 input bool   InputEnableOppositeFvgHuntAfterM15Breach = true;
 input bool   InputDrawBosOppositeFairValueGapZones   = true;
-input double InputBosMaxImpulsePercentOfChartRangeBeforeOppositeFvg = 15.0; // 0=off; % of M2 chart range from breach level
+input double InputM15BreachAnticipationPercentBelowUpHigh = 5.0;  // 0=exact leg high; wick cross (high − N% M2 range) arms hunt
+input double InputM15BreachAnticipationPercentAboveDownLow = 5.0; // 0=exact leg low; wick cross (low + N% M2 range) arms hunt
+input double InputBosMaxImpulsePercentOfChartRangeBeforeOppositeFvg = 20.0; // 0=off; % of M2 chart range from breach level
 input bool   InputDrawImpulseCancelBufferZone = true;  // hollow rect while hunt ON
 input color  InputImpulseCancelBufferColor    = clrDarkOrange;
 input int    InputChartRangeBarCount     = 147;
 input double InputFairValueGapMinimumPercentOfChartRange = 2.0;
 input int    InputMaximumFairValueGapRectangles = 120;
 input bool   InputShowLiquidityHuntHud   = true;
+input bool   InputLogHuntEvents          = true;  // Experts tab: hunt / FVG / BOS / weakPullback
 
 // --- swing structs (plot_swing_h1_m5_copy.mq5) ---
 struct Swing
@@ -77,6 +80,13 @@ struct BosOppositeFairValueGapMemory
 };
 
 #define BosOppositeFairValueGapMemoryCapacity 32
+#define M15LegLiquidityBreachMemoryCapacity   24
+
+struct M15LegLiquidityBreachRecord
+{
+   datetime legEndTime;
+   bool     isUpLegHighBreach;
+};
 
 SwingState     g_m15Swing;
 SwingState     g_m2Swing;
@@ -96,10 +106,16 @@ double   g_impulseCloseExtremeSinceM15Breach = 0.0;
 datetime g_m15BreachM2BarOpenTime            = 0;
 int      g_oppositeFvgFoundDuringHuntCount  = 0;
 bool     g_deferHuntEndUntilNextOppositeBos = false;
+int      g_weakPullback                     = 0;
+int      g_oppositeM2BosCountDuringHunt     = 0;
+bool     g_sawOppositeBosDuringOppositeM2Phase = false;
 
 BosOppositeFairValueGapMemory g_bosOppFvgMem[BosOppositeFairValueGapMemoryCapacity];
 int                           g_bosOppFvgMemCount = 0;
 int                           g_lqBosMarkedFvgRectangleSequence = 0;
+
+M15LegLiquidityBreachRecord g_m15LegLiquidityBreaches[M15LegLiquidityBreachMemoryCapacity];
+int                         g_m15LegLiquidityBreachCount = 0;
 
 void   PushLiquidityPoolFromClosedSwing(const double poolLowPrice, const double poolHighPrice,
                                         const bool isSupplyPool);
@@ -134,13 +150,17 @@ bool   TryLatestM15CompletedDownLegLow(double &outLow);
 bool   TrySecondLastM15CompletedUpLegHigh(double &outHigh);
 bool   TrySecondLastM15CompletedDownLegLow(double &outLow);
 bool   TryNthM15CompletedSwingLeg(const int swingDirection, const int nFromLatest,
-                                  double &outLegHigh, double &outLegLow);
+                                  double &outLegHigh, double &outLegLow, datetime &outLegEndTime);
+bool   IsM15LegLiquidityAlreadyBreached(const datetime legEndTime, const bool isUpLegHighBreach);
+void   RememberM15LegLiquidityBreach(const datetime legEndTime, const bool isUpLegHighBreach);
 bool   M15AllowsBearishHuntWhenSecondLastUpHighBreached(const double pointSize);
 bool   M15AllowsBullishHuntWhenSecondLastDownLowBreached(const double pointSize);
 bool   M2WickCrossesAboveLevel(const double level, const double barHigh, const double prevHigh,
                                const double pointSize);
 bool   M2WickCrossesBelowLevel(const double level, const double barLow, const double prevLow,
                                const double pointSize);
+double M15BreachWickLevelForUpLegHigh(const double legHighPrice);
+double M15BreachWickLevelForDownLegLow(const double legLowPrice);
 bool   TryDetectM2BreakOfStructureOnLastClosedBar(bool &outExpectsBullishFairValueGap, double &outBosLegLevelPrice);
 bool   PushBosOppositeFairValueGapMemory(const bool isBullishFairValueGap, const double zoneLowPrice,
                                          const double zoneHighPrice, const datetime fairValueGapBarOpenTime,
@@ -150,8 +170,26 @@ void   DrawBosMarkedFairValueGapZone(const bool isBullishFairValueGap, const dou
                                      const double zoneHighPrice, const datetime leftBarTime,
                                      const datetime rightBarTime);
 void   ProcessBosOppositeFairValueGapWindow();
+int    OppositeM2LegDirectionForHunt();
+bool   IsCurrentM2LegOppositeToHunt();
+void   ResetWeakPullbackState();
+bool   TryM2WickBreachesSameDirectionLevelForHuntReset();
+void   ApplySameDirectionBosHuntResets();
+void   LogHuntEvent(const string eventName, const string detail = "");
+void   OnM2SwingLegDirectionChange(const int closingLegDirection, const int nextLegDirection);
 void   ClearImpulseCancelBufferZone();
 void   UpdateImpulseCancelBufferZone();
+void   ResetCurrentOppositeFvgHuntSession();
+bool   TryDetectM15WickLiquidityBreach(const double barHigh, const double barLow,
+                                       const double prevHigh, const double prevLow,
+                                       const double pointSize, double &outLevel,
+                                       bool &outHighBreached, datetime &outLegEndTime);
+bool   IsDistinctM15BreachFromActiveHunt(const double m15Level, const bool m15HighBreached,
+                                         const double pointSize);
+void   ArmOppositeFvgHuntAfterM15Breach(const double m15Level, const bool m15HighBreached,
+                                          const datetime breachedLegEndTime,
+                                          const double barClose, const double barLow,
+                                          const double barHigh, const bool isRestart);
 
 //+------------------------------------------------------------------+
 int OnInit()
@@ -185,8 +223,10 @@ int OnInit()
    g_m15BreachM2BarOpenTime            = 0;
    g_oppositeFvgFoundDuringHuntCount  = 0;
    g_deferHuntEndUntilNextOppositeBos = false;
+   ResetWeakPullbackState();
    g_bosOppFvgMemCount                = 0;
    g_lqBosMarkedFvgRectangleSequence  = 0;
+   g_m15LegLiquidityBreachCount       = 0;
 
    WarmupM15SwingFromHistory();
    WarmupM2SwingFromHistory();
@@ -301,9 +341,9 @@ void OnTick()
    if(tM2 != g_lastM2BarOpen)
    {
       g_lastM2BarOpen = tM2;
-      ProcessM2SwingStep();
       if(InputEnableOppositeFvgHuntAfterM15Breach)
          ProcessBosOppositeFairValueGapWindow();
+      ProcessM2SwingStep();
       RefreshLiquidityHuntHud();
    }
 }
@@ -538,7 +578,10 @@ void ProcessSwingStepAtShift(SwingState &swingState, const ENUM_TIMEFRAMES timef
    const int candleDirection =
       (lastClosedBarClose > lastClosedBarOpen) ? 1
       : ((lastClosedBarClose < lastClosedBarOpen) ? -1 : 0);
-   const double lastClosedBarRange = lastClosedBarHigh - lastClosedBarLow;
+   const double lastClosedBarRange =
+      (timeframe == PERIOD_M2)
+      ? MathAbs(lastClosedBarClose - lastClosedBarOpen)
+      : (lastClosedBarHigh - lastClosedBarLow);
 
    if(swingState.currentSwingLeg.swingDirection == 0)
    {
@@ -580,7 +623,12 @@ void ProcessSwingStepAtShift(SwingState &swingState, const ENUM_TIMEFRAMES timef
    }
    else
    {
+      const int closingLegDirection = swingState.currentSwingLeg.swingDirection;
+
       SwingExtend(swingState, lastClosedBarHigh, lastClosedBarLow);
+
+      if(timeframe == PERIOD_M2)
+         OnM2SwingLegDirectionChange(closingLegDirection, nextSwingDirection);
 
       SwingCloseM2Leg(swingState, timeframe, swingLineColor, trendPrefix, labelPrefix, drawVisuals, sh);
 
@@ -712,6 +760,8 @@ void ProcessM15SwingStep(const int lastClosedBarShift = 1)
    }
    else
    {
+      SwingExtend(g_m15Swing, lastClosedBarHigh, lastClosedBarLow);
+
       SwingCloseM15Context(g_m15Swing, timeframe, sh);
 
       Swing closedSwingLeg = g_m15Swing.swingHistory[g_m15Swing.swingHistoryCount - 1];
@@ -749,8 +799,9 @@ void RefreshLiquidityHuntHud()
    }
    const string txt =
       g_detectOppositeM2FvgHunt
-      ? StringFormat("M15 breach → opp.M2 FVG hunt: ON  (fvgs=%d defer=%s)",
-                     g_oppositeFvgFoundDuringHuntCount, g_deferHuntEndUntilNextOppositeBos ? "Y" : "N")
+      ? StringFormat("M15 breach → opp.M2 FVG hunt: ON  (fvgs=%d oppBOS=%d defer=%s weak=%d)",
+                     g_oppositeFvgFoundDuringHuntCount, g_oppositeM2BosCountDuringHunt,
+                     g_deferHuntEndUntilNextOppositeBos ? "Y" : "N", g_weakPullback)
       : "M15 breach → opp.M2 FVG hunt: OFF";
    ObjectSetString(0, LQ_OBJ_HUNT_HUD, OBJPROP_TEXT, txt);
    ObjectSetInteger(0, LQ_OBJ_HUNT_HUD, OBJPROP_COLOR, g_detectOppositeM2FvgHunt ? clrLime : clrSilver);
@@ -900,8 +951,9 @@ bool TrySecondLastM15CompletedDownLegLow(double &outLow)
 
 //+------------------------------------------------------------------+
 bool TryNthM15CompletedSwingLeg(const int swingDirection, const int nFromLatest,
-                              double &outLegHigh, double &outLegLow)
+                              double &outLegHigh, double &outLegLow, datetime &outLegEndTime)
 {
+   outLegEndTime = 0;
    if(swingDirection == 0 || nFromLatest < 1)
       return false;
 
@@ -913,8 +965,9 @@ bool TryNthM15CompletedSwingLeg(const int swingDirection, const int nFromLatest,
       legsFound++;
       if(legsFound == nFromLatest)
       {
-         outLegHigh = g_m15Swing.swingHistory[i].legHighPrice;
-         outLegLow  = g_m15Swing.swingHistory[i].legLowPrice;
+         outLegHigh    = g_m15Swing.swingHistory[i].legHighPrice;
+         outLegLow     = g_m15Swing.swingHistory[i].legLowPrice;
+         outLegEndTime = g_m15Swing.swingHistory[i].legEndTime;
          return true;
       }
    }
@@ -922,37 +975,78 @@ bool TryNthM15CompletedSwingLeg(const int swingDirection, const int nFromLatest,
 }
 
 //+------------------------------------------------------------------+
-//| 2nd-last up high breached → bearish hunt only if older down leg     |
-//| high > latest down leg high (lower high on the more recent down).  |
+bool IsM15LegLiquidityAlreadyBreached(const datetime legEndTime, const bool isUpLegHighBreach)
+{
+   if(legEndTime == 0)
+      return false;
+
+   for(int i = 0; i < g_m15LegLiquidityBreachCount; i++)
+   {
+      if(g_m15LegLiquidityBreaches[i].legEndTime == legEndTime &&
+         g_m15LegLiquidityBreaches[i].isUpLegHighBreach == isUpLegHighBreach)
+         return true;
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+void RememberM15LegLiquidityBreach(const datetime legEndTime, const bool isUpLegHighBreach)
+{
+   if(legEndTime == 0)
+      return;
+
+   if(IsM15LegLiquidityAlreadyBreached(legEndTime, isUpLegHighBreach))
+      return;
+
+   if(g_m15LegLiquidityBreachCount < M15LegLiquidityBreachMemoryCapacity)
+   {
+      const int index = g_m15LegLiquidityBreachCount;
+      g_m15LegLiquidityBreaches[index].legEndTime         = legEndTime;
+      g_m15LegLiquidityBreaches[index].isUpLegHighBreach = isUpLegHighBreach;
+      g_m15LegLiquidityBreachCount++;
+      return;
+   }
+
+   for(int shiftIndex = 1; shiftIndex < M15LegLiquidityBreachMemoryCapacity; shiftIndex++)
+      g_m15LegLiquidityBreaches[shiftIndex - 1] = g_m15LegLiquidityBreaches[shiftIndex];
+
+   const int lastIndex = M15LegLiquidityBreachMemoryCapacity - 1;
+   g_m15LegLiquidityBreaches[lastIndex].legEndTime         = legEndTime;
+   g_m15LegLiquidityBreaches[lastIndex].isUpLegHighBreach = isUpLegHighBreach;
+}
+
+//+------------------------------------------------------------------+
+//| 2nd-last up high breach → hunt only if 2nd-last up high > latest up high. |
 //+------------------------------------------------------------------+
 bool M15AllowsBearishHuntWhenSecondLastUpHighBreached(const double pointSize)
+{
+   double latestUpHigh      = 0.0;
+   double latestUpLow       = 0.0;
+   double secondLastUpHigh  = 0.0;
+   double secondLastUpLow   = 0.0;
+   datetime legEndIgnored   = 0;
+   if(!TryNthM15CompletedSwingLeg(1, 1, latestUpHigh, latestUpLow, legEndIgnored))
+      return false;
+   if(!TryNthM15CompletedSwingLeg(1, 2, secondLastUpHigh, secondLastUpLow, legEndIgnored))
+      return false;
+   return (secondLastUpHigh > latestUpHigh + pointSize);
+}
+
+//+------------------------------------------------------------------+
+//| 2nd-last down low breach → hunt only if 2nd-last down low < latest down low. |
+//+------------------------------------------------------------------+
+bool M15AllowsBullishHuntWhenSecondLastDownLowBreached(const double pointSize)
 {
    double latestDownHigh     = 0.0;
    double latestDownLow      = 0.0;
    double secondLastDownHigh = 0.0;
    double secondLastDownLow  = 0.0;
-   if(!TryNthM15CompletedSwingLeg(-1, 1, latestDownHigh, latestDownLow))
+   datetime legEndIgnored    = 0;
+   if(!TryNthM15CompletedSwingLeg(-1, 1, latestDownHigh, latestDownLow, legEndIgnored))
       return false;
-   if(!TryNthM15CompletedSwingLeg(-1, 2, secondLastDownHigh, secondLastDownLow))
+   if(!TryNthM15CompletedSwingLeg(-1, 2, secondLastDownHigh, secondLastDownLow, legEndIgnored))
       return false;
-   return (secondLastDownHigh > latestDownHigh + pointSize);
-}
-
-//+------------------------------------------------------------------+
-//| 2nd-last down low breached → bullish hunt only if older up leg low  |
-//| < latest up leg low (higher low on the more recent up).            |
-//+------------------------------------------------------------------+
-bool M15AllowsBullishHuntWhenSecondLastDownLowBreached(const double pointSize)
-{
-   double latestUpHigh     = 0.0;
-   double latestUpLow      = 0.0;
-   double secondLastUpHigh = 0.0;
-   double secondLastUpLow  = 0.0;
-   if(!TryNthM15CompletedSwingLeg(1, 1, latestUpHigh, latestUpLow))
-      return false;
-   if(!TryNthM15CompletedSwingLeg(1, 2, secondLastUpHigh, secondLastUpLow))
-      return false;
-   return (secondLastUpLow < latestUpLow - pointSize);
+   return (secondLastDownLow < latestDownLow - pointSize);
 }
 
 //+------------------------------------------------------------------+
@@ -967,6 +1061,36 @@ bool M2WickCrossesBelowLevel(const double level, const double barLow, const doub
                              const double pointSize)
 {
    return (barLow < level - pointSize && prevLow >= level - pointSize);
+}
+
+//+------------------------------------------------------------------+
+//| Anticipation: arm hunt before exact sweep — high − N% range, low + N% range. |
+//+------------------------------------------------------------------+
+double M15BreachWickLevelForUpLegHigh(const double legHighPrice)
+{
+   if(InputM15BreachAnticipationPercentBelowUpHigh <= 0.0)
+      return legHighPrice;
+
+   const double referenceHeight = ReferenceChartHeightForFairValueGapFilterM2();
+   if(referenceHeight <= 0.0)
+      return legHighPrice;
+
+   return legHighPrice -
+          referenceHeight * (InputM15BreachAnticipationPercentBelowUpHigh / 100.0);
+}
+
+//+------------------------------------------------------------------+
+double M15BreachWickLevelForDownLegLow(const double legLowPrice)
+{
+   if(InputM15BreachAnticipationPercentAboveDownLow <= 0.0)
+      return legLowPrice;
+
+   const double referenceHeight = ReferenceChartHeightForFairValueGapFilterM2();
+   if(referenceHeight <= 0.0)
+      return legLowPrice;
+
+   return legLowPrice +
+          referenceHeight * (InputM15BreachAnticipationPercentAboveDownLow / 100.0);
 }
 
 //+------------------------------------------------------------------+
@@ -1116,6 +1240,253 @@ void DrawBosMarkedFairValueGapZone(const bool isBullishFairValueGap, const doubl
 }
 
 //+------------------------------------------------------------------+
+void LogHuntEvent(const string eventName, const string detail = "")
+{
+   if(!InputLogHuntEvents)
+      return;
+
+   const datetime barTime = iTime(_Symbol, PERIOD_M2, 1);
+   const string timeText  = (barTime != 0) ? TimeToString(barTime, TIME_DATE | TIME_MINUTES) : "no-bar";
+
+   if(StringLen(detail) > 0)
+      PrintFormat("liquidity_sweep [%s] %s | %s", timeText, eventName, detail);
+   else
+      PrintFormat("liquidity_sweep [%s] %s", timeText, eventName);
+}
+
+//+------------------------------------------------------------------+
+int OppositeM2LegDirectionForHunt()
+{
+   return g_m15HighWasBreached ? -1 : 1;
+}
+
+//+------------------------------------------------------------------+
+bool IsCurrentM2LegOppositeToHunt()
+{
+   if(!g_detectOppositeM2FvgHunt)
+      return false;
+   return (g_m2Swing.currentSwingLeg.swingDirection == OppositeM2LegDirectionForHunt());
+}
+
+//+------------------------------------------------------------------+
+void ResetWeakPullbackState()
+{
+   g_weakPullback = 0;
+   g_oppositeM2BosCountDuringHunt     = 0;
+   g_deferHuntEndUntilNextOppositeBos = false;
+   g_sawOppositeBosDuringOppositeM2Phase = false;
+}
+
+//+------------------------------------------------------------------+
+//| Weak/defer/oppBOS reset only: same-dir swing level taken by wick.   |
+//| Not M2 BOS (close break) — see TryDetectM2BreakOfStructureOnLastClosedBar. |
+//+------------------------------------------------------------------+
+bool TryM2WickBreachesSameDirectionLevelForHuntReset()
+{
+   if(!g_detectOppositeM2FvgHunt)
+      return false;
+
+   const double barHigh   = iHigh(_Symbol, PERIOD_M2, 1);
+   const double barLow    = iLow(_Symbol, PERIOD_M2, 1);
+   const double prevHigh  = iHigh(_Symbol, PERIOD_M2, 2);
+   const double prevLow   = iLow(_Symbol, PERIOD_M2, 2);
+   const double pointSize = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+
+   if(g_m15HighWasBreached)
+   {
+      if(g_m2Swing.currentSwingLeg.swingDirection == 1)
+      {
+         if(M2WickCrossesAboveLevel(g_m2Swing.currentSwingLeg.legHighPrice, barHigh, prevHigh, pointSize))
+            return true;
+      }
+
+      for(int historyIndex = g_m2Swing.swingHistoryCount - 1; historyIndex >= 0; historyIndex--)
+      {
+         if(g_m2Swing.swingHistory[historyIndex].swingDirection != 1)
+            continue;
+         if(M2WickCrossesAboveLevel(g_m2Swing.swingHistory[historyIndex].legHighPrice,
+                                    barHigh, prevHigh, pointSize))
+            return true;
+      }
+      return false;
+   }
+
+   if(g_m2Swing.currentSwingLeg.swingDirection == -1)
+   {
+      if(M2WickCrossesBelowLevel(g_m2Swing.currentSwingLeg.legLowPrice, barLow, prevLow, pointSize))
+         return true;
+   }
+
+   for(int historyIndex = g_m2Swing.swingHistoryCount - 1; historyIndex >= 0; historyIndex--)
+   {
+      if(g_m2Swing.swingHistory[historyIndex].swingDirection != -1)
+         continue;
+      if(M2WickCrossesBelowLevel(g_m2Swing.swingHistory[historyIndex].legLowPrice,
+                                 barLow, prevLow, pointSize))
+         return true;
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+void ApplySameDirectionBosHuntResets()
+{
+   g_weakPullback                      = 0;
+   g_oppositeM2BosCountDuringHunt      = 0;
+   g_oppositeFvgFoundDuringHuntCount   = 0;
+   g_deferHuntEndUntilNextOppositeBos  = false;
+   LogHuntEvent("SAME_DIR_WICK_RESET", "weak=0 oppBOS=0 fvgs=0 defer=N");
+}
+
+//+------------------------------------------------------------------+
+//| Opposite M2 leg closed with no opposite BOS in that phase → weak.  |
+//+------------------------------------------------------------------+
+void OnM2SwingLegDirectionChange(const int closingLegDirection, const int nextLegDirection)
+{
+   if(!g_detectOppositeM2FvgHunt)
+      return;
+
+   const int oppositeM2LegDirection = OppositeM2LegDirectionForHunt();
+
+   if(closingLegDirection == oppositeM2LegDirection && !g_sawOppositeBosDuringOppositeM2Phase)
+   {
+      g_weakPullback = 1;
+      LogHuntEvent("WEAK_PULLBACK_ON",
+                    StringFormat("closed opp leg dir=%d (no opp BOS in phase)", closingLegDirection));
+   }
+
+   if(nextLegDirection == oppositeM2LegDirection)
+   {
+      g_sawOppositeBosDuringOppositeM2Phase = false;
+      LogHuntEvent("OPPOSITE_PHASE_START", StringFormat("new opp leg dir=%d", nextLegDirection));
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Hunt override / fresh arm: session counters only (keep FVG history).|
+//+------------------------------------------------------------------+
+void ResetCurrentOppositeFvgHuntSession()
+{
+   g_oppositeFvgFoundDuringHuntCount = 0;
+   g_deferHuntEndUntilNextOppositeBos = false;
+   ResetWeakPullbackState();
+}
+
+//+------------------------------------------------------------------+
+//| Same rules as initial hunt arm: latest M15 leg, else 2nd-last.    |
+//+------------------------------------------------------------------+
+bool TryDetectM15WickLiquidityBreach(const double barHigh, const double barLow,
+                                     const double prevHigh, const double prevLow,
+                                     const double pointSize, double &outLevel,
+                                     bool &outHighBreached, datetime &outLegEndTime)
+{
+   outLevel        = 0.0;
+   outHighBreached = false;
+   outLegEndTime   = 0;
+
+   double legHigh = 0.0;
+   double legLow  = 0.0;
+   datetime legEnd = 0;
+
+   if(TryNthM15CompletedSwingLeg(1, 1, legHigh, legLow, legEnd) &&
+      !IsM15LegLiquidityAlreadyBreached(legEnd, true) &&
+      M2WickCrossesAboveLevel(M15BreachWickLevelForUpLegHigh(legHigh), barHigh, prevHigh, pointSize))
+   {
+      outLevel          = legHigh;
+      outLegEndTime     = legEnd;
+      outHighBreached   = true;
+      return true;
+   }
+
+   if(TryNthM15CompletedSwingLeg(1, 2, legHigh, legLow, legEnd) &&
+      !IsM15LegLiquidityAlreadyBreached(legEnd, true) &&
+      M2WickCrossesAboveLevel(M15BreachWickLevelForUpLegHigh(legHigh), barHigh, prevHigh, pointSize) &&
+      M15AllowsBearishHuntWhenSecondLastUpHighBreached(pointSize))
+   {
+      outLevel          = legHigh;
+      outLegEndTime     = legEnd;
+      outHighBreached   = true;
+      return true;
+   }
+
+   if(TryNthM15CompletedSwingLeg(-1, 1, legHigh, legLow, legEnd) &&
+      !IsM15LegLiquidityAlreadyBreached(legEnd, false) &&
+      M2WickCrossesBelowLevel(M15BreachWickLevelForDownLegLow(legLow), barLow, prevLow, pointSize))
+   {
+      outLevel          = legLow;
+      outLegEndTime     = legEnd;
+      outHighBreached   = false;
+      return true;
+   }
+
+   if(TryNthM15CompletedSwingLeg(-1, 2, legHigh, legLow, legEnd) &&
+      !IsM15LegLiquidityAlreadyBreached(legEnd, false) &&
+      M2WickCrossesBelowLevel(M15BreachWickLevelForDownLegLow(legLow), barLow, prevLow, pointSize) &&
+      M15AllowsBullishHuntWhenSecondLastDownLowBreached(pointSize))
+   {
+      outLevel          = legLow;
+      outLegEndTime     = legEnd;
+      outHighBreached   = false;
+      return true;
+   }
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
+bool IsDistinctM15BreachFromActiveHunt(const double m15Level, const bool m15HighBreached,
+                                       const double pointSize)
+{
+   if(m15HighBreached != g_m15HighWasBreached)
+      return true;
+   return (MathAbs(m15Level - g_m15BreachedLegLevelPrice) > pointSize);
+}
+
+//+------------------------------------------------------------------+
+void ArmOppositeFvgHuntAfterM15Breach(const double m15Level, const bool m15HighBreached,
+                                      const datetime breachedLegEndTime,
+                                      const double barClose, const double barLow,
+                                      const double barHigh, const bool isRestart)
+{
+   RememberM15LegLiquidityBreach(breachedLegEndTime, m15HighBreached);
+
+   if(isRestart)
+   {
+      LogHuntEvent("HUNT_RESTART",
+                   StringFormat("new M15 %s breach level=%.5f leg=%s (was %s %.5f) → %s FVG hunt",
+                                m15HighBreached ? "up high" : "down low", m15Level,
+                                TimeToString(breachedLegEndTime, TIME_DATE | TIME_MINUTES),
+                                g_m15HighWasBreached ? "high" : "low", g_m15BreachedLegLevelPrice,
+                                m15HighBreached ? "bearish" : "bullish"));
+      ResetCurrentOppositeFvgHuntSession();
+   }
+   else if(m15HighBreached)
+      LogHuntEvent("HUNT_ON",
+                   StringFormat("M15 up high hunt leg=%.5f wick>=%.5f (−%.1f%% rng) leg=%s → bearish FVG",
+                                m15Level, M15BreachWickLevelForUpLegHigh(m15Level),
+                                InputM15BreachAnticipationPercentBelowUpHigh,
+                                TimeToString(breachedLegEndTime, TIME_DATE | TIME_MINUTES)));
+   else
+      LogHuntEvent("HUNT_ON",
+                   StringFormat("M15 down low hunt leg=%.5f wick<=%.5f (+%.1f%% rng) leg=%s → bullish FVG",
+                                m15Level, M15BreachWickLevelForDownLegLow(m15Level),
+                                InputM15BreachAnticipationPercentAboveDownLow,
+                                TimeToString(breachedLegEndTime, TIME_DATE | TIME_MINUTES)));
+
+   g_detectOppositeM2FvgHunt             = true;
+   g_m15HighWasBreached                  = m15HighBreached;
+   g_m15BreachedLegLevelPrice            = m15Level;
+   g_closeWhenM15LiquidityBreached     = barClose;
+   g_pathMinLowSinceM15Breach          = barLow;
+   g_pathMaxHighSinceM15Breach         = barHigh;
+   g_impulseCloseExtremeSinceM15Breach  = barClose;
+   g_m15BreachM2BarOpenTime = iTime(_Symbol, PERIOD_M2, 1);
+
+   if(!isRestart)
+      ResetCurrentOppositeFvgHuntSession();
+}
+
+//+------------------------------------------------------------------+
 //| M15 leg crossed by M2 wick on last closed bar → hunt ON; opposite  |
 //| FVG; hunt OFF after opposite FVG + opposite BOS, or second opp.   |
 //| BOS if no FVG yet, or opposite BOS then later opposite FVG.        |
@@ -1134,8 +1505,21 @@ void ProcessBosOppositeFairValueGapWindow()
 
    if(g_detectOppositeM2FvgHunt)
    {
-      g_pathMinLowSinceM15Breach  = MathMin(g_pathMinLowSinceM15Breach, barLow);
-      g_pathMaxHighSinceM15Breach = MathMax(g_pathMaxHighSinceM15Breach, barHigh);
+      double m15Level = 0.0;
+      bool m15HighBreached = false;
+      datetime breachedLegEndTime = 0;
+      if(TryDetectM15WickLiquidityBreach(barHigh, barLow, prevHigh, prevLow, pointSize,
+                                         m15Level, m15HighBreached, breachedLegEndTime) &&
+         IsDistinctM15BreachFromActiveHunt(m15Level, m15HighBreached, pointSize))
+      {
+         ArmOppositeFvgHuntAfterM15Breach(m15Level, m15HighBreached, breachedLegEndTime,
+                                          barClose, barLow, barHigh, true);
+      }
+      else
+      {
+         g_pathMinLowSinceM15Breach  = MathMin(g_pathMinLowSinceM15Breach, barLow);
+         g_pathMaxHighSinceM15Breach = MathMax(g_pathMaxHighSinceM15Breach, barHigh);
+      }
 
       if(InputBosMaxImpulsePercentOfChartRangeBeforeOppositeFvg > 0.0)
       {
@@ -1161,14 +1545,76 @@ void ProcessBosOppositeFairValueGapWindow()
             }
             if(cancelHunt)
             {
+               LogHuntEvent("HUNT_OFF", StringFormat("impulse cancel close=%.5f limit=%.5f",
+                                                     barClose, limitPrice));
                g_detectOppositeM2FvgHunt            = false;
                g_m15BreachM2BarOpenTime            = 0;
                g_oppositeFvgFoundDuringHuntCount  = 0;
                g_deferHuntEndUntilNextOppositeBos = false;
+               ResetWeakPullbackState();
                ClearImpulseCancelBufferZone();
                return;
             }
          }
+      }
+
+      if(TryM2WickBreachesSameDirectionLevelForHuntReset())
+         ApplySameDirectionBosHuntResets();
+
+      bool bosExpectsBullishFairValueGap = false;
+      double bosLegIgnored = 0.0;
+      if(TryDetectM2BreakOfStructureOnLastClosedBar(bosExpectsBullishFairValueGap, bosLegIgnored))
+      {
+         const bool oppositeBosClearsHunt =
+            (g_m15HighWasBreached && bosExpectsBullishFairValueGap) ||
+            (!g_m15HighWasBreached && !bosExpectsBullishFairValueGap);
+
+         if(oppositeBosClearsHunt)
+         {
+            if(IsCurrentM2LegOppositeToHunt())
+            {
+               g_sawOppositeBosDuringOppositeM2Phase = true;
+               LogHuntEvent("OPP_BOS_IN_PHASE",
+                            StringFormat("expectsBullFVG=%s leg=%.5f",
+                                         bosExpectsBullishFairValueGap ? "Y" : "N", bosLegIgnored));
+            }
+
+            g_oppositeM2BosCountDuringHunt++;
+
+            if(g_oppositeFvgFoundDuringHuntCount > 0)
+            {
+               LogHuntEvent("HUNT_OFF",
+                            StringFormat("opposite BOS + FVG (oppBOS=%d fvgs=%d)",
+                                         g_oppositeM2BosCountDuringHunt, g_oppositeFvgFoundDuringHuntCount));
+               g_detectOppositeM2FvgHunt            = false;
+               g_m15BreachM2BarOpenTime            = 0;
+               g_oppositeFvgFoundDuringHuntCount  = 0;
+               ResetWeakPullbackState();
+               ClearImpulseCancelBufferZone();
+               return;
+            }
+            if(g_oppositeM2BosCountDuringHunt >= 2)
+            {
+               LogHuntEvent("HUNT_OFF",
+                            StringFormat("2nd opposite BOS oppBOS=%d (no FVG)",
+                                         g_oppositeM2BosCountDuringHunt));
+               g_detectOppositeM2FvgHunt            = false;
+               g_m15BreachM2BarOpenTime            = 0;
+               g_oppositeFvgFoundDuringHuntCount  = 0;
+               ResetWeakPullbackState();
+               ClearImpulseCancelBufferZone();
+               return;
+            }
+            if(g_oppositeM2BosCountDuringHunt < 2)
+            {
+               g_deferHuntEndUntilNextOppositeBos = true;
+               LogHuntEvent("OPP_BOS_DEFER",
+                            StringFormat("oppBOS=%d defer=Y (no FVG yet)", g_oppositeM2BosCountDuringHunt));
+            }
+         }
+         else
+            LogHuntEvent("SAME_DIR_BOS_DETECT",
+                         StringFormat("expectsBullFVG=%s (history BOS)", bosExpectsBullishFairValueGap ? "Y" : "N"));
       }
 
       bool isBullishFairValueGap = false;
@@ -1180,7 +1626,10 @@ void ProcessBosOppositeFairValueGapWindow()
          const bool polarityMatchesHunt =
             (g_m15HighWasBreached && !isBullishFairValueGap) ||
             (!g_m15HighWasBreached && isBullishFairValueGap);
-         if(polarityMatchesHunt)
+         if(polarityMatchesHunt && g_weakPullback != 0)
+            LogHuntEvent("FVG_SKIP", StringFormat("weak=1 %s FVG",
+                                                  isBullishFairValueGap ? "bull" : "bear"));
+         else if(polarityMatchesHunt && g_weakPullback == 0)
          {
             const datetime newestBarOpenTime = iTime(_Symbol, PERIOD_M2, 1);
             const datetime oldestBarOpenTime = iTime(_Symbol, PERIOD_M2, 3);
@@ -1204,13 +1653,21 @@ void ProcessBosOppositeFairValueGapWindow()
                   DrawBosMarkedFairValueGapZone(isBullishFairValueGap, fairValueGapZoneLowPrice,
                                                fairValueGapZoneHighPrice, oldestBarOpenTime, newestBarOpenTime);
                   g_oppositeFvgFoundDuringHuntCount++;
+                  LogHuntEvent("FVG_MARKED",
+                               StringFormat("%s fvgs=%d zone=%.5f-%.5f defer=%s",
+                                            isBullishFairValueGap ? "bull" : "bear",
+                                            g_oppositeFvgFoundDuringHuntCount,
+                                            fairValueGapZoneLowPrice, fairValueGapZoneHighPrice,
+                                            g_deferHuntEndUntilNextOppositeBos ? "Y" : "N"));
 
                   if(g_deferHuntEndUntilNextOppositeBos)
                   {
+                     LogHuntEvent("HUNT_OFF", "opposite FVG after deferred opposite BOS");
                      g_detectOppositeM2FvgHunt            = false;
                      g_m15BreachM2BarOpenTime            = 0;
                      g_oppositeFvgFoundDuringHuntCount  = 0;
                      g_deferHuntEndUntilNextOppositeBos = false;
+                     ResetWeakPullbackState();
                      ClearImpulseCancelBufferZone();
                      return;
                   }
@@ -1219,98 +1676,19 @@ void ProcessBosOppositeFairValueGapWindow()
          }
       }
 
-      bool bosExpectsBullishFairValueGap = false;
-      double bosLegIgnored = 0.0;
-      if(TryDetectM2BreakOfStructureOnLastClosedBar(bosExpectsBullishFairValueGap, bosLegIgnored))
-      {
-         const bool oppositeBosClearsHunt =
-            (g_m15HighWasBreached && bosExpectsBullishFairValueGap) ||
-            (!g_m15HighWasBreached && !bosExpectsBullishFairValueGap);
-         if(oppositeBosClearsHunt)
-         {
-            if(g_oppositeFvgFoundDuringHuntCount > 0)
-            {
-               g_detectOppositeM2FvgHunt            = false;
-               g_m15BreachM2BarOpenTime            = 0;
-               g_oppositeFvgFoundDuringHuntCount  = 0;
-               g_deferHuntEndUntilNextOppositeBos = false;
-               ClearImpulseCancelBufferZone();
-               return;
-            }
-            if(!g_deferHuntEndUntilNextOppositeBos)
-               g_deferHuntEndUntilNextOppositeBos = true;
-            else
-            {
-               g_detectOppositeM2FvgHunt            = false;
-               g_m15BreachM2BarOpenTime            = 0;
-               g_oppositeFvgFoundDuringHuntCount  = 0;
-               g_deferHuntEndUntilNextOppositeBos = false;
-               ClearImpulseCancelBufferZone();
-               return;
-            }
-         }
-      }
       UpdateImpulseCancelBufferZone();
       return;
    }
 
    double m15Level = 0.0;
    bool m15HighBreached = false;
+   datetime breachedLegEndTime = 0;
 
-   if(TryLatestM15CompletedUpLegHigh(m15Level) &&
-      M2WickCrossesAboveLevel(m15Level, barHigh, prevHigh, pointSize))
+   if(TryDetectM15WickLiquidityBreach(barHigh, barLow, prevHigh, prevLow, pointSize,
+                                      m15Level, m15HighBreached, breachedLegEndTime))
    {
-      m15HighBreached = true;
-   }
-   else if(TrySecondLastM15CompletedUpLegHigh(m15Level) &&
-           M2WickCrossesAboveLevel(m15Level, barHigh, prevHigh, pointSize) &&
-           M15AllowsBearishHuntWhenSecondLastUpHighBreached(pointSize))
-   {
-      m15HighBreached = true;
-   }
-
-   if(m15HighBreached)
-   {
-      g_detectOppositeM2FvgHunt            = true;
-      g_m15HighWasBreached                 = true;
-      g_m15BreachedLegLevelPrice           = m15Level;
-      g_closeWhenM15LiquidityBreached    = barClose;
-      g_pathMinLowSinceM15Breach         = barLow;
-      g_pathMaxHighSinceM15Breach        = barHigh;
-      g_impulseCloseExtremeSinceM15Breach = barClose;
-      g_m15BreachM2BarOpenTime            = iTime(_Symbol, PERIOD_M2, 1);
-      g_oppositeFvgFoundDuringHuntCount  = 0;
-      g_deferHuntEndUntilNextOppositeBos = false;
-      UpdateImpulseCancelBufferZone();
-      return;
-   }
-
-   bool m15LowBreached = false;
-
-   if(TryLatestM15CompletedDownLegLow(m15Level) &&
-      M2WickCrossesBelowLevel(m15Level, barLow, prevLow, pointSize))
-   {
-      m15LowBreached = true;
-   }
-   else if(TrySecondLastM15CompletedDownLegLow(m15Level) &&
-           M2WickCrossesBelowLevel(m15Level, barLow, prevLow, pointSize) &&
-           M15AllowsBullishHuntWhenSecondLastDownLowBreached(pointSize))
-   {
-      m15LowBreached = true;
-   }
-
-   if(m15LowBreached)
-   {
-      g_detectOppositeM2FvgHunt            = true;
-      g_m15HighWasBreached                 = false;
-      g_m15BreachedLegLevelPrice           = m15Level;
-      g_closeWhenM15LiquidityBreached    = barClose;
-      g_pathMinLowSinceM15Breach         = barLow;
-      g_pathMaxHighSinceM15Breach        = barHigh;
-      g_impulseCloseExtremeSinceM15Breach = barClose;
-      g_m15BreachM2BarOpenTime            = iTime(_Symbol, PERIOD_M2, 1);
-      g_oppositeFvgFoundDuringHuntCount  = 0;
-      g_deferHuntEndUntilNextOppositeBos = false;
+      ArmOppositeFvgHuntAfterM15Breach(m15Level, m15HighBreached, breachedLegEndTime,
+                                       barClose, barLow, barHigh, false);
       UpdateImpulseCancelBufferZone();
    }
    else
