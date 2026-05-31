@@ -1,10 +1,10 @@
 //+------------------------------------------------------------------+
-//| liquidity_sweep_v2.mq5                                          |
-//| v2: touch level, clear hunt FVGs on same-dir BOS while hunt ON, OV after hunt off |
+//| liquidity_sweep_v4.mq5                                          |
+//| v4: M2 absorption-leg TP base (0.9x/1.4x/1.9x) after touch; defer if leg open |
 //+------------------------------------------------------------------+
 #property copyright ""
-#property version   "2.44"
-#property description "Liquidity sweep v2"
+#property version   "4.24"
+#property description "Liquidity sweep v4 — M2-close sticky BOS + pivot BOS watch"
 
 #include <Trade\Trade.mqh>
 
@@ -19,10 +19,11 @@ input int    InputM2SwingWarmupBars      = 500; // 0 = off: replay M2 on attach 
 
 input group "M15 breach → opposite M2 FVG (plot_swing_m2_copy)"
 input bool   InputEnableOppositeFvgHuntAfterM15Breach = true;
-input bool   InputEndHuntOnOppositeM15LegBeforeTouch = false; // on: hunt OFF if touch line set but price never hit it when opposite M15 leg closes (no orders)
+input bool   InputEndHuntOnOppositeM15LegBeforeTouch = true; // on: hunt OFF if touch line set but price never hit it when opposite M15 leg closes (no orders)
 input bool   InputDrawBosOppositeFairValueGapZones   = true;
 input double InputM15BreachAnticipationPercentBelowUpHigh = 2.0;  // 0=exact leg high; wick cross (high − N% M2 range) arms hunt
 input double InputM15BreachAnticipationPercentAboveDownLow = 2.0; // 0=exact leg low; wick cross (low + N% M2 range) arms hunt
+input int    InputM15LiquidityPivotLookbackBars = 1166; // M15 swing legs: up-leg highs / down-leg lows dominant vs newer same-dir legs
 input double InputBosMaxImpulsePercentOfChartRangeBeforeOppositeFvg = 20.0; // 0=off; % of M2 chart range from breach level
 input bool   InputDrawImpulseCancelBufferZone = true;  // hollow rect while hunt ON
 input color  InputImpulseCancelBufferColor    = clrDarkOrange;
@@ -31,6 +32,14 @@ input double InputFairValueGapMinimumPercentOfChartRange = 3.0; // min FVG gap =
 input int    InputMaximumFairValueGapRectangles = 120;
 input bool   InputShowLiquidityHuntHud   = true;
 input bool   InputLogHuntEvents          = true;  // Experts tab: hunt / FVG / BOS
+
+input group "M15 BOS trade direction bias"
+input bool   InputEnableM15BosTradeDirectionBias = true;  // trade with sticky M15 BOS bias (2 same-dir BOS to set/flip)
+input double InputM15BosMinBreakPercentOfLegRange = 10.0; // decent BOS: M2 close beyond latest M15 leg extreme by N% of M2 chart (InputChartRangeBarCount)
+input bool   InputEnableM15PivotBosBiasFlip      = true;  // on qualified BOS: watch nearest distant pivot until same-dir M15 leg ends
+input double InputM15PivotBosMinSepPercentOfChart = 25.0; // pivot must be >= N% of M2 chart height beyond BOS broken level
+input int    InputM15PivotBosChartRangeM2Bars    = 292;   // M2 bar count for pivot separation chart height
+input bool   InputShowM15BosBiasHud              = true;  // top-right ↑ green / ↓ red (plot_swing_m2 style)
 
 input group "FVG trade (M2 opposite FVG)"
 input bool   InputEnableAutomatedTrading = true;   // false = log trade plan only (no orders)
@@ -85,6 +94,7 @@ const string PFX_M2_LBL   = "LQ2_M2_LB_";
 const string LQ_OBJ_PREFIX_FVG_RECT = "LQ2_M2_FVG_";
 const string LQ_OBJ_PREFIX_FVG_LBL  = "LQ2_M2_FVGT_";
 const string LQ_OBJ_HUNT_HUD        = "LQ2_HUNT_HUD";
+const string LQ_OBJ_M15_BIAS_HUD    = "LQ4_M15_BIAS";
 const string LQ_OBJ_IMPULSE_BUFFER  = "LQ2_IMPULSE_BUF";
 const string LQ_OBJ_TOUCH_POINT     = "LQ2_TOUCH_PT";
 const string LQ_OBJ_IMPULSE_PREFIX  = "LQ2_IMPULSE_BUF_";
@@ -130,6 +140,8 @@ struct V2HuntSession
    double   tradeTp1Price;
    double   preEntryCancelTpLevel;
    bool     firstOppBosMgmtDone;
+   bool     awaitM2AbsorptionLegForTp;
+   datetime awaitM2AbsorptionLegStartTime;
 };
 
 #define BosOppositeFairValueGapMemoryCapacity 32
@@ -139,6 +151,26 @@ struct M15LegLiquidityBreachRecord
 {
    datetime legEndTime;
    bool     isUpLegHighBreach;
+};
+
+#define M15_LIQUIDITY_PIVOT_CAPACITY 600
+#define M15_REPLAY_LEG_CAPACITY      512
+
+struct M15LiquidityPivot
+{
+   double   levelPrice;
+   datetime legEndTime;
+   double   legHighPrice;
+   double   legLowPrice;
+   int      swingDirection; // 1 = up leg (high liquidity), -1 = down leg (low liquidity)
+};
+
+struct M15ReplayLeg
+{
+   double   legHighPrice;
+   double   legLowPrice;
+   datetime legEndTime;
+   int      swingDirection;
 };
 
 SwingState     g_m15Swing;
@@ -154,7 +186,52 @@ V2HuntSession g_v2Hunts[V2_MAX_HUNT_SESSIONS];
 M15LegLiquidityBreachRecord g_m15LegLiquidityBreaches[M15LegLiquidityBreachMemoryCapacity];
 int                         g_m15LegLiquidityBreachCount = 0;
 
-// Global trade watch (pre-entry TP3 cancel); per-hunt state in g_v2Hunts[] (sessionId in LQ2_HS comments).
+M15LiquidityPivot g_m15DescHighPivots[M15_LIQUIDITY_PIVOT_CAPACITY];
+int               g_m15DescHighPivotCount = 0;
+M15LiquidityPivot g_m15AscLowPivots[M15_LIQUIDITY_PIVOT_CAPACITY];
+int               g_m15AscLowPivotCount = 0;
+
+#define M15_BOS_RECORDED_LEG_CAPACITY 32
+
+struct M15BosRecord
+{
+   int      direction;   // 1 = bull BOS, -1 = bear BOS
+   datetime barOpenTime;
+   datetime legEndTime;  // completed M15 leg that was broken (dedupe key)
+   double   brokenLevel;
+};
+
+struct M15BosRecordedLeg
+{
+   int      direction;
+   datetime legEndTime;
+};
+
+M15BosRecord        g_m15LastBosRecord;
+bool                g_m15LastBosRecordValid     = false;
+M15BosRecordedLeg   g_m15BosRecordedLegs[M15_BOS_RECORDED_LEG_CAPACITY];
+int                 g_m15BosRecordedLegCount    = 0;
+int                 g_m15BosStreakDir             = 0;
+int                 g_m15BosStreakCount           = 0;
+int                 g_m15StickyTradeDirectionBias = 0;
+
+struct M15PivotBosWatchState
+{
+   bool     active;
+   int      direction;        // 1 = bull watch (pivot high), -1 = bear watch (pivot low)
+   double   pivotTargetLevel;
+   double   bosBrokenLevel;
+   datetime bosBarOpenTime;
+   bool     sameDirLegSeen;   // entered up leg (bull) / down leg (bear) since arm
+};
+
+M15PivotBosWatchState g_m15PivotBosWatch;
+int                   g_m15PivotInstantBias = 0; // 1 bull / -1 bear override from pivot break; 0 = use sticky only
+int                   g_m15LastLoggedEffectiveBias = 0;
+bool                  g_m15EffectiveBiasLogReady = false;
+
+bool g_m15PendingUpLegClosedForBos   = false;
+bool g_m15PendingDownLegClosedForBos = false;
 bool     g_huntTradeOrdersActive         = false;
 datetime g_huntOrdersFvgFormationTime    = 0;
 bool     g_huntTradeIsBuy                = false;
@@ -205,8 +282,34 @@ bool   TryNthM15CompletedSwingLeg(const int swingDirection, const int nFromLates
                                   double &outLegHigh, double &outLegLow, datetime &outLegEndTime);
 bool   IsM15LegLiquidityAlreadyBreached(const datetime legEndTime, const bool isUpLegHighBreach);
 void   RememberM15LegLiquidityBreach(const datetime legEndTime, const bool isUpLegHighBreach);
-bool   M15AllowsBearishHuntWhenSecondLastUpHighBreached(const double pointSize);
-bool   M15AllowsBullishHuntWhenSecondLastDownLowBreached(const double pointSize);
+void   RebuildM15LiquidityPivotLevels();
+bool   TryDetectM15BosCrossOnBar(const int m15BarShift, int &outDirection,
+                                 double &outBrokenLevel, datetime &outBarOpenTime);
+bool   CloseCrossesAboveLevel(const ENUM_TIMEFRAMES timeframe, const int barShift, const double level);
+bool   CloseCrossesBelowLevel(const ENUM_TIMEFRAMES timeframe, const int barShift, const double level);
+void   UpdateM15BosWatchSameDirLegSeen();
+bool   IsM15PivotBosWatchSameCross(const int direction, const double brokenLevel);
+void   TryArmM15PivotBosOnCross(const int m15BarShift);
+void   ProcessM15StickyBosOnM2Close(const int m2BarShift);
+void   ProcessM15PivotBosWatchStep(const ENUM_TIMEFRAMES crossTimeframe, const int crossBarShift,
+                                   const bool upLegClosed, const bool downLegClosed);
+void   ProcessM15BosOnM2BarClose();
+double M15BosMinBreakDistance();
+void   PushM15BosHistory(const int direction, const datetime barOpenTime, const datetime legEndTime,
+                         const double brokenLevel);
+bool   M15StickyBosAlreadyRecordedForLeg(const int direction, const datetime legEndTime);
+void   ResetM15StickyBosState();
+double ReferenceChartHeightForM2BarCount(const int barCount);
+double M15PivotBosMinSeparationPrice();
+bool   FindNearestDistantPivotHighAbove(const double brokenLevel, double &outPivotHigh);
+bool   FindNearestDistantPivotLowBelow(const double brokenLevel, double &outPivotLow);
+void   ArmM15PivotBosWatch(const int bosDirection, const double brokenLevel, const datetime bosBarOpenTime);
+void   DisarmM15PivotBosWatch();
+int    ComputeM15StickyTradeDirectionBias();
+int    GetM15TradeDirectionBias(); // 1 bull, -1 bear, 0 undefined/mixed/disabled-filter
+void   LogM15TradeDirectionBiasIfChanged();
+bool   FvgTradeAllowedByM15BosBias(const bool isBullishFairValueGap, string &outBlockReason);
+void   RefreshM15BosBiasHud();
 bool   M2WickCrossesAboveLevel(const double level, const double barHigh, const double prevHigh,
                                const double pointSize);
 bool   M2WickCrossesBelowLevel(const double level, const double barLow, const double prevLow,
@@ -322,12 +425,15 @@ bool   SameDirectionM2BosBetweenEntryAndTp3Since(const bool isBuy, const double 
                                                   const double tp3Level, const datetime sinceTime);
 bool   ResolveFvgEntryPrice(const bool isBullishFairValueGap, const double zoneLowPrice,
                             const double zoneHighPrice, bool &outUseMarketOrder, double &outEntryPrice);
-bool   ComputeM15LegTraceRemainingTakeProfits(const bool isBullishFairValueGap, const double entryPrice,
-                                               double &outPreviousLegRange,
-                                               double &outTakeProfitPrices[]);
+bool   ComputeM2AbsorptionLegTakeProfits(const bool isBullishFairValueGap, const double entryPrice,
+                                         const double m2LegRange, double &outTakeProfitPrices[]);
+int    V4M2TradeLegDirectionForFvg(const bool isBullishFairValueGap);
+bool   V4ResolveOrDeferM2AbsorptionLegRange(const int huntIndex, const bool isBullishFairValueGap,
+                                            double &outM2LegRange, bool &outDeferred);
+void   V4TryPlaceDeferredTradesOnM2LegClose(const Swing &closedLeg);
 void   TryPlaceOppositeFvgTradeSetup(const bool isBullishFairValueGap, const double zoneLowPrice,
                                        const double zoneHighPrice, const datetime formationTime,
-                                       const datetime huntSessionId);
+                                       const datetime huntSessionId, const double m2LegRange);
 bool   IsFvgAutomatedTradingAllowed(string &outBlockReason);
 bool   TryFallbackLimitEntryToMarket(const bool isBullishFairValueGap, const double zoneLowPrice,
                                      const double zoneHighPrice, bool &inOutUseMarketOrder,
@@ -381,23 +487,28 @@ int OnInit()
 
    V2InitAllHuntSlots();
    g_m15LegLiquidityBreachCount       = 0;
+   ResetM15StickyBosState();
+   ZeroMemory(g_m15PivotBosWatch);
+   g_m15PivotInstantBias              = 0;
+   g_m15PendingUpLegClosedForBos      = false;
+   g_m15PendingDownLegClosedForBos    = false;
    ResetHuntTradeState();
 
    WarmupM15SwingFromHistory();
    WarmupM2SwingFromHistory();
+   ResetM15StickyBosState();
+   RebuildM15LiquidityPivotLevels();
+   g_m15LastLoggedEffectiveBias = GetM15TradeDirectionBias();
+   g_m15EffectiveBiasLogReady   = true;
 
    g_lastM15BarOpen = iTime(_Symbol, PERIOD_M15, 0);
    g_lastM2BarOpen  = iTime(_Symbol, PERIOD_M2, 0);
-   if(g_lastM2BarOpen == 0)
-      Print("liquidity_sweep_v2: PERIOD_M2 iTime(0)==0 — symbol may not provide M2 bars.");
 
    g_trade.SetExpertMagicNumber(LQ_EXPERT_MAGIC);
    ApplyTradeFillingModeFromSymbol();
-   string tradeBlockReason = "";
-   if(!IsFvgAutomatedTradingAllowed(tradeBlockReason))
-      Print("liquidity_sweep_v2: FVG orders blocked — ", tradeBlockReason);
 
    RefreshLiquidityHuntHud();
+   RefreshM15BosBiasHud();
 
    ChartRedraw(0);
    EventSetTimer(1);
@@ -415,6 +526,7 @@ void OnDeinit(const int reason)
    ObjectsDeleteAll(0, LQ_OBJ_PREFIX_FVG_RECT, -1, -1);
    ObjectsDeleteAll(0, LQ_OBJ_PREFIX_FVG_LBL, -1, -1);
    ObjectDelete(0, LQ_OBJ_HUNT_HUD);
+   ObjectDelete(0, LQ_OBJ_M15_BIAS_HUD);
    ObjectsDeleteAll(0, LQ_OBJ_IMPULSE_PREFIX, -1, -1);
    ObjectsDeleteAll(0, LQ_OBJ_TOUCH_POINT, -1, -1);
 }
@@ -436,7 +548,14 @@ void OnTick()
    if(tM15 != g_lastM15BarOpen)
    {
       g_lastM15BarOpen = tM15;
+      const int prevM15LegDir = g_m15Swing.currentSwingLeg.swingDirection;
       ProcessM15SwingStep(1);
+      const int newM15LegDir = g_m15Swing.currentSwingLeg.swingDirection;
+      if(prevM15LegDir == 1 && newM15LegDir == -1)
+         g_m15PendingUpLegClosedForBos = true;
+      if(prevM15LegDir == -1 && newM15LegDir == 1)
+         g_m15PendingDownLegClosedForBos = true;
+      RebuildM15LiquidityPivotLevels();
    }
 
    const datetime tM2 = iTime(_Symbol, PERIOD_M2, 0);
@@ -447,6 +566,7 @@ void OnTick()
          ProcessBosOppositeFairValueGapWindow();
       ProcessM2SwingStep();
       ManageHuntOpenPositionsOnM2BarClose();
+      ProcessM15BosOnM2BarClose();
       RefreshLiquidityHuntHud();
    }
 }
@@ -461,7 +581,12 @@ void WarmupM15SwingFromHistory()
    if(n < 1)
       return;
    for(int k = n; k >= 1; k--)
+   {
       ProcessM15SwingStep(k);
+      RebuildM15LiquidityPivotLevels();
+      TryArmM15PivotBosOnCross(k);
+   }
+   DisarmM15PivotBosWatch();
 }
 
 //+------------------------------------------------------------------+
@@ -472,16 +597,16 @@ void WarmupM2SwingFromHistory()
    const int bars = iBars(_Symbol, PERIOD_M2);
    const int minNeed = 8;
    if(bars < minNeed)
-   {
-      Print("liquidity_sweep_v2: M2 warmup skipped (need ", minNeed, " M2 bars; have ", bars, ")");
       return;
-   }
    const int n = (int)MathMin(bars - 2, InputM2SwingWarmupBars);
    if(n < 1)
       return;
    for(int k = n; k >= 1; k--)
+   {
       ProcessSwingStepAtShift(g_m2Swing, PERIOD_M2, k, InputM2SwingLineColor, PFX_M2_TREND, PFX_M2_LBL,
                               InputDrawM2SwingLegs);
+      ProcessM15StickyBosOnM2Close(k);
+   }
 }
 
 //+------------------------------------------------------------------+
@@ -730,8 +855,13 @@ void ProcessSwingStepAtShift(SwingState &swingState, const ENUM_TIMEFRAMES timef
 
       SwingExtend(swingState, lastClosedBarHigh, lastClosedBarLow);
 
+      const Swing closingLegSnapshot = swingState.currentSwingLeg;
+
       if(timeframe == PERIOD_M2)
          OnM2SwingLegDirectionChange(closingLegDirection, nextSwingDirection);
+
+      if(timeframe == PERIOD_M2)
+         V4TryPlaceDeferredTradesOnM2LegClose(closingLegSnapshot);
 
       SwingCloseM2Leg(swingState, timeframe, swingLineColor, trendPrefix, labelPrefix, drawVisuals, sh);
 
@@ -922,9 +1052,570 @@ void RefreshLiquidityHuntHud()
 }
 
 //+------------------------------------------------------------------+
-double ReferenceChartHeightForFairValueGapFilterM2()
+//| M15 BOS cross: close cross of last same-dir swing leg (barShift 0 = live M2 checks). |
+//+------------------------------------------------------------------+
+bool TryDetectM15BosCrossOnBar(const int m15BarShift, int &outDirection,
+                               double &outBrokenLevel, datetime &outBarOpenTime)
 {
-   const int barCount = InputChartRangeBarCount;
+   outDirection   = 0;
+   outBrokenLevel = 0.0;
+   outBarOpenTime = 0;
+
+   if(m15BarShift < 0 || g_m15Swing.swingHistoryCount < 1)
+      return false;
+
+   const ENUM_TIMEFRAMES tf = PERIOD_M15;
+   const double closePrice  = iClose(_Symbol, tf, m15BarShift);
+   const double prevClose   = iClose(_Symbol, tf, m15BarShift + 1);
+   const double pointSize   = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+
+   outBarOpenTime = iTime(_Symbol, tf, m15BarShift);
+   if(outBarOpenTime == 0)
+      return false;
+
+   for(int historyIndex = g_m15Swing.swingHistoryCount - 1; historyIndex >= 0; historyIndex--)
+   {
+      if(g_m15Swing.swingHistory[historyIndex].swingDirection != 1)
+         continue;
+
+      const double legHigh = g_m15Swing.swingHistory[historyIndex].legHighPrice;
+      if(closePrice > legHigh + pointSize && prevClose <= legHigh + pointSize)
+      {
+         outDirection   = 1;
+         outBrokenLevel = legHigh;
+         return true;
+      }
+      break;
+   }
+
+   for(int historyIndex = g_m15Swing.swingHistoryCount - 1; historyIndex >= 0; historyIndex--)
+   {
+      if(g_m15Swing.swingHistory[historyIndex].swingDirection != -1)
+         continue;
+
+      const double legLow = g_m15Swing.swingHistory[historyIndex].legLowPrice;
+      if(closePrice < legLow - pointSize && prevClose >= legLow - pointSize)
+      {
+         outDirection   = -1;
+         outBrokenLevel = legLow;
+         return true;
+      }
+      break;
+   }
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
+bool CloseCrossesAboveLevel(const ENUM_TIMEFRAMES timeframe, const int barShift, const double level)
+{
+   const double closePrice = iClose(_Symbol, timeframe, barShift);
+   const double prevClose  = iClose(_Symbol, timeframe, barShift + 1);
+   const double pointSize  = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   return (closePrice > level + pointSize && prevClose <= level + pointSize);
+}
+
+//+------------------------------------------------------------------+
+bool CloseCrossesBelowLevel(const ENUM_TIMEFRAMES timeframe, const int barShift, const double level)
+{
+   const double closePrice = iClose(_Symbol, timeframe, barShift);
+   const double prevClose  = iClose(_Symbol, timeframe, barShift + 1);
+   const double pointSize  = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   return (closePrice < level - pointSize && prevClose >= level - pointSize);
+}
+
+//+------------------------------------------------------------------+
+bool IsM15PivotBosWatchSameCross(const int direction, const double brokenLevel)
+{
+   if(!g_m15PivotBosWatch.active)
+      return false;
+
+   const double pointSize = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   const double eps       = (pointSize > 0.0 ? pointSize : 0.00001);
+   return (g_m15PivotBosWatch.direction == direction &&
+           MathAbs(g_m15PivotBosWatch.bosBrokenLevel - brokenLevel) <= eps);
+}
+
+//+------------------------------------------------------------------+
+void UpdateM15BosWatchSameDirLegSeen()
+{
+   if(!g_m15PivotBosWatch.active)
+      return;
+
+   if(g_m15PivotBosWatch.direction == 1 &&
+      g_m15Swing.currentSwingLeg.swingDirection == 1)
+      g_m15PivotBosWatch.sameDirLegSeen = true;
+   else if(g_m15PivotBosWatch.direction == -1 &&
+           g_m15Swing.currentSwingLeg.swingDirection == -1)
+      g_m15PivotBosWatch.sameDirLegSeen = true;
+}
+
+//+------------------------------------------------------------------+
+double M15BosMinBreakDistance()
+{
+   const double minBreakPct = InputM15BosMinBreakPercentOfLegRange;
+   if(minBreakPct <= 0.0)
+      return 0.0;
+
+   const double chartHeight = ReferenceChartHeightForM2BarCount(InputChartRangeBarCount);
+   if(chartHeight <= 0.0)
+      return 0.0;
+
+   return chartHeight * (minBreakPct / 100.0);
+}
+
+//+------------------------------------------------------------------+
+void TryArmM15PivotBosOnCross(const int m15BarShift)
+{
+   if(!InputEnableM15BosTradeDirectionBias || !InputEnableM15PivotBosBiasFlip)
+      return;
+
+   int      bosDirection = 0;
+   double   brokenLevel  = 0.0;
+   datetime barOpenTime  = 0;
+   if(!TryDetectM15BosCrossOnBar(m15BarShift, bosDirection, brokenLevel, barOpenTime))
+      return;
+
+   if(IsM15PivotBosWatchSameCross(bosDirection, brokenLevel))
+      return;
+
+   ArmM15PivotBosWatch(bosDirection, brokenLevel, barOpenTime);
+}
+
+//+------------------------------------------------------------------+
+void ResetM15StickyBosState()
+{
+   ZeroMemory(g_m15LastBosRecord);
+   g_m15LastBosRecordValid      = false;
+   g_m15BosRecordedLegCount     = 0;
+   g_m15BosStreakDir            = 0;
+   g_m15BosStreakCount          = 0;
+   g_m15StickyTradeDirectionBias = 0;
+}
+
+//+------------------------------------------------------------------+
+void RememberM15BosRecordedLeg(const int direction, const datetime legEndTime)
+{
+   if(direction == 0 || legEndTime == 0)
+      return;
+
+   if(g_m15BosRecordedLegCount >= M15_BOS_RECORDED_LEG_CAPACITY)
+   {
+      for(int shiftIndex = 1; shiftIndex < M15_BOS_RECORDED_LEG_CAPACITY; shiftIndex++)
+         g_m15BosRecordedLegs[shiftIndex - 1] = g_m15BosRecordedLegs[shiftIndex];
+      g_m15BosRecordedLegCount = M15_BOS_RECORDED_LEG_CAPACITY - 1;
+   }
+
+   const int index = g_m15BosRecordedLegCount;
+   g_m15BosRecordedLegs[index].direction  = direction;
+   g_m15BosRecordedLegs[index].legEndTime   = legEndTime;
+   g_m15BosRecordedLegCount++;
+}
+
+//+------------------------------------------------------------------+
+bool M15StickyBosAlreadyRecordedForLeg(const int direction, const datetime legEndTime)
+{
+   if(legEndTime == 0)
+      return false;
+
+   for(int i = 0; i < g_m15BosRecordedLegCount; i++)
+   {
+      if(g_m15BosRecordedLegs[i].direction == direction &&
+         g_m15BosRecordedLegs[i].legEndTime == legEndTime)
+         return true;
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Sticky BOS: M2 close beyond latest M15 leg extreme + N% chart height. |
+//| One BOS per completed M15 leg (legEndTime dedupe).                    |
+//+------------------------------------------------------------------+
+void ProcessM15StickyBosOnM2Close(const int m2BarShift)
+{
+   if(!InputEnableM15BosTradeDirectionBias)
+      return;
+
+   if(m2BarShift < 1 || g_m15Swing.swingHistoryCount < 1)
+      return;
+
+   const double minBreakDist = M15BosMinBreakDistance();
+   if(minBreakDist <= 0.0)
+      return;
+
+   const datetime barOpenTime = iTime(_Symbol, PERIOD_M2, m2BarShift);
+   if(barOpenTime == 0)
+      return;
+
+   const double m2Close   = iClose(_Symbol, PERIOD_M2, m2BarShift);
+   const double pointSize = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   const double eps       = (pointSize > 0.0 ? pointSize : 0.00001);
+
+   for(int historyIndex = g_m15Swing.swingHistoryCount - 1; historyIndex >= 0; historyIndex--)
+   {
+      const Swing leg = g_m15Swing.swingHistory[historyIndex];
+      if(leg.swingDirection != 1)
+         continue;
+
+      const double legHigh      = leg.legHighPrice;
+      const double qualifyLevel = legHigh + minBreakDist;
+      if(m2Close + eps >= qualifyLevel &&
+         !M15StickyBosAlreadyRecordedForLeg(1, leg.legEndTime))
+      {
+         PushM15BosHistory(1, barOpenTime, leg.legEndTime, legHigh);
+         if(InputLogHuntEvents)
+         {
+            LogHuntEvent("M15_BOS",
+                         StringFormat("bull decent BOS bar=%s legEnd=%s legHigh=%.5f qualify=%.5f close=%.5f (>=%.1f%% of %d M2 chart)",
+                                      TimeToString(barOpenTime, TIME_DATE | TIME_MINUTES),
+                                      TimeToString(leg.legEndTime, TIME_DATE | TIME_MINUTES),
+                                      legHigh, qualifyLevel, m2Close,
+                                      InputM15BosMinBreakPercentOfLegRange,
+                                      InputChartRangeBarCount));
+         }
+      }
+      break;
+   }
+
+   for(int historyIndex = g_m15Swing.swingHistoryCount - 1; historyIndex >= 0; historyIndex--)
+   {
+      const Swing leg = g_m15Swing.swingHistory[historyIndex];
+      if(leg.swingDirection != -1)
+         continue;
+
+      const double legLow       = leg.legLowPrice;
+      const double qualifyLevel = legLow - minBreakDist;
+      if(m2Close - eps <= qualifyLevel &&
+         !M15StickyBosAlreadyRecordedForLeg(-1, leg.legEndTime))
+      {
+         PushM15BosHistory(-1, barOpenTime, leg.legEndTime, legLow);
+         if(InputLogHuntEvents)
+         {
+            LogHuntEvent("M15_BOS",
+                         StringFormat("bear decent BOS bar=%s legEnd=%s legLow=%.5f qualify=%.5f close=%.5f (>=%.1f%% of %d M2 chart)",
+                                      TimeToString(barOpenTime, TIME_DATE | TIME_MINUTES),
+                                      TimeToString(leg.legEndTime, TIME_DATE | TIME_MINUTES),
+                                      legLow, qualifyLevel, m2Close,
+                                      InputM15BosMinBreakPercentOfLegRange,
+                                      InputChartRangeBarCount));
+         }
+      }
+      break;
+   }
+}
+
+//+------------------------------------------------------------------+
+void ProcessM15BosOnM2BarClose()
+{
+   const bool upLegClosed   = g_m15PendingUpLegClosedForBos;
+   const bool downLegClosed = g_m15PendingDownLegClosedForBos;
+
+   if(InputEnableM15BosTradeDirectionBias)
+   {
+      UpdateM15BosWatchSameDirLegSeen();
+      TryArmM15PivotBosOnCross(0);
+      ProcessM15StickyBosOnM2Close(1);
+      ProcessM15PivotBosWatchStep(PERIOD_M2, 1, upLegClosed, downLegClosed);
+      LogM15TradeDirectionBiasIfChanged();
+      RefreshM15BosBiasHud();
+   }
+
+   if(upLegClosed)
+      g_m15PendingUpLegClosedForBos = false;
+   if(downLegClosed)
+      g_m15PendingDownLegClosedForBos = false;
+}
+
+//+------------------------------------------------------------------+
+void PushM15BosHistory(const int direction, const datetime barOpenTime, const datetime legEndTime,
+                       const double brokenLevel)
+{
+   if(direction == 0 || barOpenTime == 0 || legEndTime == 0)
+      return;
+
+   if(M15StickyBosAlreadyRecordedForLeg(direction, legEndTime))
+      return;
+
+   RememberM15BosRecordedLeg(direction, legEndTime);
+
+   g_m15LastBosRecord.direction   = direction;
+   g_m15LastBosRecord.barOpenTime = barOpenTime;
+   g_m15LastBosRecord.legEndTime  = legEndTime;
+   g_m15LastBosRecord.brokenLevel = brokenLevel;
+   g_m15LastBosRecordValid        = true;
+
+   if(direction == g_m15BosStreakDir)
+      g_m15BosStreakCount++;
+   else
+   {
+      g_m15BosStreakDir   = direction;
+      g_m15BosStreakCount = 1;
+   }
+
+   if(g_m15BosStreakCount >= 2)
+   {
+      g_m15StickyTradeDirectionBias = g_m15BosStreakDir;
+      if(g_m15PivotInstantBias != 0 && g_m15PivotInstantBias != g_m15StickyTradeDirectionBias)
+         g_m15PivotInstantBias = 0;
+   }
+}
+
+//+------------------------------------------------------------------+
+string M15TradeDirectionBiasText(const int bias)
+{
+   if(bias == 1)
+      return "bull";
+   if(bias == -1)
+      return "bear";
+   return "neutral";
+}
+
+//+------------------------------------------------------------------+
+void LogM15TradeDirectionBiasIfChanged()
+{
+   if(!InputLogHuntEvents || !InputEnableM15BosTradeDirectionBias)
+      return;
+
+   const int bias = GetM15TradeDirectionBias();
+   if(!g_m15EffectiveBiasLogReady)
+   {
+      g_m15LastLoggedEffectiveBias = bias;
+      g_m15EffectiveBiasLogReady   = true;
+      return;
+   }
+
+   if(bias == g_m15LastLoggedEffectiveBias)
+      return;
+
+   LogHuntEvent("M15_BIAS",
+                StringFormat("%s → %s (sticky=%d pivotInstant=%d streak=%d x%d)",
+                             M15TradeDirectionBiasText(g_m15LastLoggedEffectiveBias),
+                             M15TradeDirectionBiasText(bias),
+                             g_m15StickyTradeDirectionBias,
+                             g_m15PivotInstantBias,
+                             g_m15BosStreakDir,
+                             g_m15BosStreakCount));
+   g_m15LastLoggedEffectiveBias = bias;
+}
+
+//+------------------------------------------------------------------+
+double M15PivotBosMinSeparationPrice()
+{
+   if(InputM15PivotBosMinSepPercentOfChart <= 0.0)
+      return 0.0;
+
+   const double chartHeight = ReferenceChartHeightForM2BarCount(InputM15PivotBosChartRangeM2Bars);
+   if(chartHeight <= 0.0)
+      return 0.0;
+
+   return chartHeight * (InputM15PivotBosMinSepPercentOfChart / 100.0);
+}
+
+//+------------------------------------------------------------------+
+bool FindNearestDistantPivotHighAbove(const double brokenLevel, double &outPivotHigh)
+{
+   outPivotHigh = 0.0;
+
+   const double minSep = M15PivotBosMinSeparationPrice();
+   if(minSep <= 0.0)
+      return false;
+
+   const double minAllowedHigh = brokenLevel + minSep;
+   const double pointSize      = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   const double eps            = (pointSize > 0.0 ? pointSize : 0.00001);
+
+   bool   found   = false;
+   double nearest = 0.0;
+   for(int pivotIndex = 0; pivotIndex < g_m15DescHighPivotCount; pivotIndex++)
+   {
+      const double pivotHigh = g_m15DescHighPivots[pivotIndex].levelPrice;
+      if(pivotHigh + eps < minAllowedHigh)
+         continue;
+
+      if(!found || pivotHigh < nearest)
+      {
+         nearest = pivotHigh;
+         found   = true;
+      }
+   }
+
+   if(!found)
+      return false;
+
+   outPivotHigh = nearest;
+   return true;
+}
+
+//+------------------------------------------------------------------+
+bool FindNearestDistantPivotLowBelow(const double brokenLevel, double &outPivotLow)
+{
+   outPivotLow = 0.0;
+
+   const double minSep = M15PivotBosMinSeparationPrice();
+   if(minSep <= 0.0)
+      return false;
+
+   const double maxAllowedLow = brokenLevel - minSep;
+   const double pointSize     = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   const double eps           = (pointSize > 0.0 ? pointSize : 0.00001);
+
+   bool   found   = false;
+   double nearest = 0.0;
+   for(int pivotIndex = 0; pivotIndex < g_m15AscLowPivotCount; pivotIndex++)
+   {
+      const double pivotLow = g_m15AscLowPivots[pivotIndex].levelPrice;
+      if(pivotLow - eps > maxAllowedLow)
+         continue;
+
+      if(!found || pivotLow > nearest)
+      {
+         nearest = pivotLow;
+         found   = true;
+      }
+   }
+
+   if(!found)
+      return false;
+
+   outPivotLow = nearest;
+   return true;
+}
+
+//+------------------------------------------------------------------+
+void DisarmM15PivotBosWatch()
+{
+   ZeroMemory(g_m15PivotBosWatch);
+}
+
+//+------------------------------------------------------------------+
+void ArmM15PivotBosWatch(const int bosDirection, const double brokenLevel, const datetime bosBarOpenTime)
+{
+   if(bosDirection != 1 && bosDirection != -1)
+      return;
+
+   if(IsM15PivotBosWatchSameCross(bosDirection, brokenLevel))
+      return;
+
+   DisarmM15PivotBosWatch();
+
+   double pivotTarget = 0.0;
+   if(bosDirection == 1)
+   {
+      if(!FindNearestDistantPivotHighAbove(brokenLevel, pivotTarget))
+      {
+         if(InputLogHuntEvents)
+            LogHuntEvent("M15_PIVOT_BOS", StringFormat("bull BOS gate OFF — no pivot high >= %.5f + sep", brokenLevel));
+         return;
+      }
+   }
+   else
+   {
+      if(!FindNearestDistantPivotLowBelow(brokenLevel, pivotTarget))
+      {
+         if(InputLogHuntEvents)
+            LogHuntEvent("M15_PIVOT_BOS", StringFormat("bear BOS gate OFF — no pivot low <= %.5f - sep", brokenLevel));
+         return;
+      }
+   }
+
+   g_m15PivotBosWatch.active           = true;
+   g_m15PivotBosWatch.direction        = bosDirection;
+   g_m15PivotBosWatch.pivotTargetLevel = pivotTarget;
+   g_m15PivotBosWatch.bosBrokenLevel   = brokenLevel;
+   g_m15PivotBosWatch.bosBarOpenTime   = bosBarOpenTime;
+   g_m15PivotBosWatch.sameDirLegSeen   =
+      (bosDirection == 1 && g_m15Swing.currentSwingLeg.swingDirection == 1) ||
+      (bosDirection == -1 && g_m15Swing.currentSwingLeg.swingDirection == -1);
+
+   if(InputLogHuntEvents)
+   {
+      LogHuntEvent("M15_PIVOT_BOS",
+                   StringFormat("%s gate ON bosLvl=%.5f pivot=%.5f bar=%s",
+                                bosDirection == 1 ? "bull" : "bear",
+                                brokenLevel, pivotTarget,
+                                TimeToString(bosBarOpenTime, TIME_DATE | TIME_MINUTES)));
+   }
+}
+
+//+------------------------------------------------------------------+
+void ProcessM15PivotBosWatchStep(const ENUM_TIMEFRAMES crossTimeframe, const int crossBarShift,
+                                 const bool upLegClosed, const bool downLegClosed)
+{
+   if(!InputEnableM15PivotBosBiasFlip || !InputEnableM15BosTradeDirectionBias)
+      return;
+
+   if(!g_m15PivotBosWatch.active)
+      return;
+
+   UpdateM15BosWatchSameDirLegSeen();
+
+   const int watchDir = g_m15PivotBosWatch.direction;
+   const double pivotLevel = g_m15PivotBosWatch.pivotTargetLevel;
+   const datetime barOpenTime = iTime(_Symbol, crossTimeframe, crossBarShift);
+
+   if(watchDir == 1)
+   {
+      if(CloseCrossesAboveLevel(crossTimeframe, crossBarShift, pivotLevel))
+      {
+         g_m15PivotInstantBias = 1;
+         if(InputLogHuntEvents)
+         {
+            LogHuntEvent("M15_PIVOT_BOS",
+                         StringFormat("bull pivot break bar=%s lvl=%.5f → bias bull",
+                                      TimeToString(barOpenTime, TIME_DATE | TIME_MINUTES),
+                                      pivotLevel));
+         }
+         DisarmM15PivotBosWatch();
+         return;
+      }
+
+      if(g_m15PivotBosWatch.sameDirLegSeen && upLegClosed)
+      {
+         if(InputLogHuntEvents)
+         {
+            LogHuntEvent("M15_PIVOT_BOS",
+                         StringFormat("bull gate OFF — up leg ended without pivot break %.5f", pivotLevel));
+         }
+         if(g_m15PivotInstantBias == 1)
+            g_m15PivotInstantBias = 0;
+         DisarmM15PivotBosWatch();
+      }
+      return;
+   }
+
+   if(watchDir == -1)
+   {
+      if(CloseCrossesBelowLevel(crossTimeframe, crossBarShift, pivotLevel))
+      {
+         g_m15PivotInstantBias = -1;
+         if(InputLogHuntEvents)
+         {
+            LogHuntEvent("M15_PIVOT_BOS",
+                         StringFormat("bear pivot break bar=%s lvl=%.5f → bias bear",
+                                      TimeToString(barOpenTime, TIME_DATE | TIME_MINUTES),
+                                      pivotLevel));
+         }
+         DisarmM15PivotBosWatch();
+         return;
+      }
+
+      if(g_m15PivotBosWatch.sameDirLegSeen && downLegClosed)
+      {
+         if(InputLogHuntEvents)
+         {
+            LogHuntEvent("M15_PIVOT_BOS",
+                         StringFormat("bear gate OFF — down leg ended without pivot break %.5f", pivotLevel));
+         }
+         if(g_m15PivotInstantBias == -1)
+            g_m15PivotInstantBias = 0;
+         DisarmM15PivotBosWatch();
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+double ReferenceChartHeightForM2BarCount(const int barCount)
+{
    if(barCount < 1)
       return 0.0;
 
@@ -944,6 +1635,96 @@ double ReferenceChartHeightForFairValueGapFilterM2()
       lowestLowPrice   = MathMin(lowestLowPrice, iLow(_Symbol, PERIOD_M2, barShiftIndex));
    }
    return highestHighPrice - lowestLowPrice;
+}
+
+//+------------------------------------------------------------------+
+//| Sticky bias: flips only after 2 consecutive BOS in the same direction. |
+//| e.g. bear+bear → bear; then one bull → still bear until bull+bull.   |
+//+------------------------------------------------------------------+
+int ComputeM15StickyTradeDirectionBias()
+{
+   return g_m15StickyTradeDirectionBias;
+}
+
+//+------------------------------------------------------------------+
+int GetM15TradeDirectionBias()
+{
+   if(!InputEnableM15BosTradeDirectionBias)
+      return 0;
+
+   if(g_m15PivotInstantBias != 0)
+      return g_m15PivotInstantBias;
+
+   return ComputeM15StickyTradeDirectionBias();
+}
+
+//+------------------------------------------------------------------+
+bool FvgTradeAllowedByM15BosBias(const bool isBullishFairValueGap, string &outBlockReason)
+{
+   outBlockReason = "";
+   if(!InputEnableM15BosTradeDirectionBias)
+      return true;
+
+   const int bias = GetM15TradeDirectionBias();
+   if(bias == 0)
+      return true;
+
+   const int tradeDir = isBullishFairValueGap ? 1 : -1;
+   if(tradeDir != bias)
+   {
+      outBlockReason = StringFormat("M15 BOS overall bias %s blocks %s FVG",
+                                    bias == 1 ? "bull" : "bear",
+                                    isBullishFairValueGap ? "bull" : "bear");
+      return false;
+   }
+   return true;
+}
+
+//+------------------------------------------------------------------+
+void RefreshM15BosBiasHud()
+{
+   if(!InputShowM15BosBiasHud)
+   {
+      ObjectDelete(0, LQ_OBJ_M15_BIAS_HUD);
+      return;
+   }
+
+   if(ObjectFind(0, LQ_OBJ_M15_BIAS_HUD) < 0)
+   {
+      if(!ObjectCreate(0, LQ_OBJ_M15_BIAS_HUD, OBJ_LABEL, 0, 0, 0))
+         return;
+      ObjectSetInteger(0, LQ_OBJ_M15_BIAS_HUD, OBJPROP_CORNER, CORNER_RIGHT_UPPER);
+      ObjectSetInteger(0, LQ_OBJ_M15_BIAS_HUD, OBJPROP_ANCHOR, ANCHOR_RIGHT_UPPER);
+      ObjectSetInteger(0, LQ_OBJ_M15_BIAS_HUD, OBJPROP_XDISTANCE, 8);
+      ObjectSetInteger(0, LQ_OBJ_M15_BIAS_HUD, OBJPROP_YDISTANCE, 18);
+      ObjectSetString(0, LQ_OBJ_M15_BIAS_HUD, OBJPROP_FONT, "Arial Bold");
+      ObjectSetInteger(0, LQ_OBJ_M15_BIAS_HUD, OBJPROP_SELECTABLE, false);
+      ObjectSetInteger(0, LQ_OBJ_M15_BIAS_HUD, OBJPROP_HIDDEN, true);
+   }
+
+   const int    bias  = GetM15TradeDirectionBias();
+   string       arrow = "—";
+   color        col   = clrSilver;
+   if(bias == 1)
+   {
+      arrow = "↑";
+      col   = clrLime;
+   }
+   else if(bias == -1)
+   {
+      arrow = "↓";
+      col   = clrTomato;
+   }
+
+   ObjectSetString(0, LQ_OBJ_M15_BIAS_HUD, OBJPROP_TEXT, "M15 " + arrow);
+   ObjectSetInteger(0, LQ_OBJ_M15_BIAS_HUD, OBJPROP_COLOR, col);
+   ObjectSetInteger(0, LQ_OBJ_M15_BIAS_HUD, OBJPROP_FONTSIZE, 14);
+}
+
+//+------------------------------------------------------------------+
+double ReferenceChartHeightForFairValueGapFilterM2()
+{
+   return ReferenceChartHeightForM2BarCount(InputChartRangeBarCount);
 }
 
 //+------------------------------------------------------------------+
@@ -1153,37 +1934,180 @@ void RememberM15LegLiquidityBreach(const datetime legEndTime, const bool isUpLeg
 }
 
 //+------------------------------------------------------------------+
-//| 2nd-last up high breach → hunt only if 2nd-last up high > latest up high. |
-//+------------------------------------------------------------------+
-bool M15AllowsBearishHuntWhenSecondLastUpHighBreached(const double pointSize)
+bool TryPushM15ReplayLeg(M15ReplayLeg &replayLegs[], int &replayLegCount, const Swing &closedLeg)
 {
-   double latestUpHigh      = 0.0;
-   double latestUpLow       = 0.0;
-   double secondLastUpHigh  = 0.0;
-   double secondLastUpLow   = 0.0;
-   datetime legEndIgnored   = 0;
-   if(!TryNthM15CompletedSwingLeg(1, 1, latestUpHigh, latestUpLow, legEndIgnored))
+   if(closedLeg.swingDirection == 0 || closedLeg.legEndTime == 0)
       return false;
-   if(!TryNthM15CompletedSwingLeg(1, 2, secondLastUpHigh, secondLastUpLow, legEndIgnored))
+   if(replayLegCount >= M15_REPLAY_LEG_CAPACITY)
       return false;
-   return (secondLastUpHigh > latestUpHigh + pointSize);
+
+   replayLegs[replayLegCount].legHighPrice    = closedLeg.legHighPrice;
+   replayLegs[replayLegCount].legLowPrice     = closedLeg.legLowPrice;
+   replayLegs[replayLegCount].legEndTime      = closedLeg.legEndTime;
+   replayLegs[replayLegCount].swingDirection = closedLeg.swingDirection;
+   replayLegCount++;
+   return true;
 }
 
 //+------------------------------------------------------------------+
-//| 2nd-last down low breach → hunt only if 2nd-last down low < latest down low. |
+//| Replay one closed M15 bar into swingState; append completed legs (no hunt side effects). |
 //+------------------------------------------------------------------+
-bool M15AllowsBullishHuntWhenSecondLastDownLowBreached(const double pointSize)
+void ProcessM15SwingStepReplay(SwingState &swingState, const int lastClosedBarShift,
+                               M15ReplayLeg &replayLegs[], int &replayLegCount)
 {
-   double latestDownHigh     = 0.0;
-   double latestDownLow      = 0.0;
-   double secondLastDownHigh = 0.0;
-   double secondLastDownLow  = 0.0;
-   datetime legEndIgnored    = 0;
-   if(!TryNthM15CompletedSwingLeg(-1, 1, latestDownHigh, latestDownLow, legEndIgnored))
-      return false;
-   if(!TryNthM15CompletedSwingLeg(-1, 2, secondLastDownHigh, secondLastDownLow, legEndIgnored))
-      return false;
-   return (secondLastDownLow < latestDownLow - pointSize);
+   const ENUM_TIMEFRAMES timeframe = PERIOD_M15;
+   const int         sh            = lastClosedBarShift;
+
+   const double lastClosedBarOpen  = iOpen(_Symbol, timeframe, sh);
+   const double lastClosedBarClose = iClose(_Symbol, timeframe, sh);
+   const double lastClosedBarHigh  = iHigh(_Symbol, timeframe, sh);
+   const double lastClosedBarLow   = iLow(_Symbol, timeframe, sh);
+
+   const int candleDirection =
+      (lastClosedBarClose > lastClosedBarOpen) ? 1
+      : ((lastClosedBarClose < lastClosedBarOpen) ? -1 : 0);
+   const double lastClosedBarRange = lastClosedBarHigh - lastClosedBarLow;
+
+   if(swingState.currentSwingLeg.swingDirection == 0)
+   {
+      if(candleDirection == 0)
+         return;
+      SwingStartNew(swingState, timeframe, candleDirection, lastClosedBarHigh, lastClosedBarLow, sh);
+      swingState.priceAnchorLevel = (lastClosedBarHigh + lastClosedBarLow) / 2.0;
+      return;
+   }
+
+   double sumRangeFivePriorBars = 0.0;
+   for(int k = 1; k <= 5; k++)
+      sumRangeFivePriorBars +=
+         (iHigh(_Symbol, timeframe, sh + k) - iLow(_Symbol, timeframe, sh + k));
+   const double averageRangeFiveBars = sumRangeFivePriorBars / 5.0;
+
+   const bool isDecentMovement = (lastClosedBarRange > (averageRangeFiveBars * 1.0));
+   if(isDecentMovement && candleDirection == swingState.currentSwingLeg.swingDirection)
+      swingState.priceAnchorLevel = (lastClosedBarHigh + lastClosedBarLow) / 2.0;
+
+   int nextSwingDirection = swingState.currentSwingLeg.swingDirection;
+   if(swingState.currentSwingLeg.swingDirection == 1 && lastClosedBarClose < swingState.priceAnchorLevel)
+      nextSwingDirection = -1;
+   else if(swingState.currentSwingLeg.swingDirection == -1 && lastClosedBarClose > swingState.priceAnchorLevel)
+      nextSwingDirection = 1;
+
+   if(nextSwingDirection == swingState.currentSwingLeg.swingDirection)
+   {
+      SwingExtend(swingState, lastClosedBarHigh, lastClosedBarLow);
+      return;
+   }
+
+   SwingExtend(swingState, lastClosedBarHigh, lastClosedBarLow);
+
+   Swing closedSwingLeg = swingState.currentSwingLeg;
+   closedSwingLeg.legEndTime = iTime(_Symbol, timeframe, sh);
+   TryPushM15ReplayLeg(replayLegs, replayLegCount, closedSwingLeg);
+
+   double newSwingLegHigh = lastClosedBarHigh;
+   double newSwingLegLow  = lastClosedBarLow;
+   if(closedSwingLeg.swingDirection == 1 && nextSwingDirection == -1)
+      newSwingLegHigh = MathMax(lastClosedBarHigh, closedSwingLeg.legHighPrice);
+   else if(closedSwingLeg.swingDirection == -1 && nextSwingDirection == 1)
+      newSwingLegLow = MathMin(lastClosedBarLow, closedSwingLeg.legLowPrice);
+
+   SwingStartNew(swingState, timeframe, nextSwingDirection, newSwingLegHigh, newSwingLegLow, sh);
+   swingState.priceAnchorLevel = (lastClosedBarHigh + lastClosedBarLow) / 2.0;
+}
+
+//+------------------------------------------------------------------+
+//| Completed M15 swing legs in lookback: up-leg high / down-leg low pivots only.   |
+//| Pivot up high: legHigh beats every newer up-leg high; pivot down low: vice versa. |
+//+------------------------------------------------------------------+
+void RebuildM15LiquidityPivotLevels()
+{
+   g_m15DescHighPivotCount = 0;
+   g_m15AscLowPivotCount   = 0;
+
+   if(InputM15LiquidityPivotLookbackBars < 2)
+      return;
+
+   const int barsTotal = iBars(_Symbol, PERIOD_M15);
+   if(barsTotal < 3)
+      return;
+
+   const int maxShift =
+      (int)MathMin((double)InputM15LiquidityPivotLookbackBars, (double)(barsTotal - 2));
+   if(maxShift < 1)
+      return;
+
+   M15ReplayLeg replayLegs[M15_REPLAY_LEG_CAPACITY];
+   int          replayLegCount = 0;
+   SwingState   replaySwing;
+   ZeroMemory(replaySwing);
+
+   for(int shift = maxShift; shift >= 1; shift--)
+      ProcessM15SwingStepReplay(replaySwing, shift, replayLegs, replayLegCount);
+
+   if(replayLegCount <= 0)
+      return;
+
+   const double pointSize = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   const double eps       = (pointSize > 0.0 ? pointSize : 0.00001);
+
+   for(int legIndex = replayLegCount - 1; legIndex >= 0; legIndex--)
+   {
+      if(replayLegs[legIndex].swingDirection != 1)
+         continue;
+
+      bool isPivotHigh = true;
+      for(int newerIndex = legIndex + 1; newerIndex < replayLegCount; newerIndex++)
+      {
+         if(replayLegs[newerIndex].swingDirection != 1)
+            continue;
+         if(replayLegs[newerIndex].legHighPrice >= replayLegs[legIndex].legHighPrice - eps)
+         {
+            isPivotHigh = false;
+            break;
+         }
+      }
+
+      if(!isPivotHigh || g_m15DescHighPivotCount >= M15_LIQUIDITY_PIVOT_CAPACITY)
+         continue;
+
+      const int outIndex = g_m15DescHighPivotCount;
+      g_m15DescHighPivots[outIndex].levelPrice     = replayLegs[legIndex].legHighPrice;
+      g_m15DescHighPivots[outIndex].legEndTime      = replayLegs[legIndex].legEndTime;
+      g_m15DescHighPivots[outIndex].legHighPrice    = replayLegs[legIndex].legHighPrice;
+      g_m15DescHighPivots[outIndex].legLowPrice     = replayLegs[legIndex].legLowPrice;
+      g_m15DescHighPivots[outIndex].swingDirection  = 1;
+      g_m15DescHighPivotCount++;
+   }
+
+   for(int legIndex = replayLegCount - 1; legIndex >= 0; legIndex--)
+   {
+      if(replayLegs[legIndex].swingDirection != -1)
+         continue;
+
+      bool isPivotLow = true;
+      for(int newerIndex = legIndex + 1; newerIndex < replayLegCount; newerIndex++)
+      {
+         if(replayLegs[newerIndex].swingDirection != -1)
+            continue;
+         if(replayLegs[newerIndex].legLowPrice <= replayLegs[legIndex].legLowPrice + eps)
+         {
+            isPivotLow = false;
+            break;
+         }
+      }
+
+      if(!isPivotLow || g_m15AscLowPivotCount >= M15_LIQUIDITY_PIVOT_CAPACITY)
+         continue;
+
+      const int outIndex = g_m15AscLowPivotCount;
+      g_m15AscLowPivots[outIndex].levelPrice     = replayLegs[legIndex].legLowPrice;
+      g_m15AscLowPivots[outIndex].legEndTime      = replayLegs[legIndex].legEndTime;
+      g_m15AscLowPivots[outIndex].legHighPrice    = replayLegs[legIndex].legHighPrice;
+      g_m15AscLowPivots[outIndex].legLowPrice     = replayLegs[legIndex].legLowPrice;
+      g_m15AscLowPivots[outIndex].swingDirection  = -1;
+      g_m15AscLowPivotCount++;
+   }
 }
 
 //+------------------------------------------------------------------+
@@ -1351,9 +2275,9 @@ void LogHuntEvent(const string eventName, const string detail = "")
    const string timeText  = (barTime != 0) ? TimeToString(barTime, TIME_DATE | TIME_MINUTES) : "no-bar";
 
    if(StringLen(detail) > 0)
-      PrintFormat("liquidity_sweep_v2 [%s] %s | %s", timeText, eventName, detail);
+      PrintFormat("liquidity_sweep_v4 [%s] %s | %s", timeText, eventName, detail);
    else
-      PrintFormat("liquidity_sweep_v2 [%s] %s", timeText, eventName);
+      PrintFormat("liquidity_sweep_v4 [%s] %s", timeText, eventName);
 }
 
 //+------------------------------------------------------------------+
@@ -3099,37 +4023,30 @@ bool ResolveFvgEntryPrice(const bool isBullishFairValueGap, const double zoneLow
 }
 
 //+------------------------------------------------------------------+
-// previousLegRange = latest completed M15 leg in trade direction (high - low).
-// TP distance from entry = (multiplier * previousLegRange) (1x, 1.5x, 2x).
-bool ComputeM15LegTraceRemainingTakeProfits(const bool isBullishFairValueGap, const double entryPrice,
-                                            double &outPreviousLegRange,
-                                            double &outTakeProfitPrices[])
+// M2 absorption leg range (high - low) at/after touch. TP = 0.9x / 1.4x / 1.9x from entry.
+//+------------------------------------------------------------------+
+int V4M2TradeLegDirectionForFvg(const bool isBullishFairValueGap)
 {
-   outPreviousLegRange = 0.0;
+   return isBullishFairValueGap ? 1 : -1;
+}
+
+//+------------------------------------------------------------------+
+bool ComputeM2AbsorptionLegTakeProfits(const bool isBullishFairValueGap, const double entryPrice,
+                                       const double m2LegRange, double &outTakeProfitPrices[])
+{
    ArrayResize(outTakeProfitPrices, LQ_TP_COUNT);
 
-   if(g_m15Swing.currentSwingLeg.swingDirection == 0)
-      return false;
-
-   const int swingDirection = isBullishFairValueGap ? 1 : -1;
-   double    prevLegHigh    = 0.0;
-   double    prevLegLow     = 0.0;
-   datetime  prevLegEndIgnored = 0;
-   if(!TryNthM15CompletedSwingLeg(swingDirection, 1, prevLegHigh, prevLegLow, prevLegEndIgnored))
-      return false;
-
-   outPreviousLegRange = prevLegHigh - prevLegLow;
    const double minDistance = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-   if(outPreviousLegRange <= minDistance)
+   if(m2LegRange <= minDistance)
       return false;
 
-   const double tpMultipliers[3] = {1.0, 1.5, 2.0};
+   const double tpMultipliers[3] = {0.9, 1.4, 1.9};
 
    if(isBullishFairValueGap)
    {
       for(int tpIndex = 0; tpIndex < LQ_TP_COUNT; tpIndex++)
       {
-         const double tpDistance = tpMultipliers[tpIndex] * outPreviousLegRange;
+         const double tpDistance = tpMultipliers[tpIndex] * m2LegRange;
          if(tpDistance <= minDistance)
             return false;
          outTakeProfitPrices[tpIndex] = NormalizeDouble(entryPrice + tpDistance, _Digits);
@@ -3139,12 +4056,100 @@ bool ComputeM15LegTraceRemainingTakeProfits(const bool isBullishFairValueGap, co
 
    for(int tpIndex = 0; tpIndex < LQ_TP_COUNT; tpIndex++)
    {
-      const double tpDistance = tpMultipliers[tpIndex] * outPreviousLegRange;
+      const double tpDistance = tpMultipliers[tpIndex] * m2LegRange;
       if(tpDistance <= minDistance)
          return false;
       outTakeProfitPrices[tpIndex] = NormalizeDouble(entryPrice - tpDistance, _Digits);
    }
    return (outTakeProfitPrices[0] < entryPrice);
+}
+
+//+------------------------------------------------------------------+
+bool V4ResolveOrDeferM2AbsorptionLegRange(const int huntIndex, const bool isBullishFairValueGap,
+                                          double &outM2LegRange, bool &outDeferred)
+{
+   outM2LegRange = 0.0;
+   outDeferred   = false;
+
+   if(huntIndex < 0 || huntIndex >= V2_MAX_HUNT_SESSIONS)
+      return false;
+
+   const int tradeLegDir = V4M2TradeLegDirectionForFvg(isBullishFairValueGap);
+
+   if(g_m2Swing.currentSwingLeg.swingDirection == tradeLegDir &&
+      g_m2Swing.currentSwingLeg.legStartTime != 0)
+   {
+      g_v2Hunts[huntIndex].awaitM2AbsorptionLegForTp        = true;
+      g_v2Hunts[huntIndex].awaitM2AbsorptionLegStartTime    = g_m2Swing.currentSwingLeg.legStartTime;
+      outDeferred = true;
+      return false;
+   }
+
+   double    legHigh         = 0.0;
+   double    legLow          = 0.0;
+   datetime  legEndIgnored   = 0;
+   if(!TryNthM2CompletedSwingLeg(tradeLegDir, 1, legHigh, legLow, legEndIgnored))
+      return false;
+
+   outM2LegRange = legHigh - legLow;
+   return (outM2LegRange > SymbolInfoDouble(_Symbol, SYMBOL_POINT));
+}
+
+//+------------------------------------------------------------------+
+void V4TryPlaceDeferredTradesOnM2LegClose(const Swing &closedLeg)
+{
+   if(closedLeg.swingDirection == 0 || closedLeg.legStartTime == 0)
+      return;
+
+   const double minDistance = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+
+   for(int huntIndex = 0; huntIndex < V2_MAX_HUNT_SESSIONS; huntIndex++)
+   {
+      if(!g_v2Hunts[huntIndex].awaitM2AbsorptionLegForTp)
+         continue;
+
+      const datetime deferredSessionId = g_v2Hunts[huntIndex].sessionId;
+      if(deferredSessionId == 0 || V2FindHuntSlotBySessionId(deferredSessionId) != huntIndex)
+         continue;
+
+      if(closedLeg.legStartTime != g_v2Hunts[huntIndex].awaitM2AbsorptionLegStartTime)
+         continue;
+
+      const int tradeLegDir = V4M2TradeLegDirectionForFvg(g_v2Hunts[huntIndex].pendingTradeIsBullishFvg);
+      if(closedLeg.swingDirection != tradeLegDir)
+         continue;
+
+      g_v2Hunts[huntIndex].awaitM2AbsorptionLegForTp = false;
+
+      const double m2LegRange = closedLeg.legHighPrice - closedLeg.legLowPrice;
+      if(m2LegRange <= minDistance)
+      {
+         V2LogHuntEvent(huntIndex, "TRADE_SKIP",
+                        StringFormat("M2 absorption leg range=%.5f too small", m2LegRange));
+         g_v2Hunts[huntIndex].pendingTradeFvgValid = false;
+         continue;
+      }
+
+      bool     tradeIsBullishFvg  = false;
+      double   tradeZoneLow       = 0.0;
+      double   tradeZoneHigh      = 0.0;
+      datetime tradeFormationTime = 0;
+      if(!V2ResolveTradeFvgForHunt(huntIndex, tradeIsBullishFvg, tradeZoneLow, tradeZoneHigh,
+                                   tradeFormationTime))
+      {
+         V2LogHuntEvent(huntIndex, "TRADE_SKIP", "deferred — no FVG for trade");
+         g_v2Hunts[huntIndex].pendingTradeFvgValid = false;
+         continue;
+      }
+
+      V2LogHuntEvent(huntIndex, "TRADE_M2_LEG_CLOSED",
+                     StringFormat("%s leg H-L=%.5f end=%s → place",
+                                  closedLeg.swingDirection == 1 ? "up" : "down", m2LegRange,
+                                  TimeToString(closedLeg.legEndTime, TIME_DATE | TIME_MINUTES)));
+      TryPlaceOppositeFvgTradeSetup(tradeIsBullishFvg, tradeZoneLow, tradeZoneHigh,
+                                    tradeFormationTime, deferredSessionId, m2LegRange);
+      g_v2Hunts[huntIndex].pendingTradeFvgValid = false;
+   }
 }
 
 //+------------------------------------------------------------------+
@@ -3338,7 +4343,7 @@ bool TryPromoteFvgLimitToMarketIfFormationCloseMatchesEntry(const bool isBullish
 //+------------------------------------------------------------------+
 void TryPlaceOppositeFvgTradeSetup(const bool isBullishFairValueGap, const double zoneLowPrice,
                                     const double zoneHighPrice, const datetime formationTime,
-                                    const datetime huntSessionId)
+                                    const datetime huntSessionId, const double m2LegRange)
 {
    const int huntIndex = V2FindHuntSlotBySessionId(huntSessionId);
    if(formationTime == 0)
@@ -3350,6 +4355,13 @@ void TryPlaceOppositeFvgTradeSetup(const bool isBullishFairValueGap, const doubl
    if(V2IsHuntSessionStillActive(huntSessionId))
    {
       V2LogHuntEvent(huntIndex, "TRADE_SKIP", "hunt still ON — orders after touch");
+      return;
+   }
+
+   string bosBiasBlockReason = "";
+   if(!FvgTradeAllowedByM15BosBias(isBullishFairValueGap, bosBiasBlockReason))
+   {
+      V2LogHuntEvent(huntIndex, "TRADE_SKIP", bosBiasBlockReason);
       return;
    }
 
@@ -3485,15 +4497,13 @@ void TryPlaceOppositeFvgTradeSetup(const bool isBullishFairValueGap, const doubl
       }
    }
 
-   double m15PreviousLegRange = 0.0;
    double takeProfitPrices[];
-   if(!ComputeM15LegTraceRemainingTakeProfits(isBullishFairValueGap, normalizedEntry,
-                                            m15PreviousLegRange, takeProfitPrices))
+   if(!ComputeM2AbsorptionLegTakeProfits(isBullishFairValueGap, normalizedEntry, m2LegRange,
+                                         takeProfitPrices))
    {
       LogHuntEvent("TRADE_SKIP",
-                   StringFormat("M15 range TP invalid entry=%.5f activeM15=%d prevRange=%.5f",
-                                normalizedEntry, g_m15Swing.currentSwingLeg.swingDirection,
-                                m15PreviousLegRange));
+                   StringFormat("M2 absorption TP invalid entry=%.5f m2Range=%.5f",
+                                normalizedEntry, m2LegRange));
       return;
    }
 
@@ -3522,11 +4532,11 @@ void TryPlaceOppositeFvgTradeSetup(const bool isBullishFairValueGap, const doubl
    int          zeroVolumeCount   = 0;
 
    const string logDetail = StringFormat(
-      "%s entry=%.5f sl=%.5f (2nd-prev M2 sh=%d %s buf2%%rng=%.5f) tp=%.5f/%.5f/%.5f prevM15Range=%.5f market=%s",
+      "%s entry=%.5f sl=%.5f (2nd-prev M2 sh=%d %s buf2%%rng=%.5f) tp=%.5f/%.5f/%.5f m2AbsRange=%.5f market=%s",
       isBullishFairValueGap ? "bull" : "bear", normalizedEntry, stopLossOverall, slRefBarShift,
       isBullishFairValueGap ? "low" : "high", bufferPrice,
       takeProfitPrices[0], takeProfitPrices[1], takeProfitPrices[2],
-      m15PreviousLegRange, useMarketOrder ? "Y" : "N");
+      m2LegRange, useMarketOrder ? "Y" : "N");
 
    string tradeBlockReason = "";
    if(!IsFvgAutomatedTradingAllowed(tradeBlockReason))
@@ -3592,6 +4602,8 @@ void V2InitHuntSlot(const int huntIndex)
    g_v2Hunts[huntIndex].tradeTp1Price                  = 0.0;
    g_v2Hunts[huntIndex].preEntryCancelTpLevel          = 0.0;
    g_v2Hunts[huntIndex].firstOppBosMgmtDone            = false;
+   g_v2Hunts[huntIndex].awaitM2AbsorptionLegForTp      = false;
+   g_v2Hunts[huntIndex].awaitM2AbsorptionLegStartTime   = 0;
 }
 
 //+------------------------------------------------------------------+
@@ -3612,11 +4624,21 @@ int V2CountActiveHunts()
 }
 
 //+------------------------------------------------------------------+
+bool V2HuntSlotAwaitingM2AbsorptionLeg(const int huntIndex)
+{
+   if(huntIndex < 0 || huntIndex >= V2_MAX_HUNT_SESSIONS)
+      return false;
+   return g_v2Hunts[huntIndex].awaitM2AbsorptionLegForTp;
+}
+
+//+------------------------------------------------------------------+
 int V2AllocHuntSlot()
 {
    for(int i = 0; i < V2_MAX_HUNT_SESSIONS; i++)
    {
       if(g_v2Hunts[i].active)
+         continue;
+      if(V2HuntSlotAwaitingM2AbsorptionLeg(i))
          continue;
       if(g_v2Hunts[i].sessionId != 0 &&
          V2HuntHasPendingOrdersForSession(g_v2Hunts[i].sessionId))
@@ -3624,13 +4646,9 @@ int V2AllocHuntSlot()
       return i;
    }
 
-   for(int i = 0; i < V2_MAX_HUNT_SESSIONS; i++)
-   {
-      if(!g_v2Hunts[i].active)
-         return i;
-   }
    LogHuntEvent("HUNT_ARRAY_FULL",
-                StringFormat("max=%d slots (high+low); cannot arm another hunt", V2_MAX_HUNT_SESSIONS));
+                StringFormat("max=%d slots; all reserved (active, deferred M2 leg, or pending orders)",
+                             V2_MAX_HUNT_SESSIONS));
    return -1;
 }
 
@@ -3776,6 +4794,10 @@ int V2SameSideM2LegDirectionForHunt(const int huntIndex)
 //+------------------------------------------------------------------+
 void V2ResetHuntSlotSessionCounters(const int huntIndex)
 {
+   if(huntIndex < 0 || huntIndex >= V2_MAX_HUNT_SESSIONS)
+      return;
+   if(V2HuntSlotAwaitingM2AbsorptionLeg(huntIndex))
+      return;
    g_v2Hunts[huntIndex].oppositeFvgFoundCount = 0;
    g_v2Hunts[huntIndex].touchLevel            = 0.0;
    g_v2Hunts[huntIndex].touchLevelReady       = false;
@@ -3788,6 +4810,8 @@ void V2ResetHuntSlotSessionCounters(const int huntIndex)
    g_v2Hunts[huntIndex].tradeTp1Price         = 0.0;
    g_v2Hunts[huntIndex].preEntryCancelTpLevel = 0.0;
    g_v2Hunts[huntIndex].firstOppBosMgmtDone     = false;
+   g_v2Hunts[huntIndex].awaitM2AbsorptionLegForTp    = false;
+   g_v2Hunts[huntIndex].awaitM2AbsorptionLegStartTime = 0;
    V2ClearTouchPointLine(huntIndex);
 }
 
@@ -4121,8 +5145,28 @@ void V2TryPlacePendingFvgTradesAfterHuntOff(const int huntIndex)
                                tradeIdx, MathMax(fvgCount, 1),
                                IntegerToString((long)tradeFormationTime),
                                tradeIsBullishFvg ? "bull" : "bear", pickNote));
+
+   double m2LegRange = 0.0;
+   bool   deferred   = false;
+   if(!V4ResolveOrDeferM2AbsorptionLegRange(huntIndex, tradeIsBullishFvg, m2LegRange, deferred))
+   {
+      if(deferred)
+      {
+         g_v2Hunts[huntIndex].pendingTradeIsBullishFvg = tradeIsBullishFvg;
+         V2LogHuntEvent(huntIndex, "TRADE_DEFER_M2_LEG",
+                        StringFormat("await %s M2 leg start=%s",
+                                     tradeIsBullishFvg ? "up" : "down",
+                                     TimeToString(g_v2Hunts[huntIndex].awaitM2AbsorptionLegStartTime,
+                                                  TIME_DATE | TIME_MINUTES)));
+         return;
+      }
+      V2LogHuntEvent(huntIndex, "TRADE_SKIP", "no M2 absorption leg range at touch");
+      g_v2Hunts[huntIndex].pendingTradeFvgValid = false;
+      return;
+   }
+
    TryPlaceOppositeFvgTradeSetup(tradeIsBullishFvg, tradeZoneLow, tradeZoneHigh,
-                                 tradeFormationTime, sessionId);
+                                 tradeFormationTime, sessionId, m2LegRange);
    g_v2Hunts[huntIndex].pendingTradeFvgValid = false;
 }
 
@@ -4431,35 +5475,47 @@ bool TryDetectM15WickLiquidityBreach(const double barHigh, const double barLow,
    outHighBreached = false;
    outLegEndTime   = 0;
 
-   double legHigh = 0.0;
-   double legLow  = 0.0;
-   datetime legEnd = 0;
+   // Bearish hunt: M15 up-leg high breach only (newest qualifying pivot first).
+   for(int pivotIndex = 0; pivotIndex < g_m15DescHighPivotCount; pivotIndex++)
+   {
+      if(g_m15DescHighPivots[pivotIndex].swingDirection != 1)
+         continue;
 
-   if(TryNthM15CompletedSwingLeg(1, 1, legHigh, legLow, legEnd) &&
-      !IsM15LegLiquidityAlreadyBreached(legEnd, true) &&
-      M2WickCrossesAboveLevel(M15BreachWickLevelForUpLegHigh(legHigh), barHigh, prevHigh, pointSize))
-      return TryAcceptM15BreachForHunt(true, legHigh, legLow, legEnd, outLevel, outHighBreached,
-                                       outLegEndTime);
+      const datetime legEndTime = g_m15DescHighPivots[pivotIndex].legEndTime;
+      if(IsM15LegLiquidityAlreadyBreached(legEndTime, true))
+         continue;
 
-   if(TryNthM15CompletedSwingLeg(1, 2, legHigh, legLow, legEnd) &&
-      !IsM15LegLiquidityAlreadyBreached(legEnd, true) &&
-      M2WickCrossesAboveLevel(M15BreachWickLevelForUpLegHigh(legHigh), barHigh, prevHigh, pointSize) &&
-      M15AllowsBearishHuntWhenSecondLastUpHighBreached(pointSize))
-      return TryAcceptM15BreachForHunt(true, legHigh, legLow, legEnd, outLevel, outHighBreached,
-                                       outLegEndTime);
+      const double wickLevel =
+         M15BreachWickLevelForUpLegHigh(g_m15DescHighPivots[pivotIndex].levelPrice);
+      if(!M2WickCrossesAboveLevel(wickLevel, barHigh, prevHigh, pointSize))
+         continue;
 
-   if(TryNthM15CompletedSwingLeg(-1, 1, legHigh, legLow, legEnd) &&
-      !IsM15LegLiquidityAlreadyBreached(legEnd, false) &&
-      M2WickCrossesBelowLevel(M15BreachWickLevelForDownLegLow(legLow), barLow, prevLow, pointSize))
-      return TryAcceptM15BreachForHunt(false, legHigh, legLow, legEnd, outLevel, outHighBreached,
-                                       outLegEndTime);
+      return TryAcceptM15BreachForHunt(true,
+                                       g_m15DescHighPivots[pivotIndex].legHighPrice,
+                                       g_m15DescHighPivots[pivotIndex].legLowPrice,
+                                       legEndTime, outLevel, outHighBreached, outLegEndTime);
+   }
 
-   if(TryNthM15CompletedSwingLeg(-1, 2, legHigh, legLow, legEnd) &&
-      !IsM15LegLiquidityAlreadyBreached(legEnd, false) &&
-      M2WickCrossesBelowLevel(M15BreachWickLevelForDownLegLow(legLow), barLow, prevLow, pointSize) &&
-      M15AllowsBullishHuntWhenSecondLastDownLowBreached(pointSize))
-      return TryAcceptM15BreachForHunt(false, legHigh, legLow, legEnd, outLevel, outHighBreached,
-                                       outLegEndTime);
+   // Bullish hunt: M15 down-leg low breach only (newest qualifying pivot first).
+   for(int pivotIndex = 0; pivotIndex < g_m15AscLowPivotCount; pivotIndex++)
+   {
+      if(g_m15AscLowPivots[pivotIndex].swingDirection != -1)
+         continue;
+
+      const datetime legEndTime = g_m15AscLowPivots[pivotIndex].legEndTime;
+      if(IsM15LegLiquidityAlreadyBreached(legEndTime, false))
+         continue;
+
+      const double wickLevel =
+         M15BreachWickLevelForDownLegLow(g_m15AscLowPivots[pivotIndex].levelPrice);
+      if(!M2WickCrossesBelowLevel(wickLevel, barLow, prevLow, pointSize))
+         continue;
+
+      return TryAcceptM15BreachForHunt(false,
+                                       g_m15AscLowPivots[pivotIndex].legHighPrice,
+                                       g_m15AscLowPivots[pivotIndex].legLowPrice,
+                                       legEndTime, outLevel, outHighBreached, outLegEndTime);
+   }
 
    return false;
 }
