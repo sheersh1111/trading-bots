@@ -3,8 +3,8 @@
 //| v4: M2 absorption-leg TP base (0.9x/1.4x/1.9x) after touch; defer if leg open |
 //+------------------------------------------------------------------+
 #property copyright ""
-#property version   "4.24"
-#property description "Liquidity sweep v4 — M2-close sticky BOS + pivot BOS watch"
+#property version   "4.27"
+#property description "Liquidity sweep v4 — M2 sticky decent BOS streak + pivot BOS bias"
 
 #include <Trade\Trade.mqh>
 
@@ -13,7 +13,7 @@ input int    InputWarmupBars             = 500;  // 0 = off: replay closed M15 b
 input bool   InputDrawM15SwingLegVisuals = true;
 input color  InputM15SwingTrendLineColor = clrGold;
 
-input bool   InputDrawM2SwingLegs        = true;
+input bool   InputDrawM2SwingLegs        = false;
 input color  InputM2SwingLineColor       = clrMediumPurple;
 input int    InputM2SwingWarmupBars      = 500; // 0 = off: replay M2 on attach (plot_swing_h1_m5_copy)
 
@@ -34,9 +34,10 @@ input bool   InputShowLiquidityHuntHud   = true;
 input bool   InputLogHuntEvents          = true;  // Experts tab: hunt / FVG / BOS
 
 input group "M15 BOS trade direction bias"
-input bool   InputEnableM15BosTradeDirectionBias = true;  // trade with sticky M15 BOS bias (2 same-dir BOS to set/flip)
-input double InputM15BosMinBreakPercentOfLegRange = 10.0; // decent BOS: M2 close beyond latest M15 leg extreme by N% of M2 chart (InputChartRangeBarCount)
-input bool   InputEnableM15PivotBosBiasFlip      = true;  // on qualified BOS: watch nearest distant pivot until same-dir M15 leg ends
+input bool   InputEnableM15BosTradeDirectionBias = false;  // trade with M15 BOS bias (streak + optional pivot)
+input int    InputM15BosSameDirCountToFlipBias = 3; // consecutive decent same-dir M15 BOS to set/flip trade bias (min 1)
+input double InputM15BosMinBreakPercentOfLegRange = 20.0; // decent BOS: M15 close beyond latest M15 leg extreme by N% of M2 chart (InputChartRangeBarCount)
+input bool   InputEnableM15PivotBosBiasFlip      = true;  // on close-cross BOS: watch nearest distant pivot until same-dir M15 leg ends
 input double InputM15PivotBosMinSepPercentOfChart = 25.0; // pivot must be >= N% of M2 chart height beyond BOS broken level
 input int    InputM15PivotBosChartRangeM2Bars    = 292;   // M2 bar count for pivot separation chart height
 input bool   InputShowM15BosBiasHud              = true;  // top-right ↑ green / ↓ red (plot_swing_m2 style)
@@ -125,6 +126,7 @@ struct V2HuntSession
    double   touchLevel;
    bool     touchLevelReady;
    bool     touchPointTouched;
+   datetime touchHitM2BarOpenTime; // after touch: keep hunt on 1 more closed M2 bar for FVG
    bool     pendingTradeFvgValid;
    bool     pendingTradeIsBullishFvg;
    double   pendingTradeZoneLow;
@@ -192,6 +194,7 @@ M15LiquidityPivot g_m15AscLowPivots[M15_LIQUIDITY_PIVOT_CAPACITY];
 int               g_m15AscLowPivotCount = 0;
 
 #define M15_BOS_RECORDED_LEG_CAPACITY 32
+#define M15_DECENT_BOS_HISTORY_CAPACITY 16
 
 struct M15BosRecord
 {
@@ -214,6 +217,8 @@ int                 g_m15BosRecordedLegCount    = 0;
 int                 g_m15BosStreakDir             = 0;
 int                 g_m15BosStreakCount           = 0;
 int                 g_m15StickyTradeDirectionBias = 0;
+M15BosRecord        g_m15DecentBosHistory[M15_DECENT_BOS_HISTORY_CAPACITY];
+int                 g_m15DecentBosHistoryCount    = 0;
 
 struct M15PivotBosWatchState
 {
@@ -222,16 +227,15 @@ struct M15PivotBosWatchState
    double   pivotTargetLevel;
    double   bosBrokenLevel;
    datetime bosBarOpenTime;
-   bool     sameDirLegSeen;   // entered up leg (bull) / down leg (bear) since arm
+   bool     sameDirLegSeen;
 };
 
 M15PivotBosWatchState g_m15PivotBosWatch;
-int                   g_m15PivotInstantBias = 0; // 1 bull / -1 bear override from pivot break; 0 = use sticky only
-int                   g_m15LastLoggedEffectiveBias = 0;
-bool                  g_m15EffectiveBiasLogReady = false;
-
-bool g_m15PendingUpLegClosedForBos   = false;
-bool g_m15PendingDownLegClosedForBos = false;
+int                   g_m15PivotInstantBias = 0; // 1 bull / -1 bear from pivot break; 0 = use sticky streak bias
+bool                  g_m15PendingUpLegClosedForBos   = false;
+bool                  g_m15PendingDownLegClosedForBos = false;
+int                 g_m15LastLoggedEffectiveBias    = 0;
+bool                g_m15EffectiveBiasLogReady      = false;
 bool     g_huntTradeOrdersActive         = false;
 datetime g_huntOrdersFvgFormationTime    = 0;
 bool     g_huntTradeIsBuy                = false;
@@ -290,22 +294,21 @@ bool   CloseCrossesBelowLevel(const ENUM_TIMEFRAMES timeframe, const int barShif
 void   UpdateM15BosWatchSameDirLegSeen();
 bool   IsM15PivotBosWatchSameCross(const int direction, const double brokenLevel);
 void   TryArmM15PivotBosOnCross(const int m15BarShift);
-void   ProcessM15StickyBosOnM2Close(const int m2BarShift);
 void   ProcessM15PivotBosWatchStep(const ENUM_TIMEFRAMES crossTimeframe, const int crossBarShift,
                                    const bool upLegClosed, const bool downLegClosed);
 void   ProcessM15BosOnM2BarClose();
+void   ProcessM15StickyBosOnM2Close(const int m2BarShift);
 double M15BosMinBreakDistance();
 void   PushM15BosHistory(const int direction, const datetime barOpenTime, const datetime legEndTime,
                          const double brokenLevel);
-bool   M15StickyBosAlreadyRecordedForLeg(const int direction, const datetime legEndTime);
-void   ResetM15StickyBosState();
-double ReferenceChartHeightForM2BarCount(const int barCount);
+bool   M15BosAlreadyRecordedForLeg(const int direction, const datetime legEndTime);
+void   ResetM15BosBiasState();
 double M15PivotBosMinSeparationPrice();
 bool   FindNearestDistantPivotHighAbove(const double brokenLevel, double &outPivotHigh);
 bool   FindNearestDistantPivotLowBelow(const double brokenLevel, double &outPivotLow);
 void   ArmM15PivotBosWatch(const int bosDirection, const double brokenLevel, const datetime bosBarOpenTime);
 void   DisarmM15PivotBosWatch();
-int    ComputeM15StickyTradeDirectionBias();
+double ReferenceChartHeightForM2BarCount(const int barCount);
 int    GetM15TradeDirectionBias(); // 1 bull, -1 bear, 0 undefined/mixed/disabled-filter
 void   LogM15TradeDirectionBiasIfChanged();
 bool   FvgTradeAllowedByM15BosBias(const bool isBullishFairValueGap, string &outBlockReason);
@@ -347,6 +350,9 @@ int    V2OppositeM2LegDirectionForHunt(const int huntIndex);
 void   V2ResetHuntSlotSessionCounters(const int huntIndex);
 double V2TouchLevelFromLegExtreme(const bool m15HighWasBreached, const double legLowPrice,
                                    const double legHighPrice);
+bool   V2TryGetLastCompletedM2Leg(const int legDirection, double &outLegLow, double &outLegHigh);
+void   V2TryLockTouchLevelFromM2Leg(const int huntIndex, const double legLow, const double legHigh,
+                                     const string logContext);
 void   V2UpdateTouchLevelFromM2Swing(const int huntIndex);
 void   V2DrawTouchPointLine(const int huntIndex);
 void   V2ClearTouchPointLine(const int huntIndex);
@@ -487,7 +493,7 @@ int OnInit()
 
    V2InitAllHuntSlots();
    g_m15LegLiquidityBreachCount       = 0;
-   ResetM15StickyBosState();
+   ResetM15BosBiasState();
    ZeroMemory(g_m15PivotBosWatch);
    g_m15PivotInstantBias              = 0;
    g_m15PendingUpLegClosedForBos      = false;
@@ -496,7 +502,7 @@ int OnInit()
 
    WarmupM15SwingFromHistory();
    WarmupM2SwingFromHistory();
-   ResetM15StickyBosState();
+   ResetM15BosBiasState();
    RebuildM15LiquidityPivotLevels();
    g_m15LastLoggedEffectiveBias = GetM15TradeDirectionBias();
    g_m15EffectiveBiasLogReady   = true;
@@ -584,9 +590,7 @@ void WarmupM15SwingFromHistory()
    {
       ProcessM15SwingStep(k);
       RebuildM15LiquidityPivotLevels();
-      TryArmM15PivotBosOnCross(k);
    }
-   DisarmM15PivotBosWatch();
 }
 
 //+------------------------------------------------------------------+
@@ -605,7 +609,8 @@ void WarmupM2SwingFromHistory()
    {
       ProcessSwingStepAtShift(g_m2Swing, PERIOD_M2, k, InputM2SwingLineColor, PFX_M2_TREND, PFX_M2_LBL,
                               InputDrawM2SwingLegs);
-      ProcessM15StickyBosOnM2Close(k);
+      if(InputEnableM15BosTradeDirectionBias)
+         ProcessM15StickyBosOnM2Close(k);
    }
 }
 
@@ -692,7 +697,7 @@ void SwingCloseM2Leg(SwingState &swingState, const ENUM_TIMEFRAMES timeframe, co
 {
    swingState.currentSwingLeg.keyLevelId = 0;
 
-   if(timeframe == PERIOD_M2 && drawVisuals)
+   if(timeframe == PERIOD_M2 && InputDrawM2SwingLegs)
       ObjectDelete(0, PFX_M2_TREND + "LIVE");
 
    swingState.currentSwingLeg.legEndTime = iTime(_Symbol, timeframe, lastClosedBarShift);
@@ -713,7 +718,7 @@ void SwingCloseM2Leg(SwingState &swingState, const ENUM_TIMEFRAMES timeframe, co
       trendLineEndPrice   = swingState.currentSwingLeg.legLowPrice;
    }
 
-   if(drawVisuals)
+   if(InputDrawM2SwingLegs)
    {
       datetime tRightDraw = swingState.currentSwingLeg.legEndTime;
       if(tRightDraw <= swingState.currentSwingLeg.legStartTime)
@@ -752,7 +757,7 @@ void SwingCloseM2Leg(SwingState &swingState, const ENUM_TIMEFRAMES timeframe, co
 void UpdateM2LiveSwingLegVisualIf(const SwingState &swingState, const ENUM_TIMEFRAMES timeframe,
                                   const bool drawVisuals)
 {
-   if(timeframe != PERIOD_M2 || !drawVisuals)
+   if(timeframe != PERIOD_M2 || !InputDrawM2SwingLegs)
       return;
    if(swingState.currentSwingLeg.swingDirection == 0)
       return;
@@ -806,10 +811,9 @@ void ProcessSwingStepAtShift(SwingState &swingState, const ENUM_TIMEFRAMES timef
    const int candleDirection =
       (lastClosedBarClose > lastClosedBarOpen) ? 1
       : ((lastClosedBarClose < lastClosedBarOpen) ? -1 : 0);
-   const double lastClosedBarRange =
-      (timeframe == PERIOD_M2)
-      ? MathAbs(lastClosedBarClose - lastClosedBarOpen)
-      : (lastClosedBarHigh - lastClosedBarLow);
+   // Anchor tolerance: M2 = body vs 0.2× prior avg; M15 = wick AND body vs 0.5× prior avg.
+   const double lastClosedBarBodyRange = MathAbs(lastClosedBarClose - lastClosedBarOpen);
+   const double lastClosedBarWickRange  = lastClosedBarHigh - lastClosedBarLow;
 
    if(swingState.currentSwingLeg.swingDirection == 0)
    {
@@ -834,7 +838,13 @@ void ProcessSwingStepAtShift(SwingState &swingState, const ENUM_TIMEFRAMES timef
    }
    const double averageRangeFiveBars = (rangeBarCount > 0) ? sumRangeFivePriorBars / (double)rangeBarCount : 0.0;
 
-   const bool isDecentMovement = (lastClosedBarRange > (averageRangeFiveBars * 0.5));
+   const double anchorDecentMovementMultiplier =
+      (timeframe == PERIOD_M15) ? 0.5 : 0.2;
+   const double minDecentRange = averageRangeFiveBars * anchorDecentMovementMultiplier;
+   const bool isDecentMovement =
+      (timeframe == PERIOD_M2)
+      ? (lastClosedBarBodyRange > minDecentRange)
+      : (lastClosedBarWickRange > minDecentRange && lastClosedBarBodyRange > minDecentRange);
    if(isDecentMovement && candleDirection == swingState.currentSwingLeg.swingDirection)
       swingState.priceAnchorLevel = (lastClosedBarHigh + lastClosedBarLow) / 2.0;
 
@@ -962,7 +972,10 @@ void ProcessM15SwingStep(const int lastClosedBarShift = 1)
    const int candleDirection =
       (lastClosedBarClose > lastClosedBarOpen) ? 1
       : ((lastClosedBarClose < lastClosedBarOpen) ? -1 : 0);
-   const double lastClosedBarRange = lastClosedBarHigh - lastClosedBarLow;
+
+   // Anchor tolerance: M2 = body vs 0.2× prior avg; M15 = wick AND body vs 0.5× prior avg.
+   const double lastClosedBarBodyRange = MathAbs(lastClosedBarClose - lastClosedBarOpen);
+   const double lastClosedBarWickRange  = lastClosedBarHigh - lastClosedBarLow;
 
    if(g_m15Swing.currentSwingLeg.swingDirection == 0)
    {
@@ -972,12 +985,25 @@ void ProcessM15SwingStep(const int lastClosedBarShift = 1)
    }
 
    double sumRangeFivePriorBars = 0.0;
-   for(int k = 1; k <= 5; k++)
+   const int barsTotal = iBars(_Symbol, timeframe);
+   int       rangeBarCount = 0;
+   for(int barShiftIndex = sh + 1; barShiftIndex <= sh + 5; barShiftIndex++)
+   {
+      if(barShiftIndex >= barsTotal)
+         break;
       sumRangeFivePriorBars +=
-         (iHigh(_Symbol, timeframe, sh + k) - iLow(_Symbol, timeframe, sh + k));
-   const double averageRangeFiveBars = sumRangeFivePriorBars / 5.0;
+         (iHigh(_Symbol, timeframe, barShiftIndex) - iLow(_Symbol, timeframe, barShiftIndex));
+      rangeBarCount++;
+   }
+   const double averageRangeFiveBars = (rangeBarCount > 0) ? sumRangeFivePriorBars / (double)rangeBarCount : 0.0;
 
-   const bool isDecentMovement = (lastClosedBarRange > (averageRangeFiveBars * 1.0));
+   const double anchorDecentMovementMultiplier =
+      (timeframe == PERIOD_M15) ? 0.5 : 0.2;
+   const double minDecentRange = averageRangeFiveBars * anchorDecentMovementMultiplier;
+   const bool isDecentMovement =
+      (timeframe == PERIOD_M2)
+      ? (lastClosedBarBodyRange > minDecentRange)
+      : (lastClosedBarWickRange > minDecentRange && lastClosedBarBodyRange > minDecentRange);
    if(isDecentMovement && candleDirection == g_m15Swing.currentSwingLeg.swingDirection)
       g_m15Swing.priceAnchorLevel = (lastClosedBarHigh + lastClosedBarLow) / 2.0;
 
@@ -1052,7 +1078,7 @@ void RefreshLiquidityHuntHud()
 }
 
 //+------------------------------------------------------------------+
-//| M15 BOS cross: close cross of last same-dir swing leg (barShift 0 = live M2 checks). |
+//| M15 BOS cross: close cross of last same-dir swing leg (barShift 0 = live M2 pivot arm). |
 //+------------------------------------------------------------------+
 bool TryDetectM15BosCrossOnBar(const int m15BarShift, int &outDirection,
                                double &outBrokenLevel, datetime &outBarOpenTime)
@@ -1165,32 +1191,15 @@ double M15BosMinBreakDistance()
 }
 
 //+------------------------------------------------------------------+
-void TryArmM15PivotBosOnCross(const int m15BarShift)
-{
-   if(!InputEnableM15BosTradeDirectionBias || !InputEnableM15PivotBosBiasFlip)
-      return;
-
-   int      bosDirection = 0;
-   double   brokenLevel  = 0.0;
-   datetime barOpenTime  = 0;
-   if(!TryDetectM15BosCrossOnBar(m15BarShift, bosDirection, brokenLevel, barOpenTime))
-      return;
-
-   if(IsM15PivotBosWatchSameCross(bosDirection, brokenLevel))
-      return;
-
-   ArmM15PivotBosWatch(bosDirection, brokenLevel, barOpenTime);
-}
-
-//+------------------------------------------------------------------+
-void ResetM15StickyBosState()
+void ResetM15BosBiasState()
 {
    ZeroMemory(g_m15LastBosRecord);
-   g_m15LastBosRecordValid      = false;
-   g_m15BosRecordedLegCount     = 0;
-   g_m15BosStreakDir            = 0;
-   g_m15BosStreakCount          = 0;
-   g_m15StickyTradeDirectionBias = 0;
+   g_m15LastBosRecordValid           = false;
+   g_m15BosRecordedLegCount          = 0;
+   g_m15DecentBosHistoryCount          = 0;
+   g_m15BosStreakDir                   = 0;
+   g_m15BosStreakCount                 = 0;
+   g_m15StickyTradeDirectionBias       = 0;
 }
 
 //+------------------------------------------------------------------+
@@ -1213,7 +1222,7 @@ void RememberM15BosRecordedLeg(const int direction, const datetime legEndTime)
 }
 
 //+------------------------------------------------------------------+
-bool M15StickyBosAlreadyRecordedForLeg(const int direction, const datetime legEndTime)
+bool M15BosAlreadyRecordedForLeg(const int direction, const datetime legEndTime)
 {
    if(legEndTime == 0)
       return false;
@@ -1228,8 +1237,8 @@ bool M15StickyBosAlreadyRecordedForLeg(const int direction, const datetime legEn
 }
 
 //+------------------------------------------------------------------+
-//| Sticky BOS: M2 close beyond latest M15 leg extreme + N% chart height. |
-//| One BOS per completed M15 leg (legEndTime dedupe).                    |
+//| Sticky decent BOS: M2 close beyond latest M15 leg extreme + N% chart height. Each M2 bar. |
+//| Bias flips after InputM15BosSameDirCountToFlipBias consecutive same-dir decent BOS.      |
 //+------------------------------------------------------------------+
 void ProcessM15StickyBosOnM2Close(const int m2BarShift)
 {
@@ -1260,7 +1269,7 @@ void ProcessM15StickyBosOnM2Close(const int m2BarShift)
       const double legHigh      = leg.legHighPrice;
       const double qualifyLevel = legHigh + minBreakDist;
       if(m2Close + eps >= qualifyLevel &&
-         !M15StickyBosAlreadyRecordedForLeg(1, leg.legEndTime))
+         !M15BosAlreadyRecordedForLeg(1, leg.legEndTime))
       {
          PushM15BosHistory(1, barOpenTime, leg.legEndTime, legHigh);
          if(InputLogHuntEvents)
@@ -1286,7 +1295,7 @@ void ProcessM15StickyBosOnM2Close(const int m2BarShift)
       const double legLow       = leg.legLowPrice;
       const double qualifyLevel = legLow - minBreakDist;
       if(m2Close - eps <= qualifyLevel &&
-         !M15StickyBosAlreadyRecordedForLeg(-1, leg.legEndTime))
+         !M15BosAlreadyRecordedForLeg(-1, leg.legEndTime))
       {
          PushM15BosHistory(-1, barOpenTime, leg.legEndTime, legLow);
          if(InputLogHuntEvents)
@@ -1302,6 +1311,24 @@ void ProcessM15StickyBosOnM2Close(const int m2BarShift)
       }
       break;
    }
+}
+
+//+------------------------------------------------------------------+
+void TryArmM15PivotBosOnCross(const int m15BarShift)
+{
+   if(!InputEnableM15BosTradeDirectionBias || !InputEnableM15PivotBosBiasFlip)
+      return;
+
+   int      bosDirection = 0;
+   double   brokenLevel  = 0.0;
+   datetime barOpenTime  = 0;
+   if(!TryDetectM15BosCrossOnBar(m15BarShift, bosDirection, brokenLevel, barOpenTime))
+      return;
+
+   if(IsM15PivotBosWatchSameCross(bosDirection, brokenLevel))
+      return;
+
+   ArmM15PivotBosWatch(bosDirection, brokenLevel, barOpenTime);
 }
 
 //+------------------------------------------------------------------+
@@ -1327,16 +1354,36 @@ void ProcessM15BosOnM2BarClose()
 }
 
 //+------------------------------------------------------------------+
+void RememberM15DecentBosInHistory(const int direction, const datetime barOpenTime,
+                                   const datetime legEndTime, const double brokenLevel)
+{
+   if(g_m15DecentBosHistoryCount >= M15_DECENT_BOS_HISTORY_CAPACITY)
+   {
+      for(int shiftIndex = 1; shiftIndex < M15_DECENT_BOS_HISTORY_CAPACITY; shiftIndex++)
+         g_m15DecentBosHistory[shiftIndex - 1] = g_m15DecentBosHistory[shiftIndex];
+      g_m15DecentBosHistoryCount = M15_DECENT_BOS_HISTORY_CAPACITY - 1;
+   }
+
+   const int index = g_m15DecentBosHistoryCount;
+   g_m15DecentBosHistory[index].direction   = direction;
+   g_m15DecentBosHistory[index].barOpenTime = barOpenTime;
+   g_m15DecentBosHistory[index].legEndTime  = legEndTime;
+   g_m15DecentBosHistory[index].brokenLevel = brokenLevel;
+   g_m15DecentBosHistoryCount++;
+}
+
+//+------------------------------------------------------------------+
 void PushM15BosHistory(const int direction, const datetime barOpenTime, const datetime legEndTime,
                        const double brokenLevel)
 {
    if(direction == 0 || barOpenTime == 0 || legEndTime == 0)
       return;
 
-   if(M15StickyBosAlreadyRecordedForLeg(direction, legEndTime))
+   if(M15BosAlreadyRecordedForLeg(direction, legEndTime))
       return;
 
    RememberM15BosRecordedLeg(direction, legEndTime);
+   RememberM15DecentBosInHistory(direction, barOpenTime, legEndTime, brokenLevel);
 
    g_m15LastBosRecord.direction   = direction;
    g_m15LastBosRecord.barOpenTime = barOpenTime;
@@ -1344,6 +1391,7 @@ void PushM15BosHistory(const int direction, const datetime barOpenTime, const da
    g_m15LastBosRecord.brokenLevel = brokenLevel;
    g_m15LastBosRecordValid        = true;
 
+   const int needSameDirBos = MathMax(1, InputM15BosSameDirCountToFlipBias);
    if(direction == g_m15BosStreakDir)
       g_m15BosStreakCount++;
    else
@@ -1352,7 +1400,7 @@ void PushM15BosHistory(const int direction, const datetime barOpenTime, const da
       g_m15BosStreakCount = 1;
    }
 
-   if(g_m15BosStreakCount >= 2)
+   if(g_m15BosStreakCount >= needSameDirBos)
    {
       g_m15StickyTradeDirectionBias = g_m15BosStreakDir;
       if(g_m15PivotInstantBias != 0 && g_m15PivotInstantBias != g_m15StickyTradeDirectionBias)
@@ -1388,13 +1436,14 @@ void LogM15TradeDirectionBiasIfChanged()
       return;
 
    LogHuntEvent("M15_BIAS",
-                StringFormat("%s → %s (sticky=%d pivotInstant=%d streak=%d x%d)",
+                StringFormat("%s → %s (sticky=%d pivotInstant=%d streak=%d x%d need=%d)",
                              M15TradeDirectionBiasText(g_m15LastLoggedEffectiveBias),
                              M15TradeDirectionBiasText(bias),
                              g_m15StickyTradeDirectionBias,
                              g_m15PivotInstantBias,
                              g_m15BosStreakDir,
-                             g_m15BosStreakCount));
+                             g_m15BosStreakCount,
+                             InputM15BosSameDirCountToFlipBias));
    g_m15LastLoggedEffectiveBias = bias;
 }
 
@@ -1638,15 +1687,6 @@ double ReferenceChartHeightForM2BarCount(const int barCount)
 }
 
 //+------------------------------------------------------------------+
-//| Sticky bias: flips only after 2 consecutive BOS in the same direction. |
-//| e.g. bear+bear → bear; then one bull → still bear until bull+bull.   |
-//+------------------------------------------------------------------+
-int ComputeM15StickyTradeDirectionBias()
-{
-   return g_m15StickyTradeDirectionBias;
-}
-
-//+------------------------------------------------------------------+
 int GetM15TradeDirectionBias()
 {
    if(!InputEnableM15BosTradeDirectionBias)
@@ -1655,7 +1695,7 @@ int GetM15TradeDirectionBias()
    if(g_m15PivotInstantBias != 0)
       return g_m15PivotInstantBias;
 
-   return ComputeM15StickyTradeDirectionBias();
+   return g_m15StickyTradeDirectionBias;
 }
 
 //+------------------------------------------------------------------+
@@ -1966,7 +2006,10 @@ void ProcessM15SwingStepReplay(SwingState &swingState, const int lastClosedBarSh
    const int candleDirection =
       (lastClosedBarClose > lastClosedBarOpen) ? 1
       : ((lastClosedBarClose < lastClosedBarOpen) ? -1 : 0);
-   const double lastClosedBarRange = lastClosedBarHigh - lastClosedBarLow;
+
+   // Anchor tolerance: M2 = body vs 0.2× prior avg; M15 = wick AND body vs 0.5× prior avg.
+   const double lastClosedBarBodyRange = MathAbs(lastClosedBarClose - lastClosedBarOpen);
+   const double lastClosedBarWickRange  = lastClosedBarHigh - lastClosedBarLow;
 
    if(swingState.currentSwingLeg.swingDirection == 0)
    {
@@ -1978,12 +2021,25 @@ void ProcessM15SwingStepReplay(SwingState &swingState, const int lastClosedBarSh
    }
 
    double sumRangeFivePriorBars = 0.0;
-   for(int k = 1; k <= 5; k++)
+   const int barsTotal = iBars(_Symbol, timeframe);
+   int       rangeBarCount = 0;
+   for(int barShiftIndex = sh + 1; barShiftIndex <= sh + 5; barShiftIndex++)
+   {
+      if(barShiftIndex >= barsTotal)
+         break;
       sumRangeFivePriorBars +=
-         (iHigh(_Symbol, timeframe, sh + k) - iLow(_Symbol, timeframe, sh + k));
-   const double averageRangeFiveBars = sumRangeFivePriorBars / 5.0;
+         (iHigh(_Symbol, timeframe, barShiftIndex) - iLow(_Symbol, timeframe, barShiftIndex));
+      rangeBarCount++;
+   }
+   const double averageRangeFiveBars = (rangeBarCount > 0) ? sumRangeFivePriorBars / (double)rangeBarCount : 0.0;
 
-   const bool isDecentMovement = (lastClosedBarRange > (averageRangeFiveBars * 1.0));
+   const double anchorDecentMovementMultiplier =
+      (timeframe == PERIOD_M15) ? 0.5 : 0.2;
+   const double minDecentRange = averageRangeFiveBars * anchorDecentMovementMultiplier;
+   const bool isDecentMovement =
+      (timeframe == PERIOD_M2)
+      ? (lastClosedBarBodyRange > minDecentRange)
+      : (lastClosedBarWickRange > minDecentRange && lastClosedBarBodyRange > minDecentRange);
    if(isDecentMovement && candleDirection == swingState.currentSwingLeg.swingDirection)
       swingState.priceAnchorLevel = (lastClosedBarHigh + lastClosedBarLow) / 2.0;
 
@@ -2324,6 +2380,47 @@ double V2TouchLevelFromLegExtreme(const bool m15HighWasBreached, const double le
    if(bufferPrice <= 0.0)
       return NormalizeDouble(legHighPrice, _Digits);
    return NormalizeDouble(legHighPrice - bufferPrice, _Digits);
+}
+
+//+------------------------------------------------------------------+
+bool V2TryGetLastCompletedM2Leg(const int legDirection, double &outLegLow, double &outLegHigh)
+{
+   outLegLow  = 0.0;
+   outLegHigh = 0.0;
+   if(legDirection == 0 || g_m2Swing.swingHistoryCount < 1)
+      return false;
+
+   for(int historyIndex = g_m2Swing.swingHistoryCount - 1; historyIndex >= 0; historyIndex--)
+   {
+      if(g_m2Swing.swingHistory[historyIndex].swingDirection != legDirection)
+         continue;
+      outLegLow  = g_m2Swing.swingHistory[historyIndex].legLowPrice;
+      outLegHigh = g_m2Swing.swingHistory[historyIndex].legHighPrice;
+      return (outLegLow > 0.0 && outLegHigh > 0.0);
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+void V2TryLockTouchLevelFromM2Leg(const int huntIndex, const double legLow, const double legHigh,
+                                    const string logContext)
+{
+   if(!g_v2Hunts[huntIndex].active || g_v2Hunts[huntIndex].touchLevelReady)
+      return;
+
+   g_v2Hunts[huntIndex].touchLevel =
+      V2TouchLevelFromLegExtreme(g_v2Hunts[huntIndex].m15HighWasBreached, legLow, legHigh);
+   if(g_v2Hunts[huntIndex].touchLevel <= 0.0)
+      return;
+
+   g_v2Hunts[huntIndex].touchLevelReady        = true;
+   g_v2Hunts[huntIndex].touchPointTouched      = false;
+   g_v2Hunts[huntIndex].touchHitM2BarOpenTime  = 0;
+   V2DrawTouchPointLine(huntIndex);
+   V2LogHuntEvent(huntIndex, "V2_STORE_TOUCH",
+                  StringFormat("lvl=%.5f legL=%.5f legH=%.5f buf2%%rng=%.5f (%s)",
+                               g_v2Hunts[huntIndex].touchLevel, legLow, legHigh,
+                               M2FvgStopBufferPrice(), logContext));
 }
 
 //+------------------------------------------------------------------+
@@ -4592,6 +4689,7 @@ void V2InitHuntSlot(const int huntIndex)
    g_v2Hunts[huntIndex].touchLevel                     = 0.0;
    g_v2Hunts[huntIndex].touchLevelReady                = false;
    g_v2Hunts[huntIndex].touchPointTouched              = false;
+   g_v2Hunts[huntIndex].touchHitM2BarOpenTime          = 0;
    g_v2Hunts[huntIndex].pendingTradeFvgValid           = false;
    g_v2Hunts[huntIndex].fvgMemCount                    = 0;
    g_v2Hunts[huntIndex].fvgRectSequence                = 0;
@@ -4801,7 +4899,8 @@ void V2ResetHuntSlotSessionCounters(const int huntIndex)
    g_v2Hunts[huntIndex].oppositeFvgFoundCount = 0;
    g_v2Hunts[huntIndex].touchLevel            = 0.0;
    g_v2Hunts[huntIndex].touchLevelReady       = false;
-   g_v2Hunts[huntIndex].touchPointTouched     = false;
+   g_v2Hunts[huntIndex].touchPointTouched        = false;
+   g_v2Hunts[huntIndex].touchHitM2BarOpenTime    = 0;
    g_v2Hunts[huntIndex].pendingTradeFvgValid  = false;
    g_v2Hunts[huntIndex].fvgMemCount           = 0;
    g_v2Hunts[huntIndex].fvgRectSequence       = 0;
@@ -4912,22 +5011,31 @@ void V2UpdateTouchLevelFromM2Swing(const int huntIndex)
 {
    if(!g_v2Hunts[huntIndex].active || g_v2Hunts[huntIndex].touchLevelReady)
       return;
-   const int sameSideDir = V2SameSideM2LegDirectionForHunt(huntIndex);
-   if(g_m2Swing.currentSwingLeg.swingDirection != sameSideDir)
+
+   const int oppositeDir = V2OppositeM2LegDirectionForHunt(huntIndex);
+   double    legLow      = 0.0;
+   double    legHigh     = 0.0;
+   if(!V2TryGetLastCompletedM2Leg(oppositeDir, legLow, legHigh))
       return;
-   const double legLow  = g_m2Swing.currentSwingLeg.legLowPrice;
-   const double legHigh = g_m2Swing.currentSwingLeg.legHighPrice;
-   g_v2Hunts[huntIndex].touchLevel =
-      V2TouchLevelFromLegExtreme(g_v2Hunts[huntIndex].m15HighWasBreached, legLow, legHigh);
-   if(g_v2Hunts[huntIndex].touchLevel <= 0.0)
+
+   V2TryLockTouchLevelFromM2Leg(huntIndex, legLow, legHigh, "last completed opposite M2 leg");
+}
+
+//+------------------------------------------------------------------+
+void V2OnM2LegChangeForHunt(const int huntIndex, const int closingLegDirection,
+                            const int nextLegDirection)
+{
+   if(!g_v2Hunts[huntIndex].active || g_v2Hunts[huntIndex].touchLevelReady)
       return;
-   g_v2Hunts[huntIndex].touchLevelReady   = true;
-   g_v2Hunts[huntIndex].touchPointTouched = false;
-   V2DrawTouchPointLine(huntIndex);
-   V2LogHuntEvent(huntIndex, "V2_STORE_TOUCH",
-                  StringFormat("lvl=%.5f legL=%.5f legH=%.5f buf2%%rng=%.5f (locked)",
-                               g_v2Hunts[huntIndex].touchLevel, legLow, legHigh,
-                               M2FvgStopBufferPrice()));
+
+   const int oppositeDir = V2OppositeM2LegDirectionForHunt(huntIndex);
+   if(closingLegDirection != oppositeDir)
+      return;
+
+   V2TryLockTouchLevelFromM2Leg(huntIndex,
+                                g_m2Swing.currentSwingLeg.legLowPrice,
+                                g_m2Swing.currentSwingLeg.legHighPrice,
+                                "opposite M2 leg just closed");
 }
 
 //+------------------------------------------------------------------+
@@ -5183,37 +5291,6 @@ void V2EndOppositeFvgHuntSession(const int huntIndex, const bool tryPlaceTradeAf
 }
 
 //+------------------------------------------------------------------+
-void V2OnM2LegChangeForHunt(const int huntIndex, const int closingLegDirection,
-                            const int nextLegDirection)
-{
-   if(!g_v2Hunts[huntIndex].active)
-      return;
-   const int sameSideDir = V2SameSideM2LegDirectionForHunt(huntIndex);
-   if(!g_v2Hunts[huntIndex].touchLevelReady &&
-      nextLegDirection == sameSideDir && closingLegDirection == sameSideDir &&
-      g_m2Swing.swingHistoryCount > 0)
-   {
-      const int closedLegIndex = g_m2Swing.swingHistoryCount - 1;
-      const double closedLegLow =
-         g_m2Swing.swingHistory[closedLegIndex].legLowPrice;
-      const double closedLegHigh =
-         g_m2Swing.swingHistory[closedLegIndex].legHighPrice;
-      g_v2Hunts[huntIndex].touchLevel =
-         V2TouchLevelFromLegExtreme(g_v2Hunts[huntIndex].m15HighWasBreached, closedLegLow,
-                                    closedLegHigh);
-      if(g_v2Hunts[huntIndex].touchLevel <= 0.0)
-         return;
-      g_v2Hunts[huntIndex].touchLevelReady   = true;
-      g_v2Hunts[huntIndex].touchPointTouched = false;
-      V2DrawTouchPointLine(huntIndex);
-      V2LogHuntEvent(huntIndex, "V2_STORE_TOUCH",
-                     StringFormat("lvl=%.5f legL=%.5f legH=%.5f buf2%%rng=%.5f (locked, leg close)",
-                                  g_v2Hunts[huntIndex].touchLevel, closedLegLow, closedLegHigh,
-                                  M2FvgStopBufferPrice()));
-   }
-}
-
-//+------------------------------------------------------------------+
 void V2ClearImpulseBufferZone(const int huntIndex)
 {
    if(huntIndex < 0 || huntIndex >= V2_MAX_HUNT_SESSIONS)
@@ -5318,6 +5395,7 @@ int V2ArmOppositeFvgHuntAfterM15Breach(const double m15Level, const bool m15High
    g_v2Hunts[huntIndex].impulseCloseExtremeSinceM15Breach = barClose;
    g_v2Hunts[huntIndex].sessionId                      = iTime(_Symbol, PERIOD_M2, 1);
    V2ResetHuntSlotSessionCounters(huntIndex);
+   V2UpdateTouchLevelFromM2Swing(huntIndex);
 
    if(m15HighBreached)
       V2LogHuntEvent(huntIndex, "HUNT_ON",
@@ -5449,12 +5527,25 @@ void V2ProcessOneActiveHuntOnM2Bar(const int huntIndex, const double pointSize,
    V2UpdateTouchLevelFromM2Swing(huntIndex);
 
    if(g_v2Hunts[huntIndex].touchLevelReady &&
+      !g_v2Hunts[huntIndex].touchPointTouched &&
       V2TryDetectTouchOfStoredLevel(huntIndex, barHigh, barLow, prevHigh, prevLow, pointSize))
    {
-      g_v2Hunts[huntIndex].touchPointTouched = true;
-      V2LogHuntEvent(huntIndex, "HUNT_OFF",
-                     StringFormat("touch retouch lvl=%.5f", g_v2Hunts[huntIndex].touchLevel));
-      V2EndOppositeFvgHuntSession(huntIndex);
+      g_v2Hunts[huntIndex].touchPointTouched     = true;
+      g_v2Hunts[huntIndex].touchHitM2BarOpenTime = iTime(_Symbol, PERIOD_M2, 1);
+      V2LogHuntEvent(huntIndex, "TOUCH_HIT",
+                     StringFormat("lvl=%.5f — hunt stays on 1 more M2 bar for FVG",
+                                  g_v2Hunts[huntIndex].touchLevel));
+   }
+
+   if(g_v2Hunts[huntIndex].touchHitM2BarOpenTime != 0)
+   {
+      const datetime closedM2BarOpen = iTime(_Symbol, PERIOD_M2, 1);
+      if(closedM2BarOpen != 0 && closedM2BarOpen != g_v2Hunts[huntIndex].touchHitM2BarOpenTime)
+      {
+         V2LogHuntEvent(huntIndex, "HUNT_OFF",
+                        StringFormat("touch grace ended lvl=%.5f", g_v2Hunts[huntIndex].touchLevel));
+         V2EndOppositeFvgHuntSession(huntIndex);
+      }
    }
 }
 
