@@ -1,0 +1,27 @@
+{
+  "editor.formatOnSave": false,
+  "editor.formatOnPaste": false,
+  "editor.formatOnType": false,
+  "editor.formatOnSaveTimeout": 1000,
+  "editor.codeActionsOnSave": {
+    "source.fixAll": "never",
+    "source.fixAll.eslint": "never",
+    "source.organizeImports": "never",
+    "source.sortMembers": "never"
+  },
+  "[mql5]": {
+    "editor.formatOnSave": false,
+    "editor.defaultFormatter": null,
+    "editor.codeActionsOnSave": {},
+    "files.trimTrailingWhitespace": false,
+    "files.insertFinalNewline": false
+  },
+  "files.associations": {
+    "*.mq5": "mql5",
+    "*.mqh": "mql5"
+  },
+  "files.watcherExclude": {
+    "**/*.ex5": true,
+    "**/*.log": true
+  }
+}

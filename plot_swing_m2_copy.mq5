@@ -1,9 +1,11 @@
 //+------------------------------------------------------------------+
-//| plot_swing_m2.mq5                                                |
-//| M2 BOS-opposite FVG + M15 BOS gate + H4 demand/supply path OR       |
+//| plot_swing_m2_copy.mq5                                           |
+//| M15 leg high/low crossed on M2 → detect_opposite_2min_fvg;     |
+//| hunt opposite M2 FVG; hunt ends on opposite BOS (defer rules), impulse. |
+//| M2 swing leg step matches plot_swing_h1_m5_copy.mq5 (anchor + 0.6× range). |
 //+------------------------------------------------------------------+
 #property copyright ""
-#property version   "1.39"
+#property version   "2.09"
 
 #include <Trade\Trade.mqh>
 
@@ -12,9 +14,10 @@ CTrade tradeLayer;
 const ENUM_TIMEFRAMES SwingTimeframe = PERIOD_M2;
 
 input bool InputSwitchChartToMinuteTwo = true;   // Set chart period to M2 on attach
-input bool InputDrawSwingLegVisuals = false;      // Swing leg OBJ_TREND + High/Low labels (off)
+input bool InputDrawSwingLegVisuals = true;       // M2 (SwingTimeframe) swing leg OBJ_TREND + High/Low labels
+input int  InputM2SwingWarmupBarsOnInit = 500;    // 0=off: replay last N closed M2 bars on attach (draws leg history)
 
-input group "BOS opposite FVG (M2: bar 1 vs bar 3)"
+input group "BOS opposite FVG (M2 bar 1 vs 3; arm on M15 leg cross; clear on opposite M2 BOS)"
 input bool InputDrawBosOppositeFairValueGapZones = true; // Rectangles for BOS-qualified FVG only
 input double InputBosMaxImpulsePercentOfChartRangeBeforeOppositeFvg = 15.0; // Cancel FVG watch if close exceeds this % of chart height past broken leg (0 = off)
 input int  InputChartRangeBarCount = 147;        // Bars for chart height (FVG min-gap filter)
@@ -58,6 +61,7 @@ struct Swing
    datetime legStartTime;
    datetime legEndTime;
    int      swingDirection; // 1 = up, -1 = down, 0 = unset
+   int      keyLevelId;     // M2 swing legs: unused (0); same layout as plot_swing_h1_m5_copy.mq5
 };
 
 struct SwingState
@@ -90,21 +94,16 @@ struct BosOppositeFairValueGapMemory
 
 #define BosOppositeFairValueGapMemoryCapacity 32
 
-struct BosOppositeFvgWatch
-{
-   int      counter;
-   bool     expectsBullishFairValueGap; // true = expect bullish FVG (after bearish BOS)
-   bool     skipDecrementOnce;          // no countdown tick on the bar where BOS was detected
-   double   bosLegLevelPrice;           // broken swing high (bull BOS) or low (bear BOS)
-   double   maxCloseSinceBos;           // bull BOS: running max close vs leg high (impulse filter)
-   double   minCloseSinceBos;           // bear BOS: running min close vs leg low (impulse filter)
-   datetime bosM2BarOpenTime;
-   double   bosBarClosePrice;
-   double   pathMinLowSinceBos;
-   double   pathMaxHighSinceBos;
-};
-
-#define BosOppositeFvgWatchCapacity 32
+// M15 liquidity breach → hunt opposite-direction M2 FVG until M2 opposite BOS (or FVG / impulse cap).
+bool     detect_opposite_2min_fvg = false;
+bool     g_m15HighWasBreached     = false; // true: hunt bearish M2 FVG; false: hunt bullish M2 FVG
+double   g_m15BreachedLegLevelPrice       = 0.0;
+double   g_closeWhenM15LiquidityBreached  = 0.0;
+double   g_pathMinLowSinceM15Breach       = 0.0;
+double   g_pathMaxHighSinceM15Breach        = 0.0;
+double   g_impulseCloseExtremeSinceM15Breach = 0.0;
+int      g_oppositeFvgFoundDuringHuntCount   = 0; // matching opposite M2 FVGs recorded this hunt
+bool     g_deferHuntEndUntilNextOppositeBos  = false; // after 1st opposite BOS with count==0, wait for another
 
 SwingState     globalSwingState;
 LiquidityPool  globalLiquidityPools[LiquidityPoolCapacity];
@@ -112,9 +111,6 @@ int            globalLiquidityPoolCount = 0;
 
 datetime globalLastSwingTimeframeBarOpenTime = 0;
 int      globalBosMarkedFairValueGapRectangleSequence = 0;
-
-BosOppositeFvgWatch globalBosOppositeFvgWatchList[BosOppositeFvgWatchCapacity];
-int                   globalBosOppositeFvgWatchCount = 0;
 
 BosOppositeFairValueGapMemory globalBosOppositeFairValueGapMemory[BosOppositeFairValueGapMemoryCapacity];
 int                           globalBosOppositeFairValueGapMemoryCount = 0;
@@ -174,13 +170,21 @@ const string ChartObjectNamePrefixH4DemandSupply       = "H4_DSD_";
 const string ChartObjectNamePrefixHtfDirectionHud    = "M2_HTF_HUD_";
 
 void   ProcessSwingStep(SwingState &swingState, const ENUM_TIMEFRAMES timeframe);
+void   ProcessSwingStepAtShift(SwingState &swingState, const ENUM_TIMEFRAMES timeframe, const int sh,
+                               const color swingLineColor, const string trendPrefix, const string labelPrefix,
+                               const bool drawVisuals);
+void   WarmupM2SwingFromHistory();
 void   SwingStartNew(SwingState &swingState, const ENUM_TIMEFRAMES timeframe, const int swingDirection,
                      const double highPrice, const double lowPrice, const int lastClosedBarShift = 1);
-void   SwingExtend(SwingState &swingState, const double highPrice, const double lowPrice);
+void   SwingExtend(SwingState &swingState, const ENUM_TIMEFRAMES timeframe, const double highPrice,
+                   const double lowPrice);
+void   UpdateM2LiveSwingLegVisualIf(const SwingState &swingState, const ENUM_TIMEFRAMES timeframe,
+                                    const bool drawVisuals);
 void   SwingClose(SwingState &swingState, const ENUM_TIMEFRAMES timeframe, const color swingLineColor,
-                  const string chartObjectNamePrefix);
+                  const string chartObjectNamePrefix, const string labelPrefix, const bool drawVisuals,
+                  const int lastClosedBarShift = 1);
 void   DrawSwingLegLabel(const string chartObjectNamePrefix, const datetime labelBarTime,
-                         const double labelPrice, const bool isUplegSwingDirection);
+                         const double labelPrice, const bool isUplegSwingDirection, const int keyLevelIdForLabel);
 
 void   PushLiquidityPoolFromClosedSwing(const double poolLowPrice, const double poolHighPrice,
                                         const bool isSupplyPool);
@@ -192,14 +196,10 @@ bool   DetectFairValueGapOnLastClosedBar(bool &isBullishFairValueGap, double &fa
                                        double &fairValueGapZoneHighPrice);
 bool   TryDetectBreakOfStructureOnLastClosedBar(bool &outExpectsBullishFairValueGap,
                                                double &outBosLegLevelPrice);
-void   RemoveBosOppositeFvgWatchAt(const int removeIndex);
-void   PushBosOppositeFvgWatch(const bool expectsBullishFairValueGap, const double bosLegLevelPrice);
-bool   HasAnyActiveBosOppositeFvgWatch();
-int    FindFirstMatchingBosFvgWatchIndex(const bool isBullishFairValueGap);
-void   ProcessBosOppositeFvgWatchDecrements();
-void   ProcessBosOppositeFvgWatchImpulseInvalidation();
+bool   TryLatestM15CompletedUpLegHigh(double &outHigh);
+bool   TryLatestM15CompletedDownLegLow(double &outLow);
 void   ProcessBosOppositeFairValueGapWindow();
-void   PushBosOppositeFairValueGapMemory(const bool isBullishFairValueGap, const double zoneLowPrice,
+bool   PushBosOppositeFairValueGapMemory(const bool isBullishFairValueGap, const double zoneLowPrice,
                                         const double zoneHighPrice, const datetime fairValueGapBarOpenTime,
                                         const double bosBarClosePrice, const double pathMinLowSinceBos,
                                         const double pathMaxHighSinceBos);
@@ -232,7 +232,6 @@ bool   TryParseFormationTimeFromM2FvgOrderComment(const string &comment, datetim
 void   RegisterFvgPlanAStopLossHit(const datetime formationTime);
 bool   IsFvgPlanBSkippedAfterPlanAStopHit(const datetime formationTime);
 
-void   UpdateBosOppositeFvgWatchPathExtremes();
 void   ProcessM15ContextOnNewM15Bar();
 void   SwingCloseM15Context(SwingState &swingState, const ENUM_TIMEFRAMES timeframe,
                             const int lastClosedBarShift = 1);
@@ -296,12 +295,14 @@ int OnInit()
    }
 
    if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED))
-      Print("plot_swing_m2: enable AutoTrading in terminal to send orders.");
+      Print("plot_swing_m2_copy: enable AutoTrading in terminal to send orders.");
    if(!MQLInfoInteger(MQL_TRADE_ALLOWED))
-      Print("plot_swing_m2: trading not allowed for this EA (Common / account).");
+      Print("plot_swing_m2_copy: trading not allowed for this EA (Common / account).");
 
    ObjectsDeleteAll(0, "M2_SWEEP_", -1, -1);
    ObjectsDeleteAll(0, "M2_FVG_", -1, -1);
+   ObjectsDeleteAll(0, ChartObjectNamePrefixSwingTrendLine, -1, -1);
+   ObjectsDeleteAll(0, ChartObjectNamePrefixSwingLabelText, -1, -1);
    ObjectsDeleteAll(0, ChartObjectNamePrefixM15SwingTrendLine, -1, -1);
    ObjectsDeleteAll(0, ChartObjectNamePrefixM15SwingLabelText, -1, -1);
    ObjectsDeleteAll(0, ChartObjectNamePrefixM15MemoryFairValueGap, -1, -1);
@@ -310,9 +311,15 @@ int OnInit()
    ObjectsDeleteAll(0, ChartObjectNamePrefixH4DemandSupply, -1, -1);
    ObjectsDeleteAll(0, ChartObjectNamePrefixHtfDirectionHud, -1, -1);
 
+   ZeroMemory(globalSwingState);
+
+   WarmupM2SwingFromHistory();
    WarmupHtfContextFromHistory();
 
+   globalLastSwingTimeframeBarOpenTime = iTime(_Symbol, SwingTimeframe, 0);
+
    UpdateHtfDirectionHud();
+   ChartRedraw(0);
 
    return(INIT_SUCCEEDED);
 }
@@ -480,7 +487,6 @@ void OnTick()
       return;
 
    globalLastSwingTimeframeBarOpenTime = currentBarOpenTime;
-   UpdateBosOppositeFvgWatchPathExtremes();
    ProcessSwingStep(globalSwingState, SwingTimeframe);
    ProcessBosOppositeFairValueGapWindow();
    TryExecuteFairValueGapTradePlan();
@@ -513,10 +519,21 @@ void PushLiquidityPoolFromClosedSwing(const double poolLowPrice, const double po
 //+------------------------------------------------------------------+
 void ProcessSwingStep(SwingState &swingState, const ENUM_TIMEFRAMES timeframe)
 {
-   const double lastClosedBarOpen  = iOpen(_Symbol, timeframe, 1);
-   const double lastClosedBarClose = iClose(_Symbol, timeframe, 1);
-   const double lastClosedBarHigh  = iHigh(_Symbol, timeframe, 1);
-   const double lastClosedBarLow   = iLow(_Symbol, timeframe, 1);
+   ProcessSwingStepAtShift(swingState, timeframe, 1, clrYellow, ChartObjectNamePrefixSwingTrendLine,
+                           ChartObjectNamePrefixSwingLabelText, InputDrawSwingLegVisuals);
+}
+
+//+------------------------------------------------------------------+
+//| M2 swing step aligned with plot_swing_h1_m5_copy.mq5 (same math). |
+//+------------------------------------------------------------------+
+void ProcessSwingStepAtShift(SwingState &swingState, const ENUM_TIMEFRAMES timeframe, const int sh,
+                             const color swingLineColor, const string trendPrefix, const string labelPrefix,
+                             const bool drawVisuals)
+{
+   const double lastClosedBarOpen  = iOpen(_Symbol, timeframe, sh);
+   const double lastClosedBarClose = iClose(_Symbol, timeframe, sh);
+   const double lastClosedBarHigh  = iHigh(_Symbol, timeframe, sh);
+   const double lastClosedBarLow   = iLow(_Symbol, timeframe, sh);
 
    const int candleDirection =
       (lastClosedBarClose > lastClosedBarOpen) ? 1
@@ -525,18 +542,28 @@ void ProcessSwingStep(SwingState &swingState, const ENUM_TIMEFRAMES timeframe)
 
    if(swingState.currentSwingLeg.swingDirection == 0)
    {
-      SwingStartNew(swingState, timeframe, candleDirection, lastClosedBarHigh, lastClosedBarLow);
+      if(candleDirection == 0)
+         return;
+      SwingStartNew(swingState, timeframe, candleDirection, lastClosedBarHigh, lastClosedBarLow, sh);
       swingState.priceAnchorLevel = (lastClosedBarHigh + lastClosedBarLow) / 2.0;
+      UpdateM2LiveSwingLegVisualIf(swingState, timeframe, drawVisuals);
       return;
    }
 
    double sumRangeFivePriorBars = 0.0;
-   for(int barShiftIndex = 2; barShiftIndex <= 6; barShiftIndex++)
+   const int barsTotal = iBars(_Symbol, timeframe);
+   int       rangeBarCount = 0;
+   for(int barShiftIndex = sh + 1; barShiftIndex <= sh + 5; barShiftIndex++)
+   {
+      if(barShiftIndex >= barsTotal)
+         break;
       sumRangeFivePriorBars +=
          (iHigh(_Symbol, timeframe, barShiftIndex) - iLow(_Symbol, timeframe, barShiftIndex));
-   const double averageRangeFiveBars = sumRangeFivePriorBars / 5.0;
+      rangeBarCount++;
+   }
+   const double averageRangeFiveBars = (rangeBarCount > 0) ? sumRangeFivePriorBars / (double)rangeBarCount : 0.0;
 
-   const bool isDecentMovement = (lastClosedBarRange > (averageRangeFiveBars * 1.0));
+   const bool isDecentMovement = (lastClosedBarRange > (averageRangeFiveBars * 0.6));
    if(isDecentMovement && candleDirection == swingState.currentSwingLeg.swingDirection)
       swingState.priceAnchorLevel = (lastClosedBarHigh + lastClosedBarLow) / 2.0;
 
@@ -548,13 +575,14 @@ void ProcessSwingStep(SwingState &swingState, const ENUM_TIMEFRAMES timeframe)
 
    if(nextSwingDirection == swingState.currentSwingLeg.swingDirection)
    {
-      SwingExtend(swingState, lastClosedBarHigh, lastClosedBarLow);
+      SwingExtend(swingState, timeframe, lastClosedBarHigh, lastClosedBarLow);
+      UpdateM2LiveSwingLegVisualIf(swingState, timeframe, drawVisuals);
    }
    else
    {
-      const color  swingLineColor = clrYellow;
-      const string chartObjectNamePrefix = ChartObjectNamePrefixSwingTrendLine;
-      SwingClose(swingState, timeframe, swingLineColor, chartObjectNamePrefix);
+      // Include this bar's wicks in the leg before close (reversal was decided using close vs anchor).
+      SwingExtend(swingState, timeframe, lastClosedBarHigh, lastClosedBarLow);
+      SwingClose(swingState, timeframe, swingLineColor, trendPrefix, labelPrefix, drawVisuals, sh);
 
       Swing closedSwingLeg = swingState.swingHistory[swingState.swingHistoryCount - 1];
       double newSwingLegHigh = lastClosedBarHigh;
@@ -564,8 +592,9 @@ void ProcessSwingStep(SwingState &swingState, const ENUM_TIMEFRAMES timeframe)
       else if(closedSwingLeg.swingDirection == -1 && nextSwingDirection == 1)
          newSwingLegLow = MathMin(lastClosedBarLow, closedSwingLeg.legLowPrice);
 
-      SwingStartNew(swingState, timeframe, nextSwingDirection, newSwingLegHigh, newSwingLegLow);
+      SwingStartNew(swingState, timeframe, nextSwingDirection, newSwingLegHigh, newSwingLegLow, sh);
       swingState.priceAnchorLevel = (lastClosedBarHigh + lastClosedBarLow) / 2.0;
+      UpdateM2LiveSwingLegVisualIf(swingState, timeframe, drawVisuals);
    }
 }
 
@@ -576,11 +605,13 @@ void SwingStartNew(SwingState &swingState, const ENUM_TIMEFRAMES timeframe, cons
    swingState.currentSwingLeg.swingDirection = swingDirection;
    swingState.currentSwingLeg.legHighPrice   = highPrice;
    swingState.currentSwingLeg.legLowPrice    = lowPrice;
+   swingState.currentSwingLeg.keyLevelId     = 0;
    swingState.currentSwingLeg.legStartTime   = iTime(_Symbol, timeframe, lastClosedBarShift);
 }
 
 //+------------------------------------------------------------------+
-void SwingExtend(SwingState &swingState, const double highPrice, const double lowPrice)
+void SwingExtend(SwingState &swingState, const ENUM_TIMEFRAMES timeframe, const double highPrice,
+                 const double lowPrice)
 {
    if(highPrice > swingState.currentSwingLeg.legHighPrice)
       swingState.currentSwingLeg.legHighPrice = highPrice;
@@ -589,15 +620,59 @@ void SwingExtend(SwingState &swingState, const double highPrice, const double lo
 }
 
 //+------------------------------------------------------------------+
-void SwingClose(SwingState &swingState, const ENUM_TIMEFRAMES timeframe, const color swingLineColor,
-                const string chartObjectNamePrefix)
+void UpdateM2LiveSwingLegVisualIf(const SwingState &swingState, const ENUM_TIMEFRAMES timeframe,
+                                  const bool drawVisuals)
 {
-   swingState.currentSwingLeg.legEndTime = iTime(_Symbol, timeframe, 1);
+   if(timeframe != SwingTimeframe || !drawVisuals)
+      return;
+   if(swingState.currentSwingLeg.swingDirection == 0)
+      return;
 
-   const double poolLowPrice  = swingState.currentSwingLeg.legLowPrice;
-   const double poolHighPrice = swingState.currentSwingLeg.legHighPrice;
-   const bool   isSupplyPool  = (swingState.currentSwingLeg.swingDirection == 1);
-   PushLiquidityPoolFromClosedSwing(poolLowPrice, poolHighPrice, isSupplyPool);
+   const string liveName = ChartObjectNamePrefixSwingTrendLine + "LIVE";
+   datetime tEnd = iTime(_Symbol, SwingTimeframe, 0);
+   if(tEnd <= swingState.currentSwingLeg.legStartTime)
+      tEnd = swingState.currentSwingLeg.legStartTime + (datetime)PeriodSeconds(SwingTimeframe);
+
+   double trendLineStartPrice;
+   double trendLineEndPrice;
+   if(swingState.currentSwingLeg.swingDirection == 1)
+   {
+      trendLineStartPrice = swingState.currentSwingLeg.legLowPrice;
+      trendLineEndPrice   = swingState.currentSwingLeg.legHighPrice;
+   }
+   else
+   {
+      trendLineStartPrice = swingState.currentSwingLeg.legHighPrice;
+      trendLineEndPrice   = swingState.currentSwingLeg.legLowPrice;
+   }
+
+   if(ObjectFind(0, liveName) >= 0)
+      ObjectDelete(0, liveName);
+
+   if(!ObjectCreate(0, liveName, OBJ_TREND, 0, swingState.currentSwingLeg.legStartTime, trendLineStartPrice,
+                    tEnd, trendLineEndPrice))
+      return;
+
+   ObjectSetInteger(0, liveName, OBJPROP_COLOR, clrYellow);
+   ObjectSetInteger(0, liveName, OBJPROP_WIDTH, 2);
+   ObjectSetInteger(0, liveName, OBJPROP_RAY_RIGHT, false);
+   ObjectSetInteger(0, liveName, OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, liveName, OBJPROP_BACK, false);
+   ObjectSetInteger(0, liveName, OBJPROP_HIDDEN, false);
+   ObjectSetInteger(0, liveName, OBJPROP_TIMEFRAMES, OBJ_ALL_PERIODS);
+}
+
+//+------------------------------------------------------------------+
+void SwingClose(SwingState &swingState, const ENUM_TIMEFRAMES timeframe, const color swingLineColor,
+                const string chartObjectNamePrefix, const string labelPrefix, const bool drawVisuals,
+                const int lastClosedBarShift = 1)
+{
+   swingState.currentSwingLeg.keyLevelId = 0;
+
+   if(timeframe == SwingTimeframe && drawVisuals)
+      ObjectDelete(0, ChartObjectNamePrefixSwingTrendLine + "LIVE");
+
+   swingState.currentSwingLeg.legEndTime = iTime(_Symbol, timeframe, lastClosedBarShift);
 
    const string chartObjectName =
       chartObjectNamePrefix + IntegerToString((long)swingState.currentSwingLeg.legEndTime);
@@ -615,20 +690,26 @@ void SwingClose(SwingState &swingState, const ENUM_TIMEFRAMES timeframe, const c
       trendLineEndPrice   = swingState.currentSwingLeg.legLowPrice;
    }
 
-   if(InputDrawSwingLegVisuals)
+   if(drawVisuals)
    {
+      datetime tRightDraw = swingState.currentSwingLeg.legEndTime;
+      if(tRightDraw <= swingState.currentSwingLeg.legStartTime)
+         tRightDraw = swingState.currentSwingLeg.legStartTime + (datetime)PeriodSeconds(timeframe);
+
       if(ObjectCreate(0, chartObjectName, OBJ_TREND, 0, swingState.currentSwingLeg.legStartTime,
-                      trendLineStartPrice, swingState.currentSwingLeg.legEndTime, trendLineEndPrice))
+                      trendLineStartPrice, tRightDraw, trendLineEndPrice))
       {
          ObjectSetInteger(0, chartObjectName, OBJPROP_COLOR, swingLineColor);
          ObjectSetInteger(0, chartObjectName, OBJPROP_WIDTH, 2);
          ObjectSetInteger(0, chartObjectName, OBJPROP_RAY_RIGHT, false);
          ObjectSetInteger(0, chartObjectName, OBJPROP_SELECTABLE, false);
+         ObjectSetInteger(0, chartObjectName, OBJPROP_HIDDEN, false);
+         ObjectSetInteger(0, chartObjectName, OBJPROP_TIMEFRAMES, OBJ_ALL_PERIODS);
       }
 
       const bool isUplegSwingDirection = (swingState.currentSwingLeg.swingDirection == 1);
-      DrawSwingLegLabel(ChartObjectNamePrefixSwingLabelText, swingState.currentSwingLeg.legEndTime,
-                        trendLineEndPrice, isUplegSwingDirection);
+      DrawSwingLegLabel(labelPrefix, swingState.currentSwingLeg.legEndTime, trendLineEndPrice,
+                        isUplegSwingDirection, swingState.currentSwingLeg.keyLevelId);
    }
 
    if(swingState.swingHistoryCount < 20)
@@ -646,7 +727,7 @@ void SwingClose(SwingState &swingState, const ENUM_TIMEFRAMES timeframe, const c
 
 //+------------------------------------------------------------------+
 void DrawSwingLegLabel(const string chartObjectNamePrefix, const datetime labelBarTime,
-                       const double labelPrice, const bool isUplegSwingDirection)
+                       const double labelPrice, const bool isUplegSwingDirection, const int keyLevelIdForLabel)
 {
    const string chartObjectName = chartObjectNamePrefix + IntegerToString((long)labelBarTime);
    if(ObjectFind(0, chartObjectName) >= 0)
@@ -659,14 +740,19 @@ void DrawSwingLegLabel(const string chartObjectNamePrefix, const datetime labelB
    if(!ObjectCreate(0, chartObjectName, OBJ_TEXT, 0, labelBarTime, labelVerticalOffset))
       return;
 
-   ObjectSetString(0, chartObjectName, OBJPROP_TEXT, isUplegSwingDirection ? "High" : "Low");
+   string txt = isUplegSwingDirection ? "High" : "Low";
+   if(keyLevelIdForLabel > 0)
+      txt = StringFormat("%s #%d", txt, keyLevelIdForLabel);
+
+   ObjectSetString(0, chartObjectName, OBJPROP_TEXT, txt);
    ObjectSetInteger(0, chartObjectName, OBJPROP_COLOR, isUplegSwingDirection ? clrDodgerBlue : clrOrange);
    ObjectSetInteger(0, chartObjectName, OBJPROP_FONTSIZE, 9);
    ObjectSetString(0, chartObjectName, OBJPROP_FONT, "Arial Bold");
    ObjectSetInteger(0, chartObjectName, OBJPROP_ANCHOR,
                     isUplegSwingDirection ? ANCHOR_LOWER : ANCHOR_UPPER);
    ObjectSetInteger(0, chartObjectName, OBJPROP_SELECTABLE, false);
-   ObjectSetInteger(0, chartObjectName, OBJPROP_HIDDEN, true);
+   ObjectSetInteger(0, chartObjectName, OBJPROP_HIDDEN, false);
+   ObjectSetInteger(0, chartObjectName, OBJPROP_TIMEFRAMES, OBJ_ALL_PERIODS);
 }
 
 //+------------------------------------------------------------------+
@@ -674,6 +760,11 @@ void SwingCloseM15Context(SwingState &swingState, const ENUM_TIMEFRAMES timefram
                           const int lastClosedBarShift = 1)
 {
    swingState.currentSwingLeg.legEndTime = iTime(_Symbol, timeframe, lastClosedBarShift);
+
+   const double poolLowPrice  = swingState.currentSwingLeg.legLowPrice;
+   const double poolHighPrice = swingState.currentSwingLeg.legHighPrice;
+   const bool   isSupplyPool  = (swingState.currentSwingLeg.swingDirection == 1);
+   PushLiquidityPoolFromClosedSwing(poolLowPrice, poolHighPrice, isSupplyPool);
 
    if(InputDrawM15SwingLegVisuals)
    {
@@ -704,7 +795,7 @@ void SwingCloseM15Context(SwingState &swingState, const ENUM_TIMEFRAMES timefram
 
       const bool isUplegSwingDirection = (swingState.currentSwingLeg.swingDirection == 1);
       DrawSwingLegLabel(ChartObjectNamePrefixM15SwingLabelText, swingState.currentSwingLeg.legEndTime,
-                        trendLineEndPrice, isUplegSwingDirection);
+                        trendLineEndPrice, isUplegSwingDirection, 0);
    }
 
    if(swingState.swingHistoryCount < 20)
@@ -761,7 +852,7 @@ void ProcessM15SwingStep(const int lastClosedBarShift = 1)
 
    if(nextSwingDirection == globalM15SwingState.currentSwingLeg.swingDirection)
    {
-      SwingExtend(globalM15SwingState, lastClosedBarHigh, lastClosedBarLow);
+      SwingExtend(globalM15SwingState, timeframe, lastClosedBarHigh, lastClosedBarLow);
    }
    else
    {
@@ -1013,7 +1104,7 @@ void ProcessH4SwingStep(const int lastClosedBarShift = 1)
 
    if(nextSwingDirection == globalH4SwingState.currentSwingLeg.swingDirection)
    {
-      SwingExtend(globalH4SwingState, lastClosedBarHigh, lastClosedBarLow);
+      SwingExtend(globalH4SwingState, timeframe, lastClosedBarHigh, lastClosedBarLow);
    }
    else
    {
@@ -1434,23 +1525,6 @@ void DrawH4DemandSupplyZones()
 }
 
 //+------------------------------------------------------------------+
-void UpdateBosOppositeFvgWatchPathExtremes()
-{
-   const double h1 = iHigh(_Symbol, SwingTimeframe, 1);
-   const double l1 = iLow(_Symbol, SwingTimeframe, 1);
-
-   for(int i = 0; i < globalBosOppositeFvgWatchCount; i++)
-   {
-      if(globalBosOppositeFvgWatchList[i].counter <= 0)
-         continue;
-      globalBosOppositeFvgWatchList[i].pathMinLowSinceBos =
-         MathMin(globalBosOppositeFvgWatchList[i].pathMinLowSinceBos, l1);
-      globalBosOppositeFvgWatchList[i].pathMaxHighSinceBos =
-         MathMax(globalBosOppositeFvgWatchList[i].pathMaxHighSinceBos, h1);
-   }
-}
-
-//+------------------------------------------------------------------+
 double ReferenceChartHeightForFairValueGapFilter(const ENUM_TIMEFRAMES timeframe)
 {
    const int barCount = InputChartRangeBarCount;
@@ -1535,9 +1609,35 @@ bool DetectFairValueGapOnLastClosedBarForTf(const ENUM_TIMEFRAMES tf, bool &isBu
 }
 
 //+------------------------------------------------------------------+
-//| Bullish BOS: last closed bar close crosses above latest completed up-leg high.|
-//| Bearish BOS: last closed bar close crosses below latest completed down-leg low.|
-//| Each BOS queues its own opposite-FVG countdown (see PushBosOppositeFvgWatch). |
+bool TryLatestM15CompletedUpLegHigh(double &outHigh)
+{
+   for(int i = globalM15SwingState.swingHistoryCount - 1; i >= 0; i--)
+   {
+      if(globalM15SwingState.swingHistory[i].swingDirection == 1)
+      {
+         outHigh = globalM15SwingState.swingHistory[i].legHighPrice;
+         return true;
+      }
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+bool TryLatestM15CompletedDownLegLow(double &outLow)
+{
+   for(int i = globalM15SwingState.swingHistoryCount - 1; i >= 0; i--)
+   {
+      if(globalM15SwingState.swingHistory[i].swingDirection == -1)
+      {
+         outLow = globalM15SwingState.swingHistory[i].legLowPrice;
+         return true;
+      }
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| M2 closes vs latest completed M2 swing leg (for turning hunt off).|
 //+------------------------------------------------------------------+
 bool TryDetectBreakOfStructureOnLastClosedBar(bool &outExpectsBullishFairValueGap,
                                              double &outBosLegLevelPrice)
@@ -1671,6 +1771,34 @@ bool TryDetectH4BreakOfStructureOnLastClosedBar(bool &outH4BosIsBullish, const i
 }
 
 //+------------------------------------------------------------------+
+//| Oldest→newest replay of M2 bars [n..1] so swing legs + labels     |
+//| exist on attach (live OnTick only advances on new M2 bar).       |
+//+------------------------------------------------------------------+
+void WarmupM2SwingFromHistory()
+{
+   const int W = InputM2SwingWarmupBarsOnInit;
+   if(W <= 0)
+      return;
+
+   const int bars = iBars(_Symbol, SwingTimeframe);
+   const int minNeed = 8; // prior-range window uses index sh+5
+   if(bars < minNeed)
+   {
+      Print("plot_swing_m2_copy: M2 swing warmup skipped (need ", minNeed, " M2 bars; have ", bars, ")");
+      return;
+   }
+
+   const int n = (int)MathMin(bars - 2, W);
+   if(n < 1)
+      return;
+
+   for(int k = n; k >= 1; k--)
+      ProcessSwingStepAtShift(globalSwingState, SwingTimeframe, k, clrYellow,
+                                ChartObjectNamePrefixSwingTrendLine, ChartObjectNamePrefixSwingLabelText,
+                                InputDrawSwingLegVisuals);
+}
+
+//+------------------------------------------------------------------+
 //| Oldest→newest replay of bar indices [W..1]: fills M15/H4 swings, |
 //| H4 FVG memory; final M15/H4 BOS from current closes. Sync stamps |
 //| so OnTick does not double-run HTF context on the same bar.        |
@@ -1684,7 +1812,7 @@ void WarmupHtfContextFromHistory()
    const int minBars = W + 5 + 1;
    if(iBars(_Symbol, PERIOD_M15) < minBars || iBars(_Symbol, PERIOD_H4) < minBars)
    {
-      Print("plot_swing_m2: HTF warmup skipped (need ", minBars, " M15/H4 bars; have M15=",
+      Print("plot_swing_m2_copy: HTF warmup skipped (need ", minBars, " M15/H4 bars; have M15=",
             iBars(_Symbol, PERIOD_M15), " H4=", iBars(_Symbol, PERIOD_H4), ")");
       return;
    }
@@ -1718,145 +1846,152 @@ void WarmupHtfContextFromHistory()
 }
 
 //+------------------------------------------------------------------+
-void RemoveBosOppositeFvgWatchAt(const int removeIndex)
-{
-   if(removeIndex < 0 || removeIndex >= globalBosOppositeFvgWatchCount)
-      return;
-   for(int j = removeIndex + 1; j < globalBosOppositeFvgWatchCount; j++)
-      globalBosOppositeFvgWatchList[j - 1] = globalBosOppositeFvgWatchList[j];
-   globalBosOppositeFvgWatchCount--;
-}
-
+//| M15 leg crossed on last closed M2 → detect_opposite_2min_fvg ON; |
+//| FVG on bar 1 before BOS. Hunt stays on after recording FVG until |
+//| opposite BOS ends it (count>0) or 2nd opposite BOS if count was 0 first. |
 //+------------------------------------------------------------------+
-void PushBosOppositeFvgWatch(const bool expectsBullishFairValueGap, const double bosLegLevelPrice)
+void ProcessBosOppositeFairValueGapWindow()
 {
-   if(globalBosOppositeFvgWatchCount >= BosOppositeFvgWatchCapacity)
-      RemoveBosOppositeFvgWatchAt(0);
+   const double pointSize = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   const double barClose  = iClose(_Symbol, SwingTimeframe, 1);
+   const double barHigh   = iHigh(_Symbol, SwingTimeframe, 1);
+   const double barLow    = iLow(_Symbol, SwingTimeframe, 1);
+   const double prevClose = iClose(_Symbol, SwingTimeframe, 2);
 
-   const double barClose = iClose(_Symbol, SwingTimeframe, 1);
-   const double barHigh  = iHigh(_Symbol, SwingTimeframe, 1);
-   const double barLow   = iLow(_Symbol, SwingTimeframe, 1);
+   if(detect_opposite_2min_fvg)
+   {
+      g_pathMinLowSinceM15Breach   = MathMin(g_pathMinLowSinceM15Breach, barLow);
+      g_pathMaxHighSinceM15Breach  = MathMax(g_pathMaxHighSinceM15Breach, barHigh);
 
-   const int index = globalBosOppositeFvgWatchCount;
-   globalBosOppositeFvgWatchList[index].counter                    = 4;
-   globalBosOppositeFvgWatchList[index].expectsBullishFairValueGap = expectsBullishFairValueGap;
-   globalBosOppositeFvgWatchList[index].skipDecrementOnce          = true;
-   globalBosOppositeFvgWatchList[index].bosLegLevelPrice           = bosLegLevelPrice;
-   globalBosOppositeFvgWatchList[index].bosM2BarOpenTime           = iTime(_Symbol, SwingTimeframe, 1);
-   globalBosOppositeFvgWatchList[index].bosBarClosePrice           = barClose;
-   globalBosOppositeFvgWatchList[index].pathMinLowSinceBos         = barLow;
-   globalBosOppositeFvgWatchList[index].pathMaxHighSinceBos        = barHigh;
-   if(expectsBullishFairValueGap)
-   {
-      globalBosOppositeFvgWatchList[index].minCloseSinceBos = barClose;
-      globalBosOppositeFvgWatchList[index].maxCloseSinceBos = 0.0;
-   }
-   else
-   {
-      globalBosOppositeFvgWatchList[index].maxCloseSinceBos = barClose;
-      globalBosOppositeFvgWatchList[index].minCloseSinceBos = 0.0;
-   }
-   globalBosOppositeFvgWatchCount++;
-}
-
-//+------------------------------------------------------------------+
-bool HasAnyActiveBosOppositeFvgWatch()
-{
-   for(int i = 0; i < globalBosOppositeFvgWatchCount; i++)
-   {
-      if(globalBosOppositeFvgWatchList[i].counter > 0)
-         return true;
-   }
-   return false;
-}
-
-//+------------------------------------------------------------------+
-int FindFirstMatchingBosFvgWatchIndex(const bool isBullishFairValueGap)
-{
-   for(int i = 0; i < globalBosOppositeFvgWatchCount; i++)
-   {
-      if(globalBosOppositeFvgWatchList[i].counter <= 0)
-         continue;
-      const bool expectsBullish = globalBosOppositeFvgWatchList[i].expectsBullishFairValueGap;
-      if((expectsBullish && isBullishFairValueGap) || (!expectsBullish && !isBullishFairValueGap))
-         return i;
-   }
-   return -1;
-}
-
-//+------------------------------------------------------------------+
-void ProcessBosOppositeFvgWatchDecrements()
-{
-   for(int i = 0; i < globalBosOppositeFvgWatchCount; i++)
-   {
-      if(globalBosOppositeFvgWatchList[i].skipDecrementOnce)
+      if(InputBosMaxImpulsePercentOfChartRangeBeforeOppositeFvg > 0.0)
       {
-         globalBosOppositeFvgWatchList[i].skipDecrementOnce = false;
-         continue;
-      }
-      if(globalBosOppositeFvgWatchList[i].counter > 0)
-      {
-         globalBosOppositeFvgWatchList[i].counter--;
-         if(globalBosOppositeFvgWatchList[i].counter <= 0)
+         const double referenceHeight = ReferenceChartHeightForFairValueGapFilter(SwingTimeframe);
+         if(referenceHeight > 0.0)
          {
-            RemoveBosOppositeFvgWatchAt(i);
-            i--;
+            const double limitPrice =
+               referenceHeight * (InputBosMaxImpulsePercentOfChartRangeBeforeOppositeFvg / 100.0);
+            bool cancelHunt = false;
+            if(g_m15HighWasBreached)
+            {
+               g_impulseCloseExtremeSinceM15Breach =
+                  MathMax(g_impulseCloseExtremeSinceM15Breach, barClose);
+               if(g_impulseCloseExtremeSinceM15Breach - g_m15BreachedLegLevelPrice > limitPrice)
+                  cancelHunt = true;
+            }
+            else
+            {
+               g_impulseCloseExtremeSinceM15Breach =
+                  MathMin(g_impulseCloseExtremeSinceM15Breach, barClose);
+               if(g_m15BreachedLegLevelPrice - g_impulseCloseExtremeSinceM15Breach > limitPrice)
+                  cancelHunt = true;
+            }
+            if(cancelHunt)
+            {
+               detect_opposite_2min_fvg = false;
+               g_oppositeFvgFoundDuringHuntCount  = 0;
+               g_deferHuntEndUntilNextOppositeBos = false;
+               return;
+            }
          }
       }
+
+      bool isBullishFairValueGap = false;
+      double fairValueGapZoneLowPrice  = 0.0;
+      double fairValueGapZoneHighPrice = 0.0;
+      if(DetectFairValueGapOnLastClosedBar(isBullishFairValueGap, fairValueGapZoneLowPrice,
+                                           fairValueGapZoneHighPrice))
+      {
+         const bool polarityMatchesHunt =
+            (g_m15HighWasBreached && !isBullishFairValueGap) ||
+            (!g_m15HighWasBreached && isBullishFairValueGap);
+         if(polarityMatchesHunt)
+         {
+            const datetime lastClosedBarOpenTime = iTime(_Symbol, SwingTimeframe, 1);
+            const datetime thirdBarOpenTime      = iTime(_Symbol, SwingTimeframe, 3);
+
+            if(PushBosOppositeFairValueGapMemory(isBullishFairValueGap, fairValueGapZoneLowPrice,
+                                                 fairValueGapZoneHighPrice, lastClosedBarOpenTime,
+                                                 g_closeWhenM15LiquidityBreached,
+                                                 g_pathMinLowSinceM15Breach, g_pathMaxHighSinceM15Breach))
+            {
+               DrawBosMarkedFairValueGapZone(isBullishFairValueGap, fairValueGapZoneLowPrice,
+                                             fairValueGapZoneHighPrice, thirdBarOpenTime, lastClosedBarOpenTime);
+               g_oppositeFvgFoundDuringHuntCount++;
+            }
+         }
+      }
+
+      bool bosExpectsBullishFairValueGap = false;
+      double bosLegIgnored = 0.0;
+      if(TryDetectBreakOfStructureOnLastClosedBar(bosExpectsBullishFairValueGap, bosLegIgnored))
+      {
+         // High-side liquidity: opposite M2 BOS is break below last down leg (expects bull FVG path off that leg).
+         // Low-side liquidity: opposite M2 BOS is break above last up leg (expects bear FVG path off that leg).
+         const bool oppositeBosClearsHunt =
+            (g_m15HighWasBreached && bosExpectsBullishFairValueGap) ||
+            (!g_m15HighWasBreached && !bosExpectsBullishFairValueGap);
+         if(oppositeBosClearsHunt)
+         {
+            if(g_oppositeFvgFoundDuringHuntCount > 0)
+            {
+               detect_opposite_2min_fvg = false;
+               g_oppositeFvgFoundDuringHuntCount  = 0;
+               g_deferHuntEndUntilNextOppositeBos = false;
+               return;
+            }
+            if(!g_deferHuntEndUntilNextOppositeBos)
+            {
+               g_deferHuntEndUntilNextOppositeBos = true;
+            }
+            else
+            {
+               detect_opposite_2min_fvg = false;
+               g_oppositeFvgFoundDuringHuntCount  = 0;
+               g_deferHuntEndUntilNextOppositeBos = false;
+               return;
+            }
+         }
+      }
+      return;
    }
-}
 
-//+------------------------------------------------------------------+
-//| Drop BOS–FVG watches if close moves more than X% of chart height past the broken leg.|
-//| Bull BOS: invalidate when max(close) − legHigh > limit. Bear BOS: legLow − min(close) > limit.|
-//+------------------------------------------------------------------+
-void ProcessBosOppositeFvgWatchImpulseInvalidation()
-{
-   if(InputBosMaxImpulsePercentOfChartRangeBeforeOppositeFvg <= 0.0)
-      return;
+   double m15UpLegHigh  = 0.0;
+   double m15DownLegLow = 0.0;
+   const bool haveHigh = TryLatestM15CompletedUpLegHigh(m15UpLegHigh);
+   const bool haveLow  = TryLatestM15CompletedDownLegLow(m15DownLegLow);
 
-   const double referenceHeight = ReferenceChartHeightForFairValueGapFilter(SwingTimeframe);
-   if(referenceHeight <= 0.0)
-      return;
-
-   const double limitPrice =
-      referenceHeight * (InputBosMaxImpulsePercentOfChartRangeBeforeOppositeFvg / 100.0);
-   const double barClose = iClose(_Symbol, SwingTimeframe, 1);
-
-   for(int i = 0; i < globalBosOppositeFvgWatchCount; i++)
+   if(haveHigh &&
+      barClose > m15UpLegHigh + pointSize && prevClose <= m15UpLegHigh + pointSize)
    {
-      if(globalBosOppositeFvgWatchList[i].counter <= 0)
-         continue;
+      detect_opposite_2min_fvg                = true;
+      g_m15HighWasBreached                    = true;
+      g_m15BreachedLegLevelPrice              = m15UpLegHigh;
+      g_closeWhenM15LiquidityBreached         = barClose;
+      g_pathMinLowSinceM15Breach              = barLow;
+      g_pathMaxHighSinceM15Breach             = barHigh;
+      g_impulseCloseExtremeSinceM15Breach     = barClose;
+      g_oppositeFvgFoundDuringHuntCount       = 0;
+      g_deferHuntEndUntilNextOppositeBos      = false;
+      return;
+   }
 
-      if(globalBosOppositeFvgWatchList[i].expectsBullishFairValueGap)
-      {
-         globalBosOppositeFvgWatchList[i].minCloseSinceBos =
-            MathMin(globalBosOppositeFvgWatchList[i].minCloseSinceBos, barClose);
-         const double impulse =
-            globalBosOppositeFvgWatchList[i].bosLegLevelPrice - globalBosOppositeFvgWatchList[i].minCloseSinceBos;
-         if(impulse > limitPrice)
-         {
-            RemoveBosOppositeFvgWatchAt(i);
-            i--;
-         }
-      }
-      else
-      {
-         globalBosOppositeFvgWatchList[i].maxCloseSinceBos =
-            MathMax(globalBosOppositeFvgWatchList[i].maxCloseSinceBos, barClose);
-         const double impulse =
-            globalBosOppositeFvgWatchList[i].maxCloseSinceBos - globalBosOppositeFvgWatchList[i].bosLegLevelPrice;
-         if(impulse > limitPrice)
-         {
-            RemoveBosOppositeFvgWatchAt(i);
-            i--;
-         }
-      }
+   if(haveLow &&
+      barClose < m15DownLegLow - pointSize && prevClose >= m15DownLegLow - pointSize)
+   {
+      detect_opposite_2min_fvg                = true;
+      g_m15HighWasBreached                    = false;
+      g_m15BreachedLegLevelPrice              = m15DownLegLow;
+      g_closeWhenM15LiquidityBreached         = barClose;
+      g_pathMinLowSinceM15Breach              = barLow;
+      g_pathMaxHighSinceM15Breach             = barHigh;
+      g_impulseCloseExtremeSinceM15Breach     = barClose;
+      g_oppositeFvgFoundDuringHuntCount       = 0;
+      g_deferHuntEndUntilNextOppositeBos      = false;
    }
 }
 
 //+------------------------------------------------------------------+
-void PushBosOppositeFairValueGapMemory(const bool isBullishFairValueGap, const double zoneLowPrice,
+bool PushBosOppositeFairValueGapMemory(const bool isBullishFairValueGap, const double zoneLowPrice,
                                      const double zoneHighPrice, const datetime fairValueGapBarOpenTime,
                                      const double bosBarClosePrice, const double pathMinLowSinceBos,
                                      const double pathMaxHighSinceBos)
@@ -1864,7 +1999,7 @@ void PushBosOppositeFairValueGapMemory(const bool isBullishFairValueGap, const d
    for(int memoryIndex = 0; memoryIndex < globalBosOppositeFairValueGapMemoryCount; memoryIndex++)
    {
       if(globalBosOppositeFairValueGapMemory[memoryIndex].fairValueGapBarOpenTime == fairValueGapBarOpenTime)
-         return;
+         return false;
    }
 
    if(globalBosOppositeFairValueGapMemoryCount < BosOppositeFairValueGapMemoryCapacity)
@@ -1878,7 +2013,7 @@ void PushBosOppositeFairValueGapMemory(const bool isBullishFairValueGap, const d
       globalBosOppositeFairValueGapMemory[index].pathMinLowSinceBos     = pathMinLowSinceBos;
       globalBosOppositeFairValueGapMemory[index].pathMaxHighSinceBos  = pathMaxHighSinceBos;
       globalBosOppositeFairValueGapMemoryCount++;
-      return;
+      return true;
    }
 
    for(int shiftIndex = 1; shiftIndex < BosOppositeFairValueGapMemoryCapacity; shiftIndex++)
@@ -1892,6 +2027,7 @@ void PushBosOppositeFairValueGapMemory(const bool isBullishFairValueGap, const d
    globalBosOppositeFairValueGapMemory[lastIndex].bosBarClosePrice       = bosBarClosePrice;
    globalBosOppositeFairValueGapMemory[lastIndex].pathMinLowSinceBos     = pathMinLowSinceBos;
    globalBosOppositeFairValueGapMemory[lastIndex].pathMaxHighSinceBos  = pathMaxHighSinceBos;
+   return true;
 }
 
 //+------------------------------------------------------------------+
@@ -1951,47 +2087,6 @@ void DrawBosMarkedFairValueGapZone(const bool isBullishFairValueGap, const doubl
       ObjectSetInteger(0, typeLabelName, OBJPROP_SELECTABLE, false);
       ObjectSetInteger(0, typeLabelName, OBJPROP_HIDDEN, true);
    }
-}
-
-//+------------------------------------------------------------------+
-void ProcessBosOppositeFairValueGapWindow()
-{
-   bool   expectsBullishFairValueGapFromBreakOfStructure;
-   double bosLegLevelPriceFromBreakOfStructure;
-   if(TryDetectBreakOfStructureOnLastClosedBar(expectsBullishFairValueGapFromBreakOfStructure,
-                                               bosLegLevelPriceFromBreakOfStructure))
-      PushBosOppositeFvgWatch(expectsBullishFairValueGapFromBreakOfStructure,
-                               bosLegLevelPriceFromBreakOfStructure);
-
-   ProcessBosOppositeFvgWatchImpulseInvalidation();
-
-   if(!HasAnyActiveBosOppositeFvgWatch())
-      return;
-
-   bool isBullishFairValueGap;
-   double fairValueGapZoneLowPrice;
-   double fairValueGapZoneHighPrice;
-   if(DetectFairValueGapOnLastClosedBar(isBullishFairValueGap, fairValueGapZoneLowPrice,
-                                        fairValueGapZoneHighPrice))
-   {
-      const int matchingWatchIndex = FindFirstMatchingBosFvgWatchIndex(isBullishFairValueGap);
-      if(matchingWatchIndex >= 0)
-      {
-         const datetime lastClosedBarOpenTime = iTime(_Symbol, SwingTimeframe, 1);
-         const datetime thirdBarOpenTime      = iTime(_Symbol, SwingTimeframe, 3);
-
-         const BosOppositeFvgWatch snapWatch = globalBosOppositeFvgWatchList[matchingWatchIndex];
-         PushBosOppositeFairValueGapMemory(isBullishFairValueGap, fairValueGapZoneLowPrice,
-                                           fairValueGapZoneHighPrice, lastClosedBarOpenTime,
-                                           snapWatch.bosBarClosePrice, snapWatch.pathMinLowSinceBos,
-                                           snapWatch.pathMaxHighSinceBos);
-         DrawBosMarkedFairValueGapZone(isBullishFairValueGap, fairValueGapZoneLowPrice,
-                                       fairValueGapZoneHighPrice, thirdBarOpenTime, lastClosedBarOpenTime);
-         RemoveBosOppositeFvgWatchAt(matchingWatchIndex);
-      }
-   }
-
-   ProcessBosOppositeFvgWatchDecrements();
 }
 
 //+------------------------------------------------------------------+
@@ -2619,9 +2714,9 @@ void TryExecuteFairValueGapTradePlan()
             s_lastHtfPrintFormation = formationTime;
             s_lastHtfPrintBarOpen   = lastClosedM2Open;
             if(htfGateOk)
-               Print("plot_swing_m2: HTF trade: YES");
+               Print("plot_swing_m2_copy: HTF trade: YES");
             else
-               Print("plot_swing_m2: HTF trade: NO — ", htfGateReason);
+               Print("plot_swing_m2_copy: HTF trade: NO — ", htfGateReason);
          }
       }
 
@@ -2738,7 +2833,7 @@ void TryExecuteFairValueGapTradePlan()
       if(!StopsDistanceAllowed(isBullishFairValueGap, normalizedEntry, normalizedStopLoss, takeProfitOneR) ||
          !StopsDistanceAllowed(isBullishFairValueGap, normalizedEntry, normalizedStopLoss, takeProfitTwoR))
       {
-         Print("plot_swing_m2: broker stops level too large for this entry/SL/TP (1R or 2R). plan=",
+         Print("plot_swing_m2_copy: broker stops level too large for this entry/SL/TP (1R or 2R). plan=",
                (usePlanA ? "A" : "B"), " formation=", formationTime);
          continue;
       }
@@ -2749,7 +2844,7 @@ void TryExecuteFairValueGapTradePlan()
       const double accountBalance = AccountInfoDouble(ACCOUNT_BALANCE);
       if(accountBalance <= 0.0 || InputRiskPercentPerTrade <= 0.0)
       {
-         Print("plot_swing_m2: risk sizing skipped — balance or InputRiskPercentPerTrade invalid.");
+         Print("plot_swing_m2_copy: risk sizing skipped — balance or InputRiskPercentPerTrade invalid.");
          continue;
       }
       const double riskAccountCurrencyTotal =
@@ -2764,7 +2859,7 @@ void TryExecuteFairValueGapTradePlan()
                                         riskAccountCurrencyPerLeg);
       if(volumeOneR <= 0.0 || volumeTwoR <= 0.0)
       {
-         Print("plot_swing_m2: volume from risk %% is zero — check symbol / contract size.");
+         Print("plot_swing_m2_copy: volume from risk %% is zero — check symbol / contract size.");
          continue;
       }
 
@@ -2772,13 +2867,13 @@ void TryExecuteFairValueGapTradePlan()
       {
          if(isBullishFairValueGap && normalizedEntry >= currentAsk)
          {
-            Print("plot_swing_m2: BuyLimit invalid — entry must be below ask. entry=", normalizedEntry,
+            Print("plot_swing_m2_copy: BuyLimit invalid — entry must be below ask. entry=", normalizedEntry,
                   " ask=", currentAsk);
             continue;
          }
          if(!isBullishFairValueGap && normalizedEntry <= currentBid)
          {
-            Print("plot_swing_m2: SellLimit invalid — entry must be above bid. entry=", normalizedEntry,
+            Print("plot_swing_m2_copy: SellLimit invalid — entry must be above bid. entry=", normalizedEntry,
                   " bid=", currentBid);
             continue;
          }
@@ -2791,7 +2886,7 @@ void TryExecuteFairValueGapTradePlan()
 
       if(!InputEnableAutomatedTrading)
       {
-         Print("plot_swing_m2: BOS opposite FVG (log only). ", planTag, " barShift=", barShift,
+         Print("plot_swing_m2_copy: BOS opposite FVG (log only). ", planTag, " barShift=", barShift,
                " risk%%=", InputRiskPercentPerTrade, " perLegAcct=", riskAccountCurrencyPerLeg,
                " bullishFvg=", isBullishFairValueGap, " market=", useMarketOrder,
                " entry=", normalizedEntry, " sl=", normalizedStopLoss,
@@ -2851,9 +2946,9 @@ void TryExecuteFairValueGapTradePlan()
       }
 
       if(orderOneResult || orderTwoResult)
-         Print("plot_swing_m2: orders sent. ", planTag, " oneR=", orderOneResult, " twoR=", orderTwoResult);
+         Print("plot_swing_m2_copy: orders sent. ", planTag, " oneR=", orderOneResult, " twoR=", orderTwoResult);
       else
-         Print("plot_swing_m2: order send failed. retcode=", tradeLayer.ResultRetcode(), " ",
+         Print("plot_swing_m2_copy: order send failed. retcode=", tradeLayer.ResultRetcode(), " ",
                tradeLayer.ResultRetcodeDescription());
       return;
    }
