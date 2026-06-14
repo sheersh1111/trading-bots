@@ -1,6 +1,20 @@
 ﻿//+------------------------------------------------------------------+
 //| h4_lq_v2.mq5                                                      |
 //| H4 primary narrative + configurable secondary TF — liquidity hunt v2 |
+//| v2.94: touch vol — if max-vol before 1st FVG pattern bar, pick bar from FVG 3-bar window (touch vol entry/SL) |
+//| v2.93: touch vol entry — if max-vol bar before 1st FVG bar, use 1st FVG bar for order |
+//| v2.92: InputTouchVolRequireAscendingVolume — toggle touch ascending vol validation |
+//| v2.91: TOUCH_GATE_ON only via verified recalc-buffer overlap (matches chart zone) |
+//| v2.90: remove TOUCH_GATE_OFF on same-dir M2 leg close before touch hit |
+//| v2.89: remove swing-group hunt OFF cancel (v2.84) — no HUNT_OFF on group hit |
+//| v2.88: remove hunt-off horizontal line + leg-close swing group recalc (v2.86/v2.87) |
+//| v2.87: hunt-off group pick — nearest by price + time (not price-only); lookback logged |
+//| v2.86: hunt-off horizontal line — swing group level on opposite/recalc-buffer leg close |
+//| v2.85: touch vol w/o FVG — gate OFF + no order; hunt stays ON |
+//| v2.84: hunt OFF on nearest swing low/high group hit; remove touch-vol FVG abort gate |
+//| v2.83: restore touch vol FVG gate — at least one FVG in session required |
+//| v2.82: revert v2.56 M2 anchor (midpoint) + v2.58 touch-vol FVG gate |
+//| v2.81: touch vol SL — widest extreme across full touch vol window (not vol bar + 2 only) |
 //| v2.79: HUNT_OFF log with reason on every V2EndOppositeFvgHuntSession call |
 //| v2.78: touch vol entry — buy low+ / sell high− offset; always limit at vol bar (no market promote) |
 //| v2.77: touch vol — 0% entry offset / 0% SL buffer allowed (SL at ref extreme, no inset) |
@@ -11,8 +25,6 @@
 //| v2.72: touch vol SL — widest extreme across vol bar + 2 older bars (was 1 older) |
 //| v2.71: touch vol entry 3% — selected bar height (not InputChartRangeBarCount); bull low+ / bear high− |
 //| v2.70: touch vol entry — bull low+3% / bear high−3% chart height; prefer massive vol leap bar (≥45) |
-//| v2.58: touch vol hit requires at least one FVG in session before trade placement |
-//| v2.56: M2 swing anchor — 3-bar structural extreme (min low / max high) vs single-candle midpoint |
 //| v2.55: InputFastTesterMode — master off switch for hunt logs + all chart objects/HUDs |
 //| v2.54: touch vol SL — wider of max-vol bar vs prior bar extreme, then ±2% chart height |
 //| v2.53: touch vol SL — max-vol bar extreme ± 2% chart height (was 1% via shared buffer) |
@@ -60,7 +72,7 @@
 //| v2.01: touch-recalc buffer tracks active same-dir leg; resumes on enter/cross only |
 //| v2.00: fork from h4_lq v1.27 — swing-group TP/proximity zones, H4 BOS HUD decouple |
 //+------------------------------------------------------------------+
-#define H4_LQ_V2_VERSION "2.79"
+#define H4_LQ_V2_VERSION "2.94"
 #property copyright ""
 #property version   H4_LQ_V2_VERSION
 #property description "h4_lq_v2 — configurable narrative TFs, H4 breach hunt + opposite FVG"
@@ -129,6 +141,7 @@ input double InputTradeSwingTpMinRewardToRisk = 2.0; // skip line/TP when reward
 input double InputTouchVolEntryOffsetPercentChart = 3.0; // buy: high−N% rng; sell: low+N% rng; 0=exact bar extreme
 input double InputTouchVolSlBufferPercentChart    = 2.0; // SL beyond ref extreme; 0=SL at ref extreme (no buffer)
 input int    InputTouchVolMinSlPoints           = 0;     // min entry–SL pts; 0=broker stops level only when widening SL
+input bool   InputTouchVolRequireAscendingVolume  = true;  // touch hit: require ascending tick-vol pattern in leg window
 
 input group "BOS SL/TP management"
 input bool   InputEnableBosMoveSlAndTp = false; // disable trailing/moving SL & TP on BOS for now
@@ -244,7 +257,6 @@ struct V2HuntSession
    bool     touchLevelReady;
    bool     postTouchFvgGateOpen;  // false after touch w/o FVG / vol fail; reopens on recalc buffer hit only
    bool     touchHitVolumeRejectLatch; // set on TOUCH_GATE_OFF vol fail; cleared on touch recalc
-   bool     touchAbortedSameDirLegClose; // same-dir leg closed before touch — blocks hunt-extreme-only gate reopen
    datetime touchRecalcSkippedBarOpenTime; // bar when TOUCH_RECALC_SKIP; FVG next bar → trade + hunt OFF
    bool     pendingTradeFvgValid;
    bool     pendingTradeIsBullishFvg;
@@ -400,8 +412,6 @@ void   SwingCloseM2Leg(SwingState &swingState, const ENUM_TIMEFRAMES timeframe, 
 void   UpdateM2LiveSwingLegVisualIf(const SwingState &swingState, const ENUM_TIMEFRAMES timeframe);
 void   UpdateM2LiveSwingLegVisualOnTick();
 void   UpdateM2SwingAnchorVisualRealtime(const SwingState &swingState);
-double SwingStructuralExtremeAnchorLevel(const ENUM_TIMEFRAMES timeframe, const int sh,
-                                          const int swingDirection);
 void   ProcessSwingStepAtShift(SwingState &swingState, const ENUM_TIMEFRAMES timeframe, const int sh,
                                const color swingLineColor, const string trendPrefix, const string labelPrefix,
                                const bool replayOnly = false);
@@ -595,9 +605,6 @@ bool   V2TouchSideBlocksBufferRecalc(const int huntIndex, const double barHigh, 
 void   V2TryTouchRecalcAfterBufferEvent(const int huntIndex, const double barHigh,
                                          const double barLow, const double barClose,
                                          const string bufferTriggerTag);
-void   V2TryReopenPostTouchFvgGateOnBufferHit(const int huntIndex, const double barHigh,
-                                               const double barLow, const double barClose,
-                                               const double huntExtremeAtBarStart = 0.0);
 void   V2UpdateTouchLevelFromM2Swing(const int huntIndex);
 void   V2DrawTouchPointLine(const int huntIndex);
 void   V2ClearTouchPointLine(const int huntIndex);
@@ -619,6 +626,12 @@ void   V2StorePendingTradeFvg(const int huntIndex, const bool isBullishFairValue
                               const double zoneLowPrice, const double zoneHighPrice,
                               const datetime formationTime);
 int    V2SelectTradeFvgMemIndexForHunt(const int huntIndex);
+bool   V2TryGetEarliestHuntFvgFormationBarOpenTime(const int huntIndex, datetime &outFormationBarOpen);
+bool   V2TryGetEarliestHuntFvgFirstPatternBarOpen(const int huntIndex, datetime &outFirstBarOpen,
+                                                   datetime &outFormationBarOpen);
+bool   V2TrySelectTouchVolEntryBarFromFvgPattern(const datetime firstBarOpen,
+                                                   const datetime formationBarOpen,
+                                                   datetime &outEntryBarOpen, long &outEntryBarVol);
 bool   V2ResolveTradeFvgForHunt(const int huntIndex, bool &outIsBullishFvg, double &outZoneLow,
                                 double &outZoneHigh, datetime &outFormationTime);
 void   V2TryPlacePendingFvgTradesAfterHuntOff(const int huntIndex);
@@ -675,6 +688,8 @@ int    TouchVolEffectiveMinSlPoints();
 bool   ApplyTouchVolMinimumSlDistance(const bool isBuy, const double entryPrice,
                                        double &inOutStopLossPrice);
 bool   M2TouchVolSlReferenceExtreme(const bool isBuy, const int entryBarShift,
+                                     const datetime windowStartInclusive,
+                                     const double legExtremeFloor,
                                      double &outRefExtreme, int &outRefBarShift);
 double LossPerLotFromTickSpec(const double entryPrice, const double stopLossPrice);
 double CalculateVolumeForFixedUsdRisk(const bool isBuy, const double entryPrice,
@@ -729,10 +744,12 @@ bool   M2FindMaxVolumeBarOpenTimeExcludingOldest(const long &volumes[], const in
                                                   const datetime windowEndOpen,
                                                   datetime &outBarOpenTime, long &outMaxVolume);
 bool   ResolveTouchLegVolumeBarEntryAndSl(const bool isBuy, const int barShift,
+                                           const datetime slWindowStartOpen, const int huntIndex,
                                            bool &outUseMarketOrder, double &outEntryPrice,
                                            double &outStopLossPrice, string &outFailReason);
 bool   TryPlaceTouchVolumeBarTradeSetup(const int huntIndex, const bool isBuy,
                                          const datetime maxVolBarOpenTime, const long maxVolume,
+                                         const datetime slWindowStartOpen,
                                          const datetime huntSessionId);
 bool   TryPlaceOppositeFvgTradeSetup(const bool isBullishFairValueGap, const double zoneLowPrice,
                                        const double zoneHighPrice, const datetime formationTime,
@@ -1216,35 +1233,6 @@ void UpdateM2SwingAnchorVisualRealtime(const SwingState &swingState)
 }
 
 //+------------------------------------------------------------------+
-//| Bull: lowest low of sh..sh+2; bear: highest high of sh..sh+2.    |
-//+------------------------------------------------------------------+
-double SwingStructuralExtremeAnchorLevel(const ENUM_TIMEFRAMES timeframe, const int sh,
-                                          const int swingDirection)
-{
-   if(swingDirection == 0)
-      return 0.0;
-
-   const int barsTotal = iBars(_Symbol, timeframe);
-   if(sh >= barsTotal)
-      return 0.0;
-
-   const int endShift = MathMin(sh + 2, barsTotal - 1);
-
-   if(swingDirection == 1)
-   {
-      double structuralLow = iLow(_Symbol, timeframe, sh);
-      for(int barShift = sh + 1; barShift <= endShift; barShift++)
-         structuralLow = MathMin(structuralLow, iLow(_Symbol, timeframe, barShift));
-      return structuralLow;
-   }
-
-   double structuralHigh = iHigh(_Symbol, timeframe, sh);
-   for(int barShift = sh + 1; barShift <= endShift; barShift++)
-      structuralHigh = MathMax(structuralHigh, iHigh(_Symbol, timeframe, barShift));
-   return structuralHigh;
-}
-
-//+------------------------------------------------------------------+
 // plot_swing_h1_m5_copy ProcessSwingStepAtShift (M2 timeframe).
 //+------------------------------------------------------------------+
 void ProcessSwingStepAtShift(SwingState &swingState, const ENUM_TIMEFRAMES timeframe, const int sh,
@@ -1268,8 +1256,7 @@ void ProcessSwingStepAtShift(SwingState &swingState, const ENUM_TIMEFRAMES timef
       if(candleDirection == 0)
          return;
       SwingStartNew(swingState, timeframe, candleDirection, lastClosedBarHigh, lastClosedBarLow, sh);
-      swingState.priceAnchorLevel =
-         SwingStructuralExtremeAnchorLevel(timeframe, sh, candleDirection);
+      swingState.priceAnchorLevel = (lastClosedBarHigh + lastClosedBarLow) / 2.0;
       if(!replayOnly)
       {
          UpdateM2LiveSwingLegVisualIf(swingState, timeframe);
@@ -1309,8 +1296,7 @@ void ProcessSwingStepAtShift(SwingState &swingState, const ENUM_TIMEFRAMES timef
    if(nextSwingDirection == swingState.currentSwingLeg.swingDirection)
    {
       if(isDecentMovement && candleDirection == swingState.currentSwingLeg.swingDirection)
-         swingState.priceAnchorLevel =
-            SwingStructuralExtremeAnchorLevel(timeframe, sh, swingState.currentSwingLeg.swingDirection);
+         swingState.priceAnchorLevel = (lastClosedBarHigh + lastClosedBarLow) / 2.0;
 
       SwingExtend(swingState, lastClosedBarHigh, lastClosedBarLow);
       if(!replayOnly)
@@ -1339,8 +1325,7 @@ void ProcessSwingStepAtShift(SwingState &swingState, const ENUM_TIMEFRAMES timef
          newSwingLegLow = MathMin(lastClosedBarLow, closedSwingLeg.legLowPrice);
 
       SwingStartNew(swingState, timeframe, nextSwingDirection, newSwingLegHigh, newSwingLegLow, sh);
-      swingState.priceAnchorLevel =
-         SwingStructuralExtremeAnchorLevel(timeframe, sh, nextSwingDirection);
+      swingState.priceAnchorLevel = (lastClosedBarHigh + lastClosedBarLow) / 2.0;
       if(!replayOnly)
       {
          UpdateM2LiveSwingLegVisualIf(swingState, timeframe);
@@ -3068,6 +3053,8 @@ bool M2FindMaxVolumeBarOpenTimeExcludingOldest(const long &volumes[], const int 
 
 //+------------------------------------------------------------------+
 bool M2TouchVolSlReferenceExtreme(const bool isBuy, const int entryBarShift,
+                                   const datetime windowStartInclusive,
+                                   const double legExtremeFloor,
                                    double &outRefExtreme, int &outRefBarShift)
 {
    outRefExtreme  = 0.0;
@@ -3080,19 +3067,37 @@ bool M2TouchVolSlReferenceExtreme(const bool isBuy, const int entryBarShift,
    if(entryBarShift >= totalBars)
       return false;
 
-   outRefExtreme = isBuy ? iLow(_Symbol, timeframe, entryBarShift)
-                         : iHigh(_Symbol, timeframe, entryBarShift);
+   const datetime entryBarOpen = iTime(_Symbol, timeframe, entryBarShift);
+   if(entryBarOpen == 0)
+      return false;
 
-   const int oldestShift = entryBarShift + LQ_TOUCH_VOL_SL_OLDER_BAR_LOOKBACK;
-   for(int barShift = entryBarShift + 1; barShift <= oldestShift; barShift++)
+   int shiftStartOlder = -1;
+   int shiftEndNewer   = entryBarShift;
+   if(windowStartInclusive > 0 &&
+      M2VolumeWindowShiftRangeValid(windowStartInclusive, entryBarOpen))
    {
-      if(barShift >= totalBars)
-         break;
+      shiftStartOlder = iBarShift(_Symbol, timeframe, windowStartInclusive, true);
+      shiftEndNewer   = entryBarShift;
+   }
+
+   if(shiftStartOlder < 0 || shiftStartOlder < shiftEndNewer)
+   {
+      shiftStartOlder = entryBarShift + LQ_TOUCH_VOL_SL_OLDER_BAR_LOOKBACK;
+      shiftEndNewer   = entryBarShift;
+   }
+
+   if(shiftStartOlder >= totalBars)
+      shiftStartOlder = totalBars - 1;
+
+   for(int barShift = shiftStartOlder; barShift >= shiftEndNewer; barShift--)
+   {
+      if(barShift < 0 || barShift >= totalBars)
+         continue;
 
       if(isBuy)
       {
          const double barLow = iLow(_Symbol, timeframe, barShift);
-         if(barLow < outRefExtreme)
+         if(outRefExtreme <= 0.0 || barLow < outRefExtreme)
          {
             outRefExtreme  = barLow;
             outRefBarShift = barShift;
@@ -3101,10 +3106,30 @@ bool M2TouchVolSlReferenceExtreme(const bool isBuy, const int entryBarShift,
       else
       {
          const double barHigh = iHigh(_Symbol, timeframe, barShift);
-         if(barHigh > outRefExtreme)
+         if(outRefExtreme <= 0.0 || barHigh > outRefExtreme)
          {
             outRefExtreme  = barHigh;
             outRefBarShift = barShift;
+         }
+      }
+   }
+
+   if(legExtremeFloor > 0.0)
+   {
+      if(isBuy)
+      {
+         if(outRefExtreme <= 0.0 || legExtremeFloor < outRefExtreme)
+         {
+            outRefExtreme  = legExtremeFloor;
+            outRefBarShift = entryBarShift;
+         }
+      }
+      else
+      {
+         if(outRefExtreme <= 0.0 || legExtremeFloor > outRefExtreme)
+         {
+            outRefExtreme  = legExtremeFloor;
+            outRefBarShift = entryBarShift;
          }
       }
    }
@@ -3114,6 +3139,7 @@ bool M2TouchVolSlReferenceExtreme(const bool isBuy, const int entryBarShift,
 
 //+------------------------------------------------------------------+
 bool ResolveTouchLegVolumeBarEntryAndSl(const bool isBuy, const int barShift,
+                                         const datetime slWindowStartOpen, const int huntIndex,
                                          bool &outUseMarketOrder, double &outEntryPrice,
                                          double &outStopLossPrice, string &outFailReason)
 {
@@ -3156,9 +3182,26 @@ bool ResolveTouchLegVolumeBarEntryAndSl(const bool isBuy, const int barShift,
       return false;
    }
 
+   datetime slScanStartOpen = slWindowStartOpen;
+   double   legExtremeFloor = 0.0;
+   if(huntIndex >= 0 && huntIndex < V2_MAX_HUNT_SESSIONS)
+   {
+      double   legLow  = 0.0;
+      double   legHigh = 0.0;
+      datetime legStartTime = 0;
+      datetime legEndTime   = 0;
+      if(V2TryGetOppositeM2LegExtentsForTouch(huntIndex, legLow, legHigh, legStartTime, legEndTime))
+      {
+         legExtremeFloor = isBuy ? legLow : legHigh;
+         if(legStartTime > 0 && (slScanStartOpen == 0 || legStartTime < slScanStartOpen))
+            slScanStartOpen = legStartTime;
+      }
+   }
+
    double slRefExtreme = 0.0;
    int    slRefBarShift = barShift;
-   if(!M2TouchVolSlReferenceExtreme(isBuy, barShift, slRefExtreme, slRefBarShift))
+   if(!M2TouchVolSlReferenceExtreme(isBuy, barShift, slScanStartOpen, legExtremeFloor,
+                                    slRefExtreme, slRefBarShift))
    {
       outFailReason = "SL reference extreme invalid";
       return false;
@@ -4668,12 +4711,12 @@ double V2TouchLevelFromLegExtreme(const int oppositeM2LegDirection, const double
    if(oppositeM2LegDirection == -1)
    {
       // Opposite down leg: 61.8% up from structural leg low → touch near leg high
-      fibLevel = legLowPrice + (legRange * 0.618);
+      fibLevel = legLowPrice + (legRange * 0.9);
    }
    else if(oppositeM2LegDirection == 1)
    {
       // Opposite up leg: 61.8% down from structural leg high → touch near leg low
-      fibLevel = legHighPrice - (legRange * 0.618);
+      fibLevel = legHighPrice - (legRange * 0.9);
    }
    else
       return 0.0;
@@ -6744,6 +6787,7 @@ bool TryPromoteFvgLimitToMarketIfFormationCloseMatchesEntry(const bool isBullish
 //+------------------------------------------------------------------+
 bool TryPlaceTouchVolumeBarTradeSetup(const int huntIndex, const bool isBuy,
                                        const datetime maxVolBarOpenTime, const long maxVolume,
+                                       const datetime slWindowStartOpen,
                                        const datetime huntSessionId)
 {
    if(huntIndex < 0 || huntIndex >= V2_MAX_HUNT_SESSIONS || maxVolBarOpenTime == 0)
@@ -6789,8 +6833,9 @@ bool TryPlaceTouchVolumeBarTradeSetup(const int huntIndex, const bool isBuy,
    double entryPrice     = 0.0;
    double stopLossOverall = 0.0;
    string entryFailReason = "";
-   if(!ResolveTouchLegVolumeBarEntryAndSl(isBuy, barShift, useMarketOrder, entryPrice,
-                                          stopLossOverall, entryFailReason))
+   if(!ResolveTouchLegVolumeBarEntryAndSl(isBuy, barShift, slWindowStartOpen, huntIndex,
+                                          useMarketOrder, entryPrice, stopLossOverall,
+                                          entryFailReason))
    {
       V2LogHuntEvent(huntIndex, "TRADE_SKIP",
                      StringFormat("touch vol bar entry/SL invalid sh=%d entry=%.5f sl=%.5f buy=%s — %s",
@@ -6843,16 +6888,30 @@ bool TryPlaceTouchVolumeBarTradeSetup(const int huntIndex, const bool isBuy,
 
    double slRefExtreme  = 0.0;
    int    slRefBarShift = barShift;
-   M2TouchVolSlReferenceExtreme(isBuy, barShift, slRefExtreme, slRefBarShift);
+   double   slLegLow  = 0.0;
+   double   slLegHigh = 0.0;
+   datetime slLegStart = 0;
+   datetime slLegEnd   = 0;
+   if(V2TryGetOppositeM2LegExtentsForTouch(huntIndex, slLegLow, slLegHigh, slLegStart, slLegEnd))
+   {
+      datetime slScanStart = slWindowStartOpen;
+      if(slLegStart > 0 && (slScanStart == 0 || slLegStart < slScanStart))
+         slScanStart = slLegStart;
+      const double legFloor = isBuy ? slLegLow : slLegHigh;
+      M2TouchVolSlReferenceExtreme(isBuy, barShift, slScanStart, legFloor, slRefExtreme, slRefBarShift);
+   }
+   else
+      M2TouchVolSlReferenceExtreme(isBuy, barShift, slWindowStartOpen, 0.0, slRefExtreme, slRefBarShift);
    const double volBarLow  = iLow(_Symbol, InputM2NarrativeTimeframe, barShift);
    const double volBarHigh = iHigh(_Symbol, InputM2NarrativeTimeframe, barShift);
    const double entryOff   = M2TouchVolEntryOffsetPrice(barShift);
    const double bufferPrice = M2TouchVolSlBufferPrice(barShift);
    const double limitRef   = M2TouchVolLimitEntryPrice(isBuy, barShift, volBarLow, volBarHigh);
    const string logDetail = StringFormat(
-      "%s entry=%.5f sl=%.5f (volBar sh=%d vol=%lld barL=%.5f barH=%.5f limitRef=%.5f off=%.5f anchor=%s slRef sh=%d %s=%.5f buf=%.5f) swingTP=%s count=%d limit=Y",
+      "%s entry=%.5f sl=%.5f (volBar sh=%d vol=%lld barL=%.5f barH=%.5f limitRef=%.5f off=%.5f anchor=%s slWin=%s slRef sh=%d %s=%.5f buf=%.5f) swingTP=%s count=%d limit=Y",
       isBuy ? "buyHunt" : "sellHunt", normalizedEntry, stopLossOverall, barShift, (long)maxVolume,
-      volBarLow, volBarHigh, limitRef, entryOff, isBuy ? "low+N%rng" : "high-N%rng", slRefBarShift,
+      volBarLow, volBarHigh, limitRef, entryOff, isBuy ? "low+N%rng" : "high-N%rng",
+      TimeToString(slWindowStartOpen, TIME_DATE | TIME_MINUTES), slRefBarShift,
       isBuy ? "low" : "high", slRefExtreme, bufferPrice,
       tpLog, takeProfitCount);
 
@@ -7161,7 +7220,6 @@ void V2InitHuntSlot(const int huntIndex)
    g_v2Hunts[huntIndex].touchLevelReady                = false;
    g_v2Hunts[huntIndex].postTouchFvgGateOpen         = true;
    g_v2Hunts[huntIndex].touchHitVolumeRejectLatch    = false;
-   g_v2Hunts[huntIndex].touchAbortedSameDirLegClose  = false;
    g_v2Hunts[huntIndex].touchRecalcSkippedBarOpenTime = 0;
    g_v2Hunts[huntIndex].pendingTradeFvgValid           = false;
    g_v2Hunts[huntIndex].fvgMemCount                    = 0;
@@ -7519,28 +7577,11 @@ void V2StopTouchRecalcBufferActiveLegTrack(const int huntIndex)
 bool V2DetectTouchRecalcBufferCrossOrTouch(const int huntIndex, const double barHigh,
                                              const double barLow, const double barClose)
 {
-   double anchor = 0.0;
-   if(!V2TryGetTouchRecalcBufferAnchorExtreme(huntIndex, anchor))
-      return false;
-
-   const double band = V2TouchRecalcBufferBandHalfWidth();
-   if(band <= 0.0)
-      return false;
-
-   if(V2HuntExpectsBullishFvg(huntIndex))
-   {
-      const double zoneLow  = anchor;
-      const double zoneHigh = anchor + band;
-      const bool touchesZone = (barHigh >= zoneLow && barLow <= zoneHigh);
-      const bool belowHigh   = (barLow < zoneHigh) || (barClose < zoneHigh);
-      return touchesZone || belowHigh;
-   }
-
-   const double zoneLow  = anchor - band;
-   const double zoneHigh = anchor;
-   const bool touchesZone = (barHigh >= zoneLow && barLow <= zoneHigh);
-   const bool aboveLow    = (barHigh > zoneLow) || (barClose > zoneLow);
-   return touchesZone || aboveLow;
+   bool nearHuntExtreme    = false;
+   bool nearOppositeBuffer = false;
+   return V2DetectTouchRecalcBufferHit(huntIndex, barHigh, barLow, barClose,
+                                        nearHuntExtreme, nearOppositeBuffer, 0.0) &&
+          nearOppositeBuffer;
 }
 
 //+------------------------------------------------------------------+
@@ -7549,6 +7590,31 @@ void V2TryArmTouchRecalcBufferResumeOnCross(const int huntIndex, const double ba
 {
    if(huntIndex < 0 || huntIndex >= V2_MAX_HUNT_SESSIONS || !g_v2Hunts[huntIndex].active)
       return;
+
+   const double pointSize = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   if(!g_v2Hunts[huntIndex].postTouchFvgGateOpen &&
+      !V2TouchSideBlocksBufferRecalc(huntIndex, barHigh, barLow, pointSize))
+   {
+      bool nearHuntExtreme    = false;
+      bool nearOppositeBuffer = false;
+      if(V2DetectTouchRecalcBufferHit(huntIndex, barHigh, barLow, barClose,
+                                       nearHuntExtreme, nearOppositeBuffer, 0.0))
+      {
+         double anchor = 0.0;
+         if(!V2TryGetTouchRecalcBufferAnchorExtreme(huntIndex, anchor))
+         {
+            double huntExtreme = 0.0;
+            if(V2GetSameDirExtremeWhileHuntOn(huntIndex, huntExtreme))
+               anchor = huntExtreme;
+         }
+         V2TryTouchRecalcAfterBufferEvent(huntIndex, barHigh, barLow, barClose,
+                                          StringFormat("%.1f%% recalc buffer hit anchor=%.5f",
+                                                       InputHuntTouchRecalcPercentBeforeSameDirExtreme,
+                                                       anchor));
+         return;
+      }
+   }
+
    if(g_v2Hunts[huntIndex].touchRecalcBufferTrackActiveLeg)
       return;
    if(g_v2Hunts[huntIndex].touchRecalcBufferResumeAfterCross)
@@ -7610,10 +7676,16 @@ void V2OnTouchRecalcBufferLegChange(const int huntIndex, const int closingLegDir
       const double freezeBarHigh  = iHigh(_Symbol, InputM2NarrativeTimeframe, 1);
       const double freezeBarLow   = iLow(_Symbol, InputM2NarrativeTimeframe, 1);
       const double freezeBarClose = iClose(_Symbol, InputM2NarrativeTimeframe, 1);
-      V2TryTouchRecalcAfterBufferEvent(huntIndex, freezeBarHigh, freezeBarLow, freezeBarClose,
-                                       StringFormat("opposite %s leg closed at buffer anchor=%.5f",
-                                                    trackDir == 1 ? "up" : "down",
-                                                    g_v2Hunts[huntIndex].touchRecalcBufferAnchor));
+      bool nearHuntExtreme    = false;
+      bool nearOppositeBuffer = false;
+      if(V2DetectTouchRecalcBufferHit(huntIndex, freezeBarHigh, freezeBarLow, freezeBarClose,
+                                        nearHuntExtreme, nearOppositeBuffer, 0.0))
+      {
+         V2TryTouchRecalcAfterBufferEvent(huntIndex, freezeBarHigh, freezeBarLow, freezeBarClose,
+                                          StringFormat("opposite %s leg closed at buffer anchor=%.5f",
+                                                       trackDir == 1 ? "up" : "down",
+                                                       g_v2Hunts[huntIndex].touchRecalcBufferAnchor));
+      }
    }
 }
 
@@ -7647,37 +7719,39 @@ bool V2DetectTouchRecalcBufferHit(const int huntIndex, const double barHigh, con
    if(!g_v2Hunts[huntIndex].active)
       return false;
 
+   const double band = V2TouchRecalcBufferBandHalfWidth();
+   if(band <= 0.0)
+      return false;
+
    double huntExtreme = 0.0;
    if(huntExtremeAtBarStart > 0.0)
       huntExtreme = huntExtremeAtBarStart;
    else if(!V2GetSameDirExtremeWhileHuntOn(huntIndex, huntExtreme))
       return false;
 
+   double anchor = huntExtreme;
+   if(V2TryGetTouchRecalcBufferAnchorExtreme(huntIndex, anchor))
+      outNearOppositeBuffer = true;
+   else
+      outNearHuntExtreme = true;
+
    const double pointSize = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
    const double eps       = (pointSize > 0.0 ? pointSize : 0.00001);
-   const double band      = V2TouchRecalcBufferBandHalfWidth();
-   if(band <= 0.0)
-      return false;
 
+   double zoneLow  = 0.0;
+   double zoneHigh = 0.0;
    if(V2HuntExpectsBullishFvg(huntIndex))
-      outNearHuntExtreme =
-         V2BarOverlapsPriceZone(barHigh, barLow, huntExtreme, huntExtreme + band, eps);
-   else
-      outNearHuntExtreme =
-         V2BarOverlapsPriceZone(barHigh, barLow, huntExtreme - band, huntExtreme, eps);
-
-   double bufferAnchor = 0.0;
-   if(V2TryGetTouchRecalcBufferAnchorExtreme(huntIndex, bufferAnchor))
    {
-      if(V2HuntExpectsBullishFvg(huntIndex))
-         outNearOppositeBuffer =
-            V2BarOverlapsPriceZone(barHigh, barLow, bufferAnchor, bufferAnchor + band, eps);
-      else
-         outNearOppositeBuffer =
-            V2BarOverlapsPriceZone(barHigh, barLow, bufferAnchor - band, bufferAnchor, eps);
+      zoneLow  = anchor;
+      zoneHigh = anchor + band;
+   }
+   else
+   {
+      zoneLow  = anchor - band;
+      zoneHigh = anchor;
    }
 
-   return (outNearHuntExtreme || outNearOppositeBuffer);
+   return V2BarOverlapsPriceZone(barHigh, barLow, zoneLow, zoneHigh, eps);
 }
 
 //+------------------------------------------------------------------+
@@ -7696,16 +7770,11 @@ void V2TryTouchRecalcAfterBufferEvent(const int huntIndex, const double barHigh,
    if(huntIndex < 0 || huntIndex >= V2_MAX_HUNT_SESSIONS || !g_v2Hunts[huntIndex].active)
       return;
 
-   if(g_v2Hunts[huntIndex].touchAbortedSameDirLegClose)
-   {
-      bool nearHuntExtreme = false;
-      bool nearOppositeBuffer = false;
-      if(!V2DetectTouchRecalcBufferHit(huntIndex, barHigh, barLow, barClose,
-                                        nearHuntExtreme, nearOppositeBuffer, 0.0) ||
-         !nearOppositeBuffer)
-         return;
-      g_v2Hunts[huntIndex].touchAbortedSameDirLegClose = false;
-   }
+   bool nearHuntExtreme    = false;
+   bool nearOppositeBuffer = false;
+   if(!V2DetectTouchRecalcBufferHit(huntIndex, barHigh, barLow, barClose,
+                                     nearHuntExtreme, nearOppositeBuffer, 0.0))
+      return;
 
    const double pointSize = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
    if(V2TouchSideBlocksBufferRecalc(huntIndex, barHigh, barLow, pointSize))
@@ -7755,30 +7824,16 @@ void V2TryRecalcTouchOnHuntSameDirProgress(const int huntIndex, const double bar
    const double pct       = InputHuntTouchRecalcPercentBeforeSameDirExtreme;
 
    if(!forceBufferRecalc && lastSnap > 0.0 && MathAbs(huntExtreme - lastSnap) <= eps)
-   {
-      if(!V2DetectTouchRecalcBufferHit(huntIndex, barHigh, barLow, barClose,
-                                        nearHuntExtreme, nearOppositeBuffer, huntExtremeAtBarStart))
-         return;
-      if(!nearOppositeBuffer)
-         return;
-   }
-
-   double sameDirLegLow  = 0.0;
-   double sameDirLegHigh = 0.0;
-   datetime sameDirLegStart = 0;
-   datetime sameDirLegEnd   = 0;
-   const int sameDir = V2SameSideM2LegDirectionForHunt(huntIndex);
-   V2TryGetLastCompletedM2Leg(sameDir, sameDirLegLow, sameDirLegHigh, sameDirLegStart, sameDirLegEnd);
+      return;
 
    string triggerTag = forcedTriggerTag;
    if(StringLen(triggerTag) == 0)
    {
-      if(nearOppositeBuffer)
-         triggerTag = g_v2Hunts[huntIndex].h4HighWasBreached
+      triggerTag = nearOppositeBuffer
+                   ? (g_v2Hunts[huntIndex].h4HighWasBreached
                       ? StringFormat("within %.1f%% M2 chart of opposite up leg buffer", pct)
-                      : StringFormat("within %.1f%% M2 chart of opposite down leg buffer", pct);
-      else
-         triggerTag = StringFormat("within %.1f%% M2 chart of hunt extreme", pct);
+                      : StringFormat("within %.1f%% M2 chart of opposite down leg buffer", pct))
+                   : StringFormat("within %.1f%% M2 chart of recalc buffer", pct);
    }
 
    const double oldTouch = g_v2Hunts[huntIndex].touchLevel;
@@ -7851,7 +7906,6 @@ void V2ResetHuntSlotSessionCounters(const int huntIndex)
    g_v2Hunts[huntIndex].touchLevelReady       = false;
    g_v2Hunts[huntIndex].postTouchFvgGateOpen    = true;
    g_v2Hunts[huntIndex].touchHitVolumeRejectLatch = false;
-   g_v2Hunts[huntIndex].touchAbortedSameDirLegClose = false;
    g_v2Hunts[huntIndex].touchRecalcSkippedBarOpenTime = 0;
    g_v2Hunts[huntIndex].sameDirExtremeAtLastTouchRecalc = 0.0;
    g_v2Hunts[huntIndex].touchRecalcBufferAnchor         = 0.0;
@@ -7986,19 +8040,7 @@ void V2OnM2LegChangeForHunt(const int huntIndex, const int closingLegDirection,
       return;
 
    if(g_v2Hunts[huntIndex].touchLevelReady)
-   {
-      const int sameDir = V2SameSideM2LegDirectionForHunt(huntIndex);
-      if(closingLegDirection == sameDir)
-      {
-         g_v2Hunts[huntIndex].postTouchFvgGateOpen          = false;
-         g_v2Hunts[huntIndex].touchHitVolumeRejectLatch    = true;
-         g_v2Hunts[huntIndex].touchAbortedSameDirLegClose  = true;
-         V2ClearTouchPointLine(huntIndex);
-         V2LogHuntEvent(huntIndex, "TOUCH_GATE_OFF",
-                        "same-direction M2 leg closed before touch event was hit");
-      }
       return;
-   }
 
    const int oppositeDir = V2OppositeM2LegDirectionForHunt(huntIndex);
    if(closingLegDirection != oppositeDir)
@@ -8119,48 +8161,6 @@ void V2TryClearHuntFvgsOnSameDirectionBosWhileHuntOn(const int huntIndex)
 }
 
 //+------------------------------------------------------------------+
-void V2TryReopenPostTouchFvgGateOnBufferHit(const int huntIndex, const double barHigh,
-                                             const double barLow, const double barClose,
-                                             const double huntExtremeAtBarStart)
-{
-   if(huntIndex < 0 || huntIndex >= V2_MAX_HUNT_SESSIONS || !g_v2Hunts[huntIndex].active)
-      return;
-   if(g_v2Hunts[huntIndex].postTouchFvgGateOpen)
-      return;
-
-   bool nearHuntExtreme = false;
-   bool nearOppositeBuffer = false;
-   if(!V2DetectTouchRecalcBufferHit(huntIndex, barHigh, barLow, barClose,
-                                     nearHuntExtreme, nearOppositeBuffer, huntExtremeAtBarStart))
-      return;
-
-   if(g_v2Hunts[huntIndex].touchAbortedSameDirLegClose)
-   {
-      if(!nearOppositeBuffer)
-         return;
-   }
-   else if(nearHuntExtreme && !nearOppositeBuffer)
-   {
-      double huntExtreme = 0.0;
-      if(V2GetSameDirExtremeWhileHuntOn(huntIndex, huntExtreme))
-      {
-         const double pointSize = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-         const double eps       = (pointSize > 0.0 ? pointSize : 0.00001);
-         const double lastSnap  = g_v2Hunts[huntIndex].sameDirExtremeAtLastTouchRecalc;
-         if(lastSnap > 0.0 && MathAbs(huntExtreme - lastSnap) <= eps)
-            return;
-      }
-   }
-
-   const string reopenDetail = nearOppositeBuffer
-      ? StringFormat("%.1f%% recalc buffer hit (opposite leg)",
-                     InputHuntTouchRecalcPercentBeforeSameDirExtreme)
-      : StringFormat("%.1f%% recalc buffer hit (hunt extreme)",
-                     InputHuntTouchRecalcPercentBeforeSameDirExtreme);
-   V2TryTouchRecalcAfterBufferEvent(huntIndex, barHigh, barLow, barClose, reopenDetail);
-}
-
-//+------------------------------------------------------------------+
 bool M2TryGetLegBarOpenFromEnd(const datetime legStartTime, const datetime legEndTime,
                                 const int barsFromEnd, datetime &outBarOpen)
 {
@@ -8232,7 +8232,14 @@ bool V2ValidateTouchHitOppositeM2LegVolume(const int huntIndex, const int lastCl
                                              outVolumes, outVolumeCount))
       return false;
 
-   return M2ValidateTouchLegVolumeIncreasePattern(outVolumes, outVolumeCount);
+   if(outVolumeCount < 2)
+      return false;
+
+   if(InputTouchVolRequireAscendingVolume &&
+      !M2ValidateTouchLegVolumeIncreasePattern(outVolumes, outVolumeCount))
+      return false;
+
+   return true;
 }
 
 //+------------------------------------------------------------------+
@@ -8302,37 +8309,74 @@ void V2HandleTouchHitConfirmed(const int huntIndex, const double barHigh, const 
                                g_v2Hunts[huntIndex].touchLevel, barHigh, barLow, maxVolBarShift,
                                (long)maxVolume,
                                TimeToString(maxVolBarOpen, TIME_DATE | TIME_MINUTES)));
-   V2LogHuntEvent(huntIndex, "TOUCH_VOL_ENTRY_BAR",
-                  StringFormat("excl oldest %s → entry bar vol=%lld",
-                               TimeToString(windowStartOpen, TIME_DATE | TIME_MINUTES),
-                               (long)maxVolume));
+
+   datetime entryBarOpen = maxVolBarOpen;
+   long     entryBarVol  = maxVolume;
+   datetime firstFvgPatternBarOpen = 0;
+   datetime fvgFormationBarOpen    = 0;
+   if(V2TryGetEarliestHuntFvgFirstPatternBarOpen(huntIndex, firstFvgPatternBarOpen,
+                                                  fvgFormationBarOpen) &&
+      firstFvgPatternBarOpen > 0 && maxVolBarOpen < firstFvgPatternBarOpen)
+   {
+      datetime fvgPatternEntryBarOpen = 0;
+      long     fvgPatternEntryBarVol  = -1;
+      if(V2TrySelectTouchVolEntryBarFromFvgPattern(firstFvgPatternBarOpen, fvgFormationBarOpen,
+                                                   fvgPatternEntryBarOpen, fvgPatternEntryBarVol))
+      {
+         entryBarOpen = fvgPatternEntryBarOpen;
+         entryBarVol  = fvgPatternEntryBarVol;
+         V2LogHuntEvent(huntIndex, "TOUCH_VOL_ENTRY_BAR",
+                        StringFormat("maxVol %s before 1st FVG bar %s → FVG-pattern bar %s vol=%lld",
+                                     TimeToString(maxVolBarOpen, TIME_DATE | TIME_MINUTES),
+                                     TimeToString(firstFvgPatternBarOpen, TIME_DATE | TIME_MINUTES),
+                                     TimeToString(entryBarOpen, TIME_DATE | TIME_MINUTES),
+                                     (long)entryBarVol));
+      }
+      else
+      {
+         V2LogHuntEvent(huntIndex, "TOUCH_VOL_ENTRY_BAR",
+                        StringFormat("maxVol %s before 1st FVG bar %s — FVG-pattern pick failed, keep maxVol",
+                                     TimeToString(maxVolBarOpen, TIME_DATE | TIME_MINUTES),
+                                     TimeToString(firstFvgPatternBarOpen, TIME_DATE | TIME_MINUTES)));
+      }
+   }
+   else
+   {
+      V2LogHuntEvent(huntIndex, "TOUCH_VOL_ENTRY_BAR",
+                     StringFormat("excl oldest %s → entry bar vol=%lld",
+                                  TimeToString(windowStartOpen, TIME_DATE | TIME_MINUTES),
+                                  (long)entryBarVol));
+   }
 
    g_v2Hunts[huntIndex].postTouchFvgGateOpen = false;
    V2ClearTouchPointLine(huntIndex);
-   V2LogHuntEvent(huntIndex, "TOUCH_GATE_OFF",
-                  StringFormat("touch lvl=%.5f vol entry — hunt OFF + place",
-                               g_v2Hunts[huntIndex].touchLevel));
 
    if(g_v2Hunts[huntIndex].oppositeFvgFoundCount <= 0 &&
       g_v2Hunts[huntIndex].fvgMemCount <= 0)
    {
+      g_v2Hunts[huntIndex].touchHitVolumeRejectLatch = true;
       V2LogHuntEvent(huntIndex, "TRADE_SKIP",
-                     "touch vol hit but no FVG formed in session — aborting trade");
-      V2EndOppositeFvgHuntSession(huntIndex,
-                                    "touch vol confirmed but no FVG in session — abort",
-                                    false);
+                     "touch vol hit but no FVG in session — no order, hunt stays ON");
+      V2LogHuntEvent(huntIndex, "TOUCH_GATE_OFF",
+                     StringFormat("touch lvl=%.5f vol ok — no FVG, gate closed (hunt ON)",
+                                  g_v2Hunts[huntIndex].touchLevel));
       return;
    }
+
+   V2LogHuntEvent(huntIndex, "TOUCH_GATE_OFF",
+                  StringFormat("touch lvl=%.5f vol entry — hunt OFF + place",
+                               g_v2Hunts[huntIndex].touchLevel));
 
    const bool     isBuy     = V2HuntExpectsBullishFvg(huntIndex);
    const datetime sessionId = g_v2Hunts[huntIndex].sessionId;
    V2EndOppositeFvgHuntSession(huntIndex,
-                               StringFormat("touch vol entry lvl=%.5f maxVolBar=%s vol=%lld",
+                               StringFormat("touch vol entry lvl=%.5f entryBar=%s vol=%lld",
                                             g_v2Hunts[huntIndex].touchLevel,
-                                            TimeToString(maxVolBarOpen, TIME_DATE | TIME_MINUTES),
-                                            (long)maxVolume),
+                                            TimeToString(entryBarOpen, TIME_DATE | TIME_MINUTES),
+                                            (long)entryBarVol),
                                false);
-   TryPlaceTouchVolumeBarTradeSetup(huntIndex, isBuy, maxVolBarOpen, maxVolume, sessionId);
+   TryPlaceTouchVolumeBarTradeSetup(huntIndex, isBuy, entryBarOpen, entryBarVol,
+                                    windowStartOpen, sessionId);
    g_v2Hunts[huntIndex].pendingTradeFvgValid = false;
 }
 
@@ -8352,6 +8396,78 @@ void V2StorePendingTradeFvg(const int huntIndex, const bool isBullishFairValueGa
 double V2FairValueGapZoneSize(const double zoneLowPrice, const double zoneHighPrice)
 {
    return MathAbs(zoneHighPrice - zoneLowPrice);
+}
+
+//+------------------------------------------------------------------+
+//| Earliest hunt-session FVG formation bar (newest / 3rd candle of 3-bar pattern). |
+//+------------------------------------------------------------------+
+bool V2TryGetEarliestHuntFvgFormationBarOpenTime(const int huntIndex, datetime &outFormationBarOpen)
+{
+   outFormationBarOpen = 0;
+   if(huntIndex < 0 || huntIndex >= V2_MAX_HUNT_SESSIONS)
+      return false;
+
+   datetime earliest = 0;
+   for(int i = 0; i < g_v2Hunts[huntIndex].fvgMemCount; i++)
+   {
+      const datetime barOpen = g_v2Hunts[huntIndex].fvgMem[i].fairValueGapBarOpenTime;
+      if(barOpen == 0)
+         continue;
+      if(!V2FvgPolarityMatchesHunt(huntIndex, g_v2Hunts[huntIndex].fvgMem[i].isBullishFairValueGap))
+         continue;
+      if(earliest == 0 || barOpen < earliest)
+         earliest = barOpen;
+   }
+
+   if(earliest == 0)
+      return false;
+
+   outFormationBarOpen = earliest;
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| 1st bar of earliest FVG pattern = oldest of 3 candles (shift+2 from formation). |
+//+------------------------------------------------------------------+
+bool V2TryGetEarliestHuntFvgFirstPatternBarOpen(const int huntIndex, datetime &outFirstBarOpen,
+                                                 datetime &outFormationBarOpen)
+{
+   outFirstBarOpen     = 0;
+   outFormationBarOpen = 0;
+   if(!V2TryGetEarliestHuntFvgFormationBarOpenTime(huntIndex, outFormationBarOpen))
+      return false;
+
+   const int formationShift =
+      iBarShift(_Symbol, InputM2NarrativeTimeframe, outFormationBarOpen, true);
+   if(formationShift < 0)
+      return false;
+
+   const int firstShift = formationShift + 2;
+   if(firstShift >= iBars(_Symbol, InputM2NarrativeTimeframe))
+      return false;
+
+   outFirstBarOpen = iTime(_Symbol, InputM2NarrativeTimeframe, firstShift);
+   return outFirstBarOpen > 0;
+}
+
+//+------------------------------------------------------------------+
+//| Same max-vol / leap pick as touch window, on FVG 3-bar pattern (excl oldest).   |
+//+------------------------------------------------------------------+
+bool V2TrySelectTouchVolEntryBarFromFvgPattern(const datetime firstBarOpen,
+                                                const datetime formationBarOpen,
+                                                datetime &outEntryBarOpen, long &outEntryBarVol)
+{
+   outEntryBarOpen = 0;
+   outEntryBarVol  = -1;
+
+   long volumes[];
+   int  volumeCount = 0;
+   if(!M2CollectTickVolumesInOpenTimeWindow(firstBarOpen, formationBarOpen, volumes, volumeCount))
+      return false;
+
+   return M2FindMaxVolumeBarOpenTimeExcludingOldest(volumes, volumeCount, firstBarOpen,
+                                                     formationBarOpen, outEntryBarOpen,
+                                                     outEntryBarVol);
 }
 
 //+------------------------------------------------------------------+
@@ -8825,10 +8941,6 @@ void V2ProcessOneActiveHuntOnM2Bar(const int huntIndex, const double pointSize,
    const bool touchSideBlocksBuffer = V2TouchSideBlocksBufferRecalc(huntIndex, barHigh, barLow, pointSize);
    const bool touchPointHitThisBar =
       touchSideBlocksBuffer && !g_v2Hunts[huntIndex].touchHitVolumeRejectLatch;
-
-   if(!g_v2Hunts[huntIndex].postTouchFvgGateOpen && !touchSideBlocksBuffer)
-      V2TryReopenPostTouchFvgGateOnBufferHit(huntIndex, barHigh, barLow, barClose,
-                                              huntExtremeAtBarStart);
 
    if(g_v2Hunts[huntIndex].postTouchFvgGateOpen)
    {
