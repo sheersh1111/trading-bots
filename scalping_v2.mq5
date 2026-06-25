@@ -3,8 +3,8 @@
 //| M15 swing legs + volume breach between consecutive decent bars.  |
 //+------------------------------------------------------------------+
 #property copyright ""
-#property version   "2.13"
-#property description "scalping_v2 — expired breach rays removed from chart."
+#property version   "2.18"
+#property description "scalping_v2 — hunt impulse cancel buffer + HUD."
 
 const ENUM_TIMEFRAMES ChartTf = PERIOD_M15;
 const ENUM_TIMEFRAMES SweepCheckTf = PERIOD_M2;
@@ -15,9 +15,19 @@ input bool   InputDrawSwingLegVisuals      = true;
 input color  InputSwingTrendLineColor      = clrYellow;
 input double InputAnchorTolerance          = 0.5; // × prior 5-bar avg range (wick AND body)
 input bool   InputDrawVolumeBreachLevels   = true;
-input int    InputBreachRayBarCount        = 24;  // horizontal ray width from vol bar
-input int    InputBreachExpiryM15BarCount    = 147; // active for N M15 bars from formation bar
+input int    InputBreachExpiryM15BarCount    = 147; // ray width + active N M15 bars from formation bar
 input double InputInternalBreachMinBodyPctOfRange = 70.0; // body >= N% of bar range (high-low)
+
+input group "Breach sweep hunt trade"
+input bool   InputEnableBreachHuntTrade   = true;
+input double InputHuntRiskSize            = 50.0; // USD risk per hunt trade
+input ulong  InputHuntMagicNumber         = 20260225;
+input int    InputHuntSlippagePoints      = 10;
+input double InputHuntRewardRiskRatio     = 2.0; // 0 = no take profit
+input bool   InputDrawImpulseCancelBufferZone = true;
+input color  InputImpulseCancelBufferColor    = clrDarkOrange;
+input double InputImpulseCancelBufferPercentChart = 2.0; // % of M15 chart height (see expiry bar count)
+input bool   InputShowHuntHud             = true;
 
 struct Swing
 {
@@ -54,6 +64,18 @@ struct M15LegVolumeBreachRecord
    ENUM_M15_BREACH_TYPE breachType;
 };
 
+struct M15BreachHuntState
+{
+   bool     active;
+   int      direction; // 1 = bull hunt (buy), -1 = bear hunt (sell)
+   double   breachLevelPrice;
+   datetime volumeBarOpenTime;
+   datetime armedBarOpenTime;
+   double   pathMinLowSinceArmed;
+   double   pathMaxHighSinceArmed;
+   double   impulseCloseExtremeSinceArmed;
+};
+
 struct M15ActiveLegVolumeBreachTrack
 {
    datetime legStartTime;
@@ -68,20 +90,23 @@ struct M15ActiveLegVolumeBreachTrack
 const string PFX_M15_TREND      = "SCALP_V2_M15_TR_";
 const string PFX_M15_LBL        = "SCALP_V2_M15_LB_";
 const string PFX_M15_VOL_BREACH = "SCALP_V2_M15_VB_";
+const string OBJ_HUNT_HUD       = "SCALP_V2_HUNT_HUD";
+const string OBJ_IMPULSE_BUFFER = "SCALP_V2_IMPULSE_BUF";
 
 const color M15_BREACH_COLOR_BULLISH = clrGreen;    // up leg after down leg closed
 const color M15_BREACH_COLOR_BEARISH = clrDeepPink; // down leg after up leg closed
 
-#define M15_LEG_VOLUME_BREACH_CAPACITY 20
-
 SwingState                   g_m15Swing;
+SwingState                   g_m2Swing;
+M15BreachHuntState           g_breachHunt;
+string                       g_breachHuntLastDisarmReason = "";
 datetime                     g_lastM15BarOpen = 0;
 datetime                     g_lastM2BarOpen = 0;
 datetime                     g_m15PrevLegLastDecentBarOpen = 0;
 int                          g_m15PrevClosedLegDirection = 0;
 bool                         g_m15AwaitingOppositeFirstDecentBreach = false;
 M15ActiveLegVolumeBreachTrack g_m15ActiveVolTrack;
-M15LegVolumeBreachRecord     g_m15LegVolumeBreaches[M15_LEG_VOLUME_BREACH_CAPACITY];
+M15LegVolumeBreachRecord     g_m15LegVolumeBreaches[];
 int                          g_m15LegVolumeBreachCount = 0;
 
 //+------------------------------------------------------------------+
@@ -307,7 +332,7 @@ void M15DrawVolumeBreachRay(const string objName, const int swingDirection,
    if(periodSec < 1)
       return;
 
-   const int bufferBars = MathMax(1, InputBreachRayBarCount);
+   const int bufferBars = MathMax(1, InputBreachExpiryM15BarCount);
    const datetime timeEnd =
       volumeBarOpenTime + (datetime)((long)bufferBars * (long)periodSec);
 
@@ -458,14 +483,659 @@ void ProcessM15BreachExpiryOnM15Close()
 }
 
 //+------------------------------------------------------------------+
+double ReferenceChartHeightForM15BarCount(const int barCount)
+{
+   if(barCount < 1)
+      return 0.0;
+
+   const int totalBars = iBars(_Symbol, ChartTf);
+   if(totalBars < 4)
+      return 0.0;
+
+   const int useBarCount = (int)MathMin((double)barCount, (double)(totalBars - 1));
+   if(useBarCount < 1)
+      return 0.0;
+
+   double highestHighPrice = -1.0e100;
+   double lowestLowPrice   = 1.0e100;
+   for(int barShiftIndex = 1; barShiftIndex <= useBarCount; barShiftIndex++)
+   {
+      highestHighPrice = MathMax(highestHighPrice, iHigh(_Symbol, ChartTf, barShiftIndex));
+      lowestLowPrice   = MathMin(lowestLowPrice, iLow(_Symbol, ChartTf, barShiftIndex));
+   }
+   return highestHighPrice - lowestLowPrice;
+}
+
+//+------------------------------------------------------------------+
+double ReferenceChartHeightForBreachImpulseCancel()
+{
+   return ReferenceChartHeightForM15BarCount(InputBreachExpiryM15BarCount);
+}
+
+//+------------------------------------------------------------------+
+bool M15BreachImpulseCancelZonePrices(const bool expectBullishHunt, const double breachLevel,
+                                       double &outZoneLow, double &outZoneHigh,
+                                       double &outCancelLimitPrice)
+{
+   outZoneLow = 0.0;
+   outZoneHigh = 0.0;
+   outCancelLimitPrice = 0.0;
+
+   if(InputImpulseCancelBufferPercentChart <= 0.0 || breachLevel <= 0.0)
+      return false;
+
+   const double referenceHeight = ReferenceChartHeightForBreachImpulseCancel();
+   if(referenceHeight <= 0.0)
+      return false;
+
+   const double farOffset = referenceHeight * (InputImpulseCancelBufferPercentChart / 100.0);
+   if(expectBullishHunt)
+   {
+      outZoneHigh         = breachLevel;
+      outZoneLow          = breachLevel - farOffset;
+      outCancelLimitPrice = outZoneLow;
+   }
+   else
+   {
+      outZoneLow          = breachLevel;
+      outZoneHigh         = breachLevel + farOffset;
+      outCancelLimitPrice = outZoneHigh;
+   }
+   return true;
+}
+
+//+------------------------------------------------------------------+
+void M15ClearImpulseBufferZoneDraw()
+{
+   if(ObjectFind(0, OBJ_IMPULSE_BUFFER) >= 0)
+      ObjectDelete(0, OBJ_IMPULSE_BUFFER);
+}
+
+//+------------------------------------------------------------------+
+void M15UpdateImpulseBufferZoneDraw()
+{
+   if(!InputDrawImpulseCancelBufferZone || !g_breachHunt.active)
+   {
+      M15ClearImpulseBufferZoneDraw();
+      return;
+   }
+
+   double zoneLow = 0.0;
+   double zoneHigh = 0.0;
+   double cancelLimitPrice = 0.0;
+   const bool isBuy = (g_breachHunt.direction == 1);
+   if(!M15BreachImpulseCancelZonePrices(isBuy, g_breachHunt.breachLevelPrice,
+                                         zoneLow, zoneHigh, cancelLimitPrice) ||
+      g_breachHunt.armedBarOpenTime == 0)
+   {
+      M15ClearImpulseBufferZoneDraw();
+      return;
+   }
+
+   datetime timeRight = iTime(_Symbol, SweepCheckTf, 0);
+   if(timeRight <= g_breachHunt.armedBarOpenTime)
+      timeRight = g_breachHunt.armedBarOpenTime + (datetime)PeriodSeconds(SweepCheckTf);
+
+   const datetime timeLeft = g_breachHunt.armedBarOpenTime;
+   if(ObjectFind(0, OBJ_IMPULSE_BUFFER) < 0)
+   {
+      if(!ObjectCreate(0, OBJ_IMPULSE_BUFFER, OBJ_RECTANGLE, 0, timeLeft, zoneHigh, timeRight, zoneLow))
+         return;
+   }
+   else
+   {
+      ObjectSetInteger(0, OBJ_IMPULSE_BUFFER, OBJPROP_TIME, 0, timeLeft);
+      ObjectSetDouble(0, OBJ_IMPULSE_BUFFER, OBJPROP_PRICE, 0, zoneHigh);
+      ObjectSetInteger(0, OBJ_IMPULSE_BUFFER, OBJPROP_TIME, 1, timeRight);
+      ObjectSetDouble(0, OBJ_IMPULSE_BUFFER, OBJPROP_PRICE, 1, zoneLow);
+   }
+   ObjectSetInteger(0, OBJ_IMPULSE_BUFFER, OBJPROP_COLOR, InputImpulseCancelBufferColor);
+   ObjectSetInteger(0, OBJ_IMPULSE_BUFFER, OBJPROP_STYLE, STYLE_SOLID);
+   ObjectSetInteger(0, OBJ_IMPULSE_BUFFER, OBJPROP_WIDTH, 2);
+   ObjectSetInteger(0, OBJ_IMPULSE_BUFFER, OBJPROP_FILL, false);
+   ObjectSetInteger(0, OBJ_IMPULSE_BUFFER, OBJPROP_BACK, true);
+   ObjectSetInteger(0, OBJ_IMPULSE_BUFFER, OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, OBJ_IMPULSE_BUFFER, OBJPROP_HIDDEN, false);
+   ObjectSetInteger(0, OBJ_IMPULSE_BUFFER, OBJPROP_TIMEFRAMES, OBJ_ALL_PERIODS);
+}
+
+//+------------------------------------------------------------------+
+void M15RefreshHuntHud()
+{
+   if(!InputShowHuntHud)
+   {
+      ObjectDelete(0, OBJ_HUNT_HUD);
+      return;
+   }
+
+   if(ObjectFind(0, OBJ_HUNT_HUD) < 0)
+   {
+      if(!ObjectCreate(0, OBJ_HUNT_HUD, OBJ_LABEL, 0, 0, 0))
+         return;
+      ObjectSetInteger(0, OBJ_HUNT_HUD, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+      ObjectSetInteger(0, OBJ_HUNT_HUD, OBJPROP_ANCHOR, ANCHOR_LEFT_UPPER);
+      ObjectSetInteger(0, OBJ_HUNT_HUD, OBJPROP_XDISTANCE, 6);
+      ObjectSetInteger(0, OBJ_HUNT_HUD, OBJPROP_YDISTANCE, 18);
+      ObjectSetString(0, OBJ_HUNT_HUD, OBJPROP_FONT, "Tahoma");
+      ObjectSetInteger(0, OBJ_HUNT_HUD, OBJPROP_SELECTABLE, false);
+      ObjectSetInteger(0, OBJ_HUNT_HUD, OBJPROP_HIDDEN, false);
+   }
+
+   string txt  = "v2 hunt: OFF";
+   color  clr  = clrSilver;
+   if(g_breachHunt.active)
+   {
+      const string dirTxt = (g_breachHunt.direction == 1 ? "bull BUY" : "bear SELL");
+      txt = StringFormat("v2 hunt: ON %s lvl=%.5f",
+                         dirTxt, g_breachHunt.breachLevelPrice);
+      clr = (g_breachHunt.direction == 1 ? clrLime : clrOrangeRed);
+   }
+   else if(g_breachHuntLastDisarmReason != "")
+   {
+      txt = "v2 hunt: OFF — " + g_breachHuntLastDisarmReason;
+   }
+
+   ObjectSetString(0, OBJ_HUNT_HUD, OBJPROP_TEXT, txt);
+   ObjectSetInteger(0, OBJ_HUNT_HUD, OBJPROP_COLOR, clr);
+   ObjectSetInteger(0, OBJ_HUNT_HUD, OBJPROP_FONTSIZE, 9);
+}
+
+//+------------------------------------------------------------------+
+void M15DisarmBreachHunt(const string reason = "")
+{
+   if(g_breachHunt.active && reason != "")
+      Print("SCALP_V2 hunt OFF: ", reason);
+
+   if(reason != "")
+      g_breachHuntLastDisarmReason = reason;
+
+   g_breachHunt.active                        = false;
+   g_breachHunt.direction                     = 0;
+   g_breachHunt.breachLevelPrice              = 0.0;
+   g_breachHunt.volumeBarOpenTime             = 0;
+   g_breachHunt.armedBarOpenTime              = 0;
+   g_breachHunt.pathMinLowSinceArmed          = 0.0;
+   g_breachHunt.pathMaxHighSinceArmed         = 0.0;
+   g_breachHunt.impulseCloseExtremeSinceArmed = 0.0;
+
+   M15ClearImpulseBufferZoneDraw();
+   M15RefreshHuntHud();
+}
+
+//+------------------------------------------------------------------+
+void M15ArmBreachHuntFromSweep(const M15LegVolumeBreachRecord &rec,
+                                const datetime sweptBarOpenTime,
+                                const double barHigh, const double barLow,
+                                const double barClose)
+{
+   if(rec.swingDirection != 1 && rec.swingDirection != -1)
+      return;
+
+   g_breachHuntLastDisarmReason               = "";
+   g_breachHunt.active                        = true;
+   g_breachHunt.direction                     = rec.swingDirection;
+   g_breachHunt.breachLevelPrice              = rec.breachLevelPrice;
+   g_breachHunt.volumeBarOpenTime             = rec.volumeBarOpenTime;
+   g_breachHunt.armedBarOpenTime              = sweptBarOpenTime;
+   g_breachHunt.pathMinLowSinceArmed          = barLow;
+   g_breachHunt.pathMaxHighSinceArmed         = barHigh;
+   g_breachHunt.impulseCloseExtremeSinceArmed = barClose;
+
+   const double prevHigh = iHigh(_Symbol, SweepCheckTf, 2);
+   const double prevLow    = iLow(_Symbol, SweepCheckTf, 2);
+   if(prevLow > 0.0)
+      g_breachHunt.pathMinLowSinceArmed = MathMin(g_breachHunt.pathMinLowSinceArmed, prevLow);
+   if(prevHigh > 0.0)
+      g_breachHunt.pathMaxHighSinceArmed = MathMax(g_breachHunt.pathMaxHighSinceArmed, prevHigh);
+
+   Print("SCALP_V2 hunt ON: ",
+         (rec.swingDirection == 1 ? "bull" : "bear"),
+         " breach=", DoubleToString(rec.breachLevelPrice, _Digits),
+         " bar=", TimeToString(sweptBarOpenTime, TIME_DATE | TIME_MINUTES));
+
+   M15UpdateImpulseBufferZoneDraw();
+   M15RefreshHuntHud();
+}
+
+//+------------------------------------------------------------------+
+bool M15TryImpulseCancelHunt(const double barClose, string &outDetail)
+{
+   outDetail = "";
+   if(!g_breachHunt.active || barClose <= 0.0)
+      return false;
+
+   double impulseZoneLow = 0.0;
+   double impulseZoneHigh = 0.0;
+   double impulseCancelLimitPrice = 0.0;
+   const bool isBuy = (g_breachHunt.direction == 1);
+   if(!M15BreachImpulseCancelZonePrices(isBuy, g_breachHunt.breachLevelPrice,
+                                         impulseZoneLow, impulseZoneHigh, impulseCancelLimitPrice))
+      return false;
+
+   if(isBuy)
+   {
+      g_breachHunt.impulseCloseExtremeSinceArmed =
+         MathMin(g_breachHunt.impulseCloseExtremeSinceArmed, barClose);
+      if(g_breachHunt.impulseCloseExtremeSinceArmed < impulseCancelLimitPrice)
+      {
+         outDetail = StringFormat("impulse cancel close=%.5f limit=%.5f (%.1f%% of %d M15 rng)",
+                                  barClose, impulseCancelLimitPrice,
+                                  InputImpulseCancelBufferPercentChart,
+                                  InputBreachExpiryM15BarCount);
+         return true;
+      }
+      return false;
+   }
+
+   g_breachHunt.impulseCloseExtremeSinceArmed =
+      MathMax(g_breachHunt.impulseCloseExtremeSinceArmed, barClose);
+   if(g_breachHunt.impulseCloseExtremeSinceArmed > impulseCancelLimitPrice)
+   {
+      outDetail = StringFormat("impulse cancel close=%.5f limit=%.5f (%.1f%% of %d M15 rng)",
+                               barClose, impulseCancelLimitPrice,
+                               InputImpulseCancelBufferPercentChart,
+                               InputBreachExpiryM15BarCount);
+      return true;
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+bool M2BarIsBullishAtShift(const int barShift)
+{
+   return iClose(_Symbol, SweepCheckTf, barShift) > iOpen(_Symbol, SweepCheckTf, barShift);
+}
+
+//+------------------------------------------------------------------+
+bool M2BarIsBearishAtShift(const int barShift)
+{
+   return iClose(_Symbol, SweepCheckTf, barShift) < iOpen(_Symbol, SweepCheckTf, barShift);
+}
+
+//+------------------------------------------------------------------+
+bool M2DetectBullishEngulfFootprint(const int candle1Shift, const int candle2Shift)
+{
+   if(candle1Shift < 1 || candle2Shift < 1)
+      return false;
+   if(!M2BarIsBearishAtShift(candle1Shift) || !M2BarIsBullishAtShift(candle2Shift))
+      return false;
+
+   const double c1Open  = iOpen(_Symbol, SweepCheckTf, candle1Shift);
+   const double c2Close = iClose(_Symbol, SweepCheckTf, candle2Shift);
+   return c2Close > c1Open;
+}
+
+//+------------------------------------------------------------------+
+bool M2DetectBearishEngulfFootprint(const int candle1Shift, const int candle2Shift)
+{
+   if(candle1Shift < 1 || candle2Shift < 1)
+      return false;
+   if(!M2BarIsBullishAtShift(candle1Shift) || !M2BarIsBearishAtShift(candle2Shift))
+      return false;
+
+   const double c1Open  = iOpen(_Symbol, SweepCheckTf, candle1Shift);
+   const double c2Close = iClose(_Symbol, SweepCheckTf, candle2Shift);
+   return c2Close < c1Open;
+}
+
+//+------------------------------------------------------------------+
+bool M2EngulfPairIsHuntPathExtreme(const bool isBuy, const double pairExtreme)
+{
+   if(pairExtreme <= 0.0 || !g_breachHunt.active)
+      return false;
+
+   const double pointSize = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   const double eps       = (pointSize > 0.0 ? pointSize * 0.5 : 0.00001);
+
+   if(isBuy)
+   {
+      if(g_breachHunt.pathMinLowSinceArmed <= 0.0)
+         return false;
+      return pairExtreme <= g_breachHunt.pathMinLowSinceArmed + eps;
+   }
+
+   if(g_breachHunt.pathMaxHighSinceArmed <= 0.0)
+      return false;
+   return pairExtreme >= g_breachHunt.pathMaxHighSinceArmed - eps;
+}
+
+//+------------------------------------------------------------------+
+bool TryDetectM2PriceBreakAboveLatestUpLegHigh(double &outBrokenLevel)
+{
+   outBrokenLevel = 0.0;
+   if(g_m2Swing.swingHistoryCount < 1)
+      return false;
+
+   const double closePrice = iClose(_Symbol, SweepCheckTf, 1);
+   const double prevClose  = iClose(_Symbol, SweepCheckTf, 2);
+   const double pointSize  = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   const double eps        = (pointSize > 0.0 ? pointSize : 0.00001);
+
+   for(int historyIndex = g_m2Swing.swingHistoryCount - 1; historyIndex >= 0; historyIndex--)
+   {
+      if(g_m2Swing.swingHistory[historyIndex].swingDirection != 1)
+         continue;
+
+      const double swingLegHighPrice = g_m2Swing.swingHistory[historyIndex].legHighPrice;
+      if(closePrice > swingLegHighPrice + eps && prevClose <= swingLegHighPrice + eps)
+      {
+         outBrokenLevel = swingLegHighPrice;
+         return true;
+      }
+      break;
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+bool TryDetectM2PriceBreakBelowLatestDownLegLow(double &outBrokenLevel)
+{
+   outBrokenLevel = 0.0;
+   if(g_m2Swing.swingHistoryCount < 1)
+      return false;
+
+   const double closePrice = iClose(_Symbol, SweepCheckTf, 1);
+   const double prevClose  = iClose(_Symbol, SweepCheckTf, 2);
+   const double pointSize  = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   const double eps        = (pointSize > 0.0 ? pointSize : 0.00001);
+
+   for(int historyIndex = g_m2Swing.swingHistoryCount - 1; historyIndex >= 0; historyIndex--)
+   {
+      if(g_m2Swing.swingHistory[historyIndex].swingDirection != -1)
+         continue;
+
+      const double swingLegLowPrice = g_m2Swing.swingHistory[historyIndex].legLowPrice;
+      if(closePrice < swingLegLowPrice - eps && prevClose >= swingLegLowPrice - eps)
+      {
+         outBrokenLevel = swingLegLowPrice;
+         return true;
+      }
+      break;
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+bool M15ComputeHuntEngulfStopLoss(const bool isBuy, const int candle1Shift, const int candle2Shift,
+                                   double &outStopLoss)
+{
+   outStopLoss = 0.0;
+   if(isBuy)
+   {
+      const double low1 = iLow(_Symbol, SweepCheckTf, candle1Shift);
+      const double low2 = iLow(_Symbol, SweepCheckTf, candle2Shift);
+      outStopLoss = MathMin(low1, low2);
+   }
+   else
+   {
+      const double high1 = iHigh(_Symbol, SweepCheckTf, candle1Shift);
+      const double high2 = iHigh(_Symbol, SweepCheckTf, candle2Shift);
+      outStopLoss = MathMax(high1, high2);
+   }
+   return outStopLoss > 0.0;
+}
+
+//+------------------------------------------------------------------+
+bool M15HuntStopsDistanceAllowed(const bool isBuy, const double entryPrice,
+                                  const double stopLoss, const double takeProfit)
+{
+   const long stopsLevel = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+   const double pointSize = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   const double minDist   = (stopsLevel > 0 && pointSize > 0.0)
+                            ? (double)stopsLevel * pointSize
+                            : 0.0;
+
+   if(minDist <= 0.0)
+      return true;
+
+   if(isBuy)
+   {
+      if(entryPrice - stopLoss < minDist)
+         return false;
+      if(takeProfit > 0.0 && takeProfit - entryPrice < minDist)
+         return false;
+   }
+   else
+   {
+      if(stopLoss - entryPrice < minDist)
+         return false;
+      if(takeProfit > 0.0 && entryPrice - takeProfit < minDist)
+         return false;
+   }
+   return true;
+}
+
+//+------------------------------------------------------------------+
+double M15LossPerLotFromTickSpec(const double entryPrice, const double stopLossPrice)
+{
+   const double slDistance = MathAbs(entryPrice - stopLossPrice);
+   if(slDistance <= 0.0)
+      return 0.0;
+
+   const double tickSize  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   const double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   if(tickSize <= 0.0 || tickValue <= 0.0)
+      return 0.0;
+
+   return (slDistance / tickSize) * tickValue;
+}
+
+//+------------------------------------------------------------------+
+double M15CalculateVolumeForUsdRisk(const bool isBuy, const double entryPrice,
+                                     const double stopLossPrice, const double riskUsd)
+{
+   if(riskUsd <= 0.0)
+      return 0.0;
+
+   const ENUM_ORDER_TYPE profitOrderType = isBuy ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+
+   double lossPerLot = 0.0;
+   double profitAtStop = 0.0;
+   if(OrderCalcProfit(profitOrderType, _Symbol, 1.0, entryPrice, stopLossPrice, profitAtStop))
+      lossPerLot = (profitAtStop < 0.0) ? -profitAtStop : profitAtStop;
+
+   if(lossPerLot <= 0.0)
+      lossPerLot = M15LossPerLotFromTickSpec(entryPrice, stopLossPrice);
+   if(lossPerLot <= 0.0)
+      return 0.0;
+
+   double volume = riskUsd / lossPerLot;
+   const double volumeStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   const double volumeMin  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   const double volumeMax  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   if(volumeStep > 0.0)
+      volume = MathFloor(volume / volumeStep) * volumeStep;
+   if(volume < volumeMin)
+      volume = volumeMin;
+   if(volume > volumeMax)
+      volume = volumeMax;
+
+   return volume;
+}
+
+//+------------------------------------------------------------------+
+bool M15TrySendHuntMarketOrder(const bool isBuy, const double stopLoss, const double takeProfit)
+{
+   if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) || !MQLInfoInteger(MQL_TRADE_ALLOWED))
+   {
+      Print("SCALP_V2 hunt trade blocked: trading not allowed");
+      return false;
+   }
+
+   const double askPrice   = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   const double bidPrice   = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   const double entryPrice = isBuy ? askPrice : bidPrice;
+   if(entryPrice <= 0.0)
+      return false;
+
+   const double lotSize =
+      M15CalculateVolumeForUsdRisk(isBuy, entryPrice, stopLoss, InputHuntRiskSize);
+   if(lotSize <= 0.0)
+   {
+      Print("SCALP_V2 hunt trade blocked: volume from risk invalid");
+      return false;
+   }
+
+   double sl = NormalizeDouble(stopLoss, _Digits);
+   double tp = (takeProfit > 0.0 ? NormalizeDouble(takeProfit, _Digits) : 0.0);
+
+   if(!M15HuntStopsDistanceAllowed(isBuy, entryPrice, sl, tp))
+   {
+      Print("SCALP_V2 hunt trade blocked: stops level");
+      return false;
+   }
+
+   MqlTradeRequest request = {};
+   MqlTradeResult  result  = {};
+   request.action    = TRADE_ACTION_DEAL;
+   request.symbol    = _Symbol;
+   request.volume    = lotSize;
+   request.type      = isBuy ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+   request.price     = entryPrice;
+   request.sl        = sl;
+   request.tp        = tp;
+   request.deviation = InputHuntSlippagePoints;
+   request.magic     = InputHuntMagicNumber;
+   request.comment   = isBuy ? "SCALP_V2_HUNT_BUY" : "SCALP_V2_HUNT_SELL";
+   request.type_filling = ORDER_FILLING_FOK;
+
+   if(!OrderSend(request, result))
+   {
+      request.type_filling = ORDER_FILLING_IOC;
+      if(!OrderSend(request, result))
+      {
+         request.type_filling = ORDER_FILLING_RETURN;
+         if(!OrderSend(request, result))
+         {
+            Print("SCALP_V2 OrderSend failed err=", GetLastError(),
+                  " retcode=", result.retcode, " comment=", result.comment);
+            return false;
+         }
+      }
+   }
+
+   if(result.retcode != TRADE_RETCODE_DONE && result.retcode != TRADE_RETCODE_PLACED &&
+      result.retcode != TRADE_RETCODE_DONE_PARTIAL)
+   {
+      Print("SCALP_V2 OrderSend retcode=", result.retcode, " comment=", result.comment);
+      return false;
+   }
+
+   Print("SCALP_V2 hunt trade placed ticket=", result.order,
+         " ", (isBuy ? "BUY" : "SELL"),
+         " entry=", DoubleToString(entryPrice, _Digits),
+         " sl=", DoubleToString(sl, _Digits),
+         (tp > 0.0 ? " tp=" + DoubleToString(tp, _Digits) : ""));
+   return true;
+}
+
+//+------------------------------------------------------------------+
+bool M15TryExecuteHuntEngulfTrade(const double barClose)
+{
+   if(!g_breachHunt.active || g_breachHunt.direction == 0)
+      return false;
+
+   const bool isBuy   = (g_breachHunt.direction == 1);
+   const int  c1Shift = 2;
+   const int  c2Shift = 1;
+
+   const bool engulfOk = isBuy
+                         ? M2DetectBullishEngulfFootprint(c1Shift, c2Shift)
+                         : M2DetectBearishEngulfFootprint(c1Shift, c2Shift);
+   if(!engulfOk)
+      return false;
+
+   const double pairExtreme = isBuy
+                              ? MathMin(iLow(_Symbol, SweepCheckTf, c1Shift),
+                                        iLow(_Symbol, SweepCheckTf, c2Shift))
+                              : MathMax(iHigh(_Symbol, SweepCheckTf, c1Shift),
+                                        iHigh(_Symbol, SweepCheckTf, c2Shift));
+   if(!M2EngulfPairIsHuntPathExtreme(isBuy, pairExtreme))
+      return false;
+
+   double stopLoss = 0.0;
+   if(!M15ComputeHuntEngulfStopLoss(isBuy, c1Shift, c2Shift, stopLoss))
+      return false;
+
+   const double entryPrice = barClose;
+   double takeProfit       = 0.0;
+   if(InputHuntRewardRiskRatio > 0.0)
+   {
+      const double risk = isBuy ? (entryPrice - stopLoss) : (stopLoss - entryPrice);
+      if(risk > 0.0)
+         takeProfit = isBuy
+                      ? entryPrice + risk * InputHuntRewardRiskRatio
+                      : entryPrice - risk * InputHuntRewardRiskRatio;
+   }
+
+   if(isBuy && entryPrice <= stopLoss)
+      return false;
+   if(!isBuy && entryPrice >= stopLoss)
+      return false;
+
+   return M15TrySendHuntMarketOrder(isBuy, stopLoss, takeProfit);
+}
+
+//+------------------------------------------------------------------+
+void ProcessBreachHuntOnM2Close(const double barHigh, const double barLow, const double barClose)
+{
+   if(!InputEnableBreachHuntTrade)
+   {
+      M15RefreshHuntHud();
+      return;
+   }
+
+   if(!g_breachHunt.active)
+   {
+      M15RefreshHuntHud();
+      return;
+   }
+
+   g_breachHunt.pathMinLowSinceArmed  = MathMin(g_breachHunt.pathMinLowSinceArmed, barLow);
+   g_breachHunt.pathMaxHighSinceArmed = MathMax(g_breachHunt.pathMaxHighSinceArmed, barHigh);
+
+   string impulseDetail = "";
+   if(M15TryImpulseCancelHunt(barClose, impulseDetail))
+   {
+      M15DisarmBreachHunt(impulseDetail);
+      return;
+   }
+
+   if(M15TryExecuteHuntEngulfTrade(barClose))
+   {
+      M15DisarmBreachHunt("engulf entry");
+      return;
+   }
+
+   double brokenLevel = 0.0;
+   if(g_breachHunt.direction == 1 && TryDetectM2PriceBreakAboveLatestUpLegHigh(brokenLevel))
+   {
+      M15DisarmBreachHunt(StringFormat("bull BOS lvl=%.5f", brokenLevel));
+      return;
+   }
+
+   if(g_breachHunt.direction == -1 && TryDetectM2PriceBreakBelowLatestDownLegLow(brokenLevel))
+   {
+      M15DisarmBreachHunt(StringFormat("bear BOS lvl=%.5f", brokenLevel));
+      return;
+   }
+
+   M15UpdateImpulseBufferZoneDraw();
+   M15RefreshHuntHud();
+}
+
+//+------------------------------------------------------------------+
 void ProcessM15BreachSweepOnM2Close()
 {
    const datetime closedBarOpenTime = iTime(_Symbol, SweepCheckTf, 1);
    if(closedBarOpenTime == 0)
       return;
 
+   ProcessM2SwingStepAtShift(g_m2Swing, 1);
+
    const double barHigh    = iHigh(_Symbol, SweepCheckTf, 1);
    const double barLow     = iLow(_Symbol, SweepCheckTf, 1);
+   const double barClose   = iClose(_Symbol, SweepCheckTf, 1);
    const double pointSize  = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
 
    for(int i = 0; i < g_m15LegVolumeBreachCount; i++)
@@ -488,7 +1158,13 @@ void ProcessM15BreachSweepOnM2Close()
       g_m15LegVolumeBreaches[i].swept = true;
       if(M15DeleteVolumeBreachRayForRecord(g_m15LegVolumeBreaches[i]))
          ChartRedraw(0);
+
+      if(InputEnableBreachHuntTrade)
+         M15ArmBreachHuntFromSweep(g_m15LegVolumeBreaches[i], closedBarOpenTime,
+                                   barHigh, barLow, barClose);
    }
+
+   ProcessBreachHuntOnM2Close(barHigh, barLow, barClose);
 }
 
 //+------------------------------------------------------------------+
@@ -555,23 +1231,14 @@ void M15RememberLegVolumeBreachRecord(const datetime legStartTime, const datetim
       return;
    }
 
-   if(g_m15LegVolumeBreachCount < M15_LEG_VOLUME_BREACH_CAPACITY)
-   {
-      M15InitLegVolumeBreachRecord(g_m15LegVolumeBreaches[g_m15LegVolumeBreachCount],
-                                   legStartTime, legEndTime, swingDirection, breachLevel,
-                                   volumeBarOpenTime, breachType);
-      g_m15LegVolumeBreachCount++;
+   const int newIndex = g_m15LegVolumeBreachCount;
+   if(ArrayResize(g_m15LegVolumeBreaches, newIndex + 1) < 0)
       return;
-   }
 
-   M15DeleteVolumeBreachRayForRecord(g_m15LegVolumeBreaches[0]);
-
-   for(int i = 1; i < M15_LEG_VOLUME_BREACH_CAPACITY; i++)
-      g_m15LegVolumeBreaches[i - 1] = g_m15LegVolumeBreaches[i];
-
-   M15InitLegVolumeBreachRecord(g_m15LegVolumeBreaches[M15_LEG_VOLUME_BREACH_CAPACITY - 1],
+   M15InitLegVolumeBreachRecord(g_m15LegVolumeBreaches[newIndex],
                                 legStartTime, legEndTime, swingDirection, breachLevel,
                                 volumeBarOpenTime, breachType);
+   g_m15LegVolumeBreachCount++;
 }
 
 //+------------------------------------------------------------------+
@@ -738,6 +1405,117 @@ void SwingExtend(SwingState &swingState, const double highPrice, const double lo
       swingState.currentSwingLeg.legHighPrice = highPrice;
    if(lowPrice < swingState.currentSwingLeg.legLowPrice)
       swingState.currentSwingLeg.legLowPrice = lowPrice;
+}
+
+//+------------------------------------------------------------------+
+void SwingStartNewBare(SwingState &swingState, const ENUM_TIMEFRAMES timeframe, const int swingDirection,
+                       const double highPrice, const double lowPrice, const int lastClosedBarShift = 1)
+{
+   swingState.currentSwingLeg.swingDirection = swingDirection;
+   swingState.currentSwingLeg.legHighPrice   = highPrice;
+   swingState.currentSwingLeg.legLowPrice    = lowPrice;
+   swingState.currentSwingLeg.legStartTime   = iTime(_Symbol, timeframe, lastClosedBarShift);
+}
+
+//+------------------------------------------------------------------+
+void SwingCloseBare(SwingState &swingState, const int lastClosedBarShift = 1)
+{
+   swingState.currentSwingLeg.legEndTime = iTime(_Symbol, SweepCheckTf, lastClosedBarShift);
+
+   if(swingState.swingHistoryCount < 20)
+   {
+      swingState.swingHistory[swingState.swingHistoryCount] = swingState.currentSwingLeg;
+      swingState.swingHistoryCount++;
+   }
+   else
+   {
+      for(int i = 1; i < 20; i++)
+         swingState.swingHistory[i - 1] = swingState.swingHistory[i];
+      swingState.swingHistory[19] = swingState.currentSwingLeg;
+   }
+}
+
+//+------------------------------------------------------------------+
+void ProcessM2SwingStepAtShift(SwingState &swingState, const int sh)
+{
+   const double lastClosedBarOpen  = iOpen(_Symbol, SweepCheckTf, sh);
+   const double lastClosedBarClose = iClose(_Symbol, SweepCheckTf, sh);
+   const double lastClosedBarHigh  = iHigh(_Symbol, SweepCheckTf, sh);
+   const double lastClosedBarLow   = iLow(_Symbol, SweepCheckTf, sh);
+
+   const int candleDirection =
+      (lastClosedBarClose > lastClosedBarOpen) ? 1
+      : ((lastClosedBarClose < lastClosedBarOpen) ? -1 : 0);
+
+   const double lastClosedBarBodyRange = MathAbs(lastClosedBarClose - lastClosedBarOpen);
+   const double lastClosedBarWickRange  = lastClosedBarHigh - lastClosedBarLow;
+
+   if(swingState.currentSwingLeg.swingDirection == 0)
+   {
+      if(candleDirection == 0)
+         return;
+      SwingStartNewBare(swingState, SweepCheckTf, candleDirection, lastClosedBarHigh, lastClosedBarLow, sh);
+      swingState.priceAnchorLevel = (lastClosedBarHigh + lastClosedBarLow) / 2.0;
+      return;
+   }
+
+   double sumRangeFivePriorBars = 0.0;
+   const int barsTotal = iBars(_Symbol, SweepCheckTf);
+   int       rangeBarCount = 0;
+   for(int barShiftIndex = sh + 1; barShiftIndex <= sh + 5; barShiftIndex++)
+   {
+      if(barShiftIndex >= barsTotal)
+         break;
+      sumRangeFivePriorBars +=
+         (iHigh(_Symbol, SweepCheckTf, barShiftIndex) - iLow(_Symbol, SweepCheckTf, barShiftIndex));
+      rangeBarCount++;
+   }
+   const double averageRangeFiveBars = (rangeBarCount > 0) ? sumRangeFivePriorBars / (double)rangeBarCount : 0.0;
+   const double minDecentRange       = averageRangeFiveBars * InputAnchorTolerance;
+   const bool isDecentMovement =
+      (lastClosedBarWickRange > minDecentRange && lastClosedBarBodyRange > minDecentRange);
+
+   if(isDecentMovement && candleDirection == swingState.currentSwingLeg.swingDirection)
+      swingState.priceAnchorLevel = (lastClosedBarHigh + lastClosedBarLow) / 2.0;
+
+   int nextSwingDirection = swingState.currentSwingLeg.swingDirection;
+   if(swingState.currentSwingLeg.swingDirection == 1 && lastClosedBarClose < swingState.priceAnchorLevel)
+      nextSwingDirection = -1;
+   else if(swingState.currentSwingLeg.swingDirection == -1 && lastClosedBarClose > swingState.priceAnchorLevel)
+      nextSwingDirection = 1;
+
+   if(nextSwingDirection == swingState.currentSwingLeg.swingDirection)
+   {
+      SwingExtend(swingState, lastClosedBarHigh, lastClosedBarLow);
+   }
+   else
+   {
+      SwingExtend(swingState, lastClosedBarHigh, lastClosedBarLow);
+      SwingCloseBare(swingState, sh);
+
+      Swing closedSwingLeg = swingState.swingHistory[swingState.swingHistoryCount - 1];
+      double newSwingLegHigh = lastClosedBarHigh;
+      double newSwingLegLow  = lastClosedBarLow;
+      if(closedSwingLeg.swingDirection == 1 && nextSwingDirection == -1)
+         newSwingLegHigh = MathMax(lastClosedBarHigh, closedSwingLeg.legHighPrice);
+      else if(closedSwingLeg.swingDirection == -1 && nextSwingDirection == 1)
+         newSwingLegLow = MathMin(lastClosedBarLow, closedSwingLeg.legLowPrice);
+
+      SwingStartNewBare(swingState, SweepCheckTf, nextSwingDirection, newSwingLegHigh, newSwingLegLow, sh);
+      swingState.priceAnchorLevel = (lastClosedBarHigh + lastClosedBarLow) / 2.0;
+   }
+}
+
+//+------------------------------------------------------------------+
+void WarmupM2SwingState(SwingState &st)
+{
+   if(InputWarmupBars <= 0)
+      return;
+
+   const int m2WarmupBars = InputWarmupBars * 8;
+   const int n = (int)MathMin(iBars(_Symbol, SweepCheckTf) - 2, m2WarmupBars);
+   for(int k = n; k >= 1; k--)
+      ProcessM2SwingStepAtShift(st, k);
 }
 
 //+------------------------------------------------------------------+
@@ -928,6 +1706,9 @@ int OnInit()
    ObjectsDeleteAll(0, PFX_M15_VOL_BREACH, -1, -1);
 
    ZeroMemory(g_m15Swing);
+   ZeroMemory(g_m2Swing);
+   M15DisarmBreachHunt();
+   ArrayResize(g_m15LegVolumeBreaches, 0);
    g_m15LegVolumeBreachCount = 0;
    g_m15PrevLegLastDecentBarOpen = 0;
    g_m15PrevClosedLegDirection = 0;
@@ -936,7 +1717,9 @@ int OnInit()
 
    WarmupSwingState(g_m15Swing, ChartTf, InputSwingTrendLineColor, PFX_M15_TREND, PFX_M15_LBL,
                     InputDrawSwingLegVisuals);
+   WarmupM2SwingState(g_m2Swing);
    ProcessM15BreachExpiryOnM15Close();
+   M15RefreshHuntHud();
 
    g_lastM15BarOpen = iTime(_Symbol, ChartTf, 0);
    g_lastM2BarOpen  = iTime(_Symbol, SweepCheckTf, 0);
@@ -949,6 +1732,8 @@ void OnDeinit(const int reason)
    ObjectsDeleteAll(0, PFX_M15_TREND, -1, -1);
    ObjectsDeleteAll(0, PFX_M15_LBL, -1, -1);
    ObjectsDeleteAll(0, PFX_M15_VOL_BREACH, -1, -1);
+   ObjectDelete(0, OBJ_HUNT_HUD);
+   ObjectDelete(0, OBJ_IMPULSE_BUFFER);
    ChartRedraw(0);
 }
 
