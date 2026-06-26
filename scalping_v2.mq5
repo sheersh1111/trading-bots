@@ -1,10 +1,20 @@
+double OnTester()
+{
+   // This creates a custom score that penalizes drawdowns heavily
+   double profit = TesterStatistics(STAT_PROFIT);
+   double drawdown = TesterStatistics(STAT_EQUITY_DDREL_PERCENT); // Max relative drawdown %
+   
+   // We want high profit AND low drawdown
+   if(drawdown == 0) return profit;
+   return profit / drawdown; 
+}
 //+------------------------------------------------------------------+
 //| scalping_v2.mq5                                                  |
 //| M15 swing legs + volume breach between consecutive decent bars.  |
 //+------------------------------------------------------------------+
 #property copyright ""
-#property version   "2.18"
-#property description "scalping_v2 — hunt impulse cancel buffer + HUD."
+#property version   "2.21"
+#property description "scalping_v2 — Forex tick volume defaults to 1 when MqlTick.volume is 0."
 
 const ENUM_TIMEFRAMES ChartTf = PERIOD_M15;
 const ENUM_TIMEFRAMES SweepCheckTf = PERIOD_M2;
@@ -13,21 +23,22 @@ input bool   InputSwitchChartToM15         = true;
 input int    InputWarmupBars               = 500;
 input bool   InputDrawSwingLegVisuals      = true;
 input color  InputSwingTrendLineColor      = clrYellow;
-input double InputAnchorTolerance          = 0.5; // × prior 5-bar avg range (wick AND body)
+input double InputAnchorTolerance          = 0.5; // Anchor Tolerance for swing leg function
 input bool   InputDrawVolumeBreachLevels   = true;
-input int    InputBreachExpiryM15BarCount    = 147; // ray width + active N M15 bars from formation bar
-input double InputInternalBreachMinBodyPctOfRange = 70.0; // body >= N% of bar range (high-low)
+input int    InputBreachExpiryM15BarCount    = 147; // Breach Expiry from formation bar
+input double InputInternalBreachMinBodyPctOfRange = 70.0; // Full body bar size condition
 
 input group "Breach sweep hunt trade"
 input bool   InputEnableBreachHuntTrade   = true;
 input double InputHuntRiskSize            = 50.0; // USD risk per hunt trade
 input ulong  InputHuntMagicNumber         = 20260225;
 input int    InputHuntSlippagePoints      = 10;
-input double InputHuntRewardRiskRatio     = 2.0; // 0 = no take profit
+input double InputHuntRewardRiskRatio     = 2.0; // Risk Reward ratio
 input bool   InputDrawImpulseCancelBufferZone = true;
 input color  InputImpulseCancelBufferColor    = clrDarkOrange;
-input double InputImpulseCancelBufferPercentChart = 2.0; // % of M15 chart height (see expiry bar count)
+input double InputImpulseCancelBufferPercentChart = 2.0; // impulse cancel buffer
 input bool   InputShowHuntHud             = true;
+input double InputHuntCvdPushMultiplier = 1.5; // multiplier for push vs wall tick delta
 
 struct Swing
 {
@@ -1030,6 +1041,426 @@ bool M15TrySendHuntMarketOrder(const bool isBuy, const double stopLoss, const do
 }
 
 //+------------------------------------------------------------------+
+double M15PriceMatchEps()
+{
+   const double pointSize = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   return (pointSize > 0.0 ? pointSize * 0.5 : 0.00001);
+}
+
+//+------------------------------------------------------------------+
+ulong M15DatetimeToMsc(const datetime dt)
+{
+   if(dt <= 0)
+      return 0;
+   return (ulong)dt * 1000UL;
+}
+
+//+------------------------------------------------------------------+
+ulong M15BarOpenMsc(const ENUM_TIMEFRAMES tf, const int shift)
+{
+   const datetime barOpen = iTime(_Symbol, tf, shift);
+   if(barOpen == 0)
+      return 0;
+   return (ulong)barOpen * 1000UL;
+}
+
+//+------------------------------------------------------------------+
+ulong M15BarCloseMsc(const ENUM_TIMEFRAMES tf, const int shift)
+{
+   const datetime barOpen = iTime(_Symbol, tf, shift);
+   if(barOpen == 0)
+      return 0;
+
+   const int periodSec = (int)PeriodSeconds(tf);
+   if(periodSec < 1)
+      return 0;
+
+   const datetime barClose = barOpen + (datetime)periodSec;
+   return (ulong)barClose * 1000UL;
+}
+
+//+------------------------------------------------------------------+
+bool M15CopyTicksRangeLogged(const ulong fromMsc, const ulong toMsc, MqlTick &ticks[], int &outTickCount)
+{
+   outTickCount = 0;
+   ArrayResize(ticks, 0);
+
+   if(fromMsc == 0 || toMsc == 0 || fromMsc >= toMsc)
+   {
+      PrintFormat("Tick Fetch Error bounds | from: %I64u to: %I64u (invalid range)",
+                  fromMsc, toMsc);
+      return false;
+   }
+
+   ResetLastError();
+   outTickCount = CopyTicksRange(_Symbol, ticks, COPY_TICKS_ALL, fromMsc, toMsc);
+   if(outTickCount < 0)
+   {
+      PrintFormat("Tick Fetch Error %d | from: %I64u to: %I64u",
+                  GetLastError(), fromMsc, toMsc);
+      return false;
+   }
+
+   return true;
+}
+
+//+------------------------------------------------------------------+
+bool M15CalcTickDeltaVolume(const ulong fromMsc, const ulong toMsc,
+                              long &outUpVol, long &outDownVol, int &outTickCount)
+{
+   outUpVol     = 0;
+   outDownVol   = 0;
+   outTickCount = 0;
+
+   MqlTick ticks[];
+   if(!M15CopyTicksRangeLogged(fromMsc, toMsc, ticks, outTickCount))
+      return false;
+   if(outTickCount < 2)
+      return false;
+
+   for(int i = 1; i < outTickCount; i++)
+   {
+      const double bid     = ticks[i].bid;
+      const double prevBid = ticks[i - 1].bid;
+      if(bid <= 0.0 || prevBid <= 0.0)
+         continue;
+
+      const double tickVol = (ticks[i].volume > 0) ? (double)ticks[i].volume : 1.0;
+
+      if(bid > prevBid)
+         outUpVol += (long)tickVol;
+      else if(bid < prevBid)
+         outDownVol += (long)tickVol;
+   }
+
+   return true;
+}
+
+//+------------------------------------------------------------------+
+bool M15FindTickTouchMscInBarWindow(const int barShift, const bool findHighTouch,
+                                     const double touchPrice, ulong &outTouchMsc)
+{
+   outTouchMsc = 0;
+   if(barShift < 0 || touchPrice <= 0.0)
+      return false;
+
+   const datetime barOpen = iTime(_Symbol, SweepCheckTf, barShift);
+   if(barOpen == 0)
+      return false;
+
+   const int periodSec = (int)PeriodSeconds(SweepCheckTf);
+   if(periodSec < 1)
+      return false;
+
+   const datetime barClose = barOpen + (datetime)periodSec;
+   const ulong fromMsc     = (ulong)barOpen * 1000UL;
+   const ulong toMsc       = (ulong)barClose * 1000UL;
+   if(fromMsc == 0 || toMsc <= fromMsc)
+      return false;
+
+   MqlTick ticks[];
+   int     tickCount = 0;
+   if(!M15CopyTicksRangeLogged(fromMsc, toMsc, ticks, tickCount))
+      return false;
+   if(tickCount < 1)
+      return false;
+
+   const double eps = M15PriceMatchEps();
+   bool         found = false;
+
+   if(findHighTouch)
+   {
+      double bestBid = -1.0e100;
+      for(int i = 0; i < tickCount; i++)
+      {
+         if(ticks[i].bid <= 0.0)
+            continue;
+         if(ticks[i].bid + eps < touchPrice)
+            continue;
+         if(!found || ticks[i].bid > bestBid)
+         {
+            bestBid     = ticks[i].bid;
+            outTouchMsc = ticks[i].time_msc;
+            found       = true;
+         }
+      }
+      return found;
+   }
+
+   double bestBid = 1.0e100;
+   for(int i = 0; i < tickCount; i++)
+   {
+      if(ticks[i].bid <= 0.0)
+         continue;
+      if(ticks[i].bid - eps > touchPrice)
+         continue;
+      if(!found || ticks[i].bid < bestBid)
+      {
+         bestBid     = ticks[i].bid;
+         outTouchMsc = ticks[i].time_msc;
+         found       = true;
+      }
+   }
+   return found;
+}
+
+//+------------------------------------------------------------------+
+bool M15FindM2ExtremeBarShiftSinceT1(const bool isBuy, const datetime t1,
+                                      const double extremePrice, int &outShift)
+{
+   outShift = -1;
+   if(t1 == 0 || extremePrice <= 0.0)
+      return false;
+
+   const double eps     = M15PriceMatchEps();
+   const int    barsTotal = iBars(_Symbol, SweepCheckTf);
+   if(barsTotal < 2)
+      return false;
+
+   for(int sh = 1; sh < barsTotal; sh++)
+   {
+      const datetime barOpen = iTime(_Symbol, SweepCheckTf, sh);
+      if(barOpen == 0 || barOpen < t1)
+         break;
+
+      if(isBuy)
+      {
+         const double barLow = iLow(_Symbol, SweepCheckTf, sh);
+         if(MathAbs(barLow - extremePrice) <= eps)
+         {
+            outShift = sh;
+            return true;
+         }
+      }
+      else
+      {
+         const double barHigh = iHigh(_Symbol, SweepCheckTf, sh);
+         if(MathAbs(barHigh - extremePrice) <= eps)
+         {
+            outShift = sh;
+            return true;
+         }
+      }
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+bool M15FindM2ApexBarShiftBetweenT1AndT2(const bool isBuy, const datetime t1,
+                                           const int t2Shift, const double targetPrice,
+                                           int &outApexShift)
+{
+   outApexShift = -1;
+   if(t1 == 0 || t2Shift < 0 || targetPrice <= 0.0)
+      return false;
+
+   const double eps       = M15PriceMatchEps();
+   const int    barsTotal = iBars(_Symbol, SweepCheckTf);
+   if(barsTotal < 2)
+      return false;
+
+   int shiftT1 = iBarShift(_Symbol, SweepCheckTf, t1, true);
+   if(shiftT1 < 0)
+      return false;
+
+   int firstQualifyingShift = -1;
+   int fallbackShift        = -1;
+   double fallbackExtreme   = isBuy ? -1.0e100 : 1.0e100;
+
+   const int startShift = MathMax(t2Shift, 1);
+   const int endShift   = MathMin(shiftT1, barsTotal - 1);
+   if(startShift > endShift)
+      return false;
+
+   for(int sh = startShift; sh <= endShift; sh++)
+   {
+      const datetime barOpen = iTime(_Symbol, SweepCheckTf, sh);
+      if(barOpen == 0 || barOpen < t1)
+         continue;
+
+      const double barHigh = iHigh(_Symbol, SweepCheckTf, sh);
+      const double barLow  = iLow(_Symbol, SweepCheckTf, sh);
+
+      if(isBuy)
+      {
+         if(barHigh > fallbackExtreme)
+         {
+            fallbackExtreme = barHigh;
+            fallbackShift   = sh;
+         }
+         if(firstQualifyingShift < 0 && barHigh + eps >= targetPrice)
+            firstQualifyingShift = sh;
+      }
+      else
+      {
+         if(barLow < fallbackExtreme)
+         {
+            fallbackExtreme = barLow;
+            fallbackShift   = sh;
+         }
+         if(firstQualifyingShift < 0 && barLow - eps <= targetPrice)
+            firstQualifyingShift = sh;
+      }
+   }
+
+   if(firstQualifyingShift >= 0)
+   {
+      outApexShift = firstQualifyingShift;
+      return true;
+   }
+
+   if(fallbackShift >= 0)
+   {
+      outApexShift = fallbackShift;
+      return true;
+   }
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
+bool M15ValidateEngulfingTickDelta(const bool isBuy, const double targetPrice, string &outDetail)
+{
+   outDetail = "CVD Fail: hunt inactive";
+   if(!g_breachHunt.active || g_breachHunt.volumeBarOpenTime == 0)
+      return false;
+
+   if(targetPrice <= 0.0)
+   {
+      outDetail = "CVD Fail: targetPrice invalid";
+      return false;
+   }
+
+   const int m15PeriodSec = (int)PeriodSeconds(ChartTf);
+   if(m15PeriodSec < 1)
+   {
+      outDetail = "CVD Fail: M15 period invalid";
+      return false;
+   }
+
+   const datetime t1 = g_breachHunt.volumeBarOpenTime + (datetime)m15PeriodSec;
+   const ulong  t1Msc = (ulong)t1 * 1000UL;
+   if(t1 == 0 || t1Msc == 0)
+   {
+      outDetail = "CVD Fail: t1 invalid";
+      return false;
+   }
+
+   const double extremePrice = isBuy
+                               ? g_breachHunt.pathMinLowSinceArmed
+                               : g_breachHunt.pathMaxHighSinceArmed;
+   if(extremePrice <= 0.0)
+   {
+      outDetail = "CVD Fail: hunt path extreme unavailable";
+      return false;
+   }
+
+   int t2Shift = -1;
+   if(!M15FindM2ExtremeBarShiftSinceT1(isBuy, t1, extremePrice, t2Shift))
+   {
+      outDetail = StringFormat("CVD Fail: t2 bar not found extreme=%.5f t1=%s",
+                               extremePrice, TimeToString(t1, TIME_DATE | TIME_MINUTES));
+      return false;
+   }
+
+   int apexShift = -1;
+   if(!M15FindM2ApexBarShiftBetweenT1AndT2(isBuy, t1, t2Shift, targetPrice, apexShift))
+   {
+      outDetail = StringFormat("CVD Fail: apex bar not found target=%.5f", targetPrice);
+      return false;
+   }
+
+   const double apexTouchPrice = isBuy
+                                 ? iHigh(_Symbol, SweepCheckTf, apexShift)
+                                 : iLow(_Symbol, SweepCheckTf, apexShift);
+   const double extremeTouchPrice = isBuy
+                                    ? iLow(_Symbol, SweepCheckTf, t2Shift)
+                                    : iHigh(_Symbol, SweepCheckTf, t2Shift);
+
+   ulong timeApexMs    = 0;
+   ulong timeExtremeMs = 0;
+   if(!M15FindTickTouchMscInBarWindow(apexShift, isBuy, apexTouchPrice, timeApexMs))
+      timeApexMs = M15BarOpenMsc(SweepCheckTf, apexShift);
+   if(timeApexMs == 0)
+   {
+      outDetail = "CVD Fail: apex tick touch not found";
+      return false;
+   }
+
+   if(!M15FindTickTouchMscInBarWindow(t2Shift, !isBuy, extremeTouchPrice, timeExtremeMs))
+      timeExtremeMs = M15BarCloseMsc(SweepCheckTf, t2Shift);
+   if(timeExtremeMs == 0)
+   {
+      outDetail = "CVD Fail: extreme tick touch not found";
+      return false;
+   }
+
+   ulong timeEngulfCloseMs = M15BarCloseMsc(SweepCheckTf, 1);
+   if(timeEngulfCloseMs == 0)
+   {
+      outDetail = "CVD Fail: engulf close ms invalid";
+      return false;
+   }
+
+   if(timeApexMs >= timeExtremeMs)
+      timeApexMs = (timeExtremeMs > 60000UL ? timeExtremeMs - 60000UL : 0UL);
+   if(timeExtremeMs >= timeEngulfCloseMs)
+      timeEngulfCloseMs = timeExtremeMs + 60000UL;
+
+   if(timeApexMs == 0 || timeApexMs >= timeExtremeMs || timeExtremeMs >= timeEngulfCloseMs)
+   {
+      outDetail = StringFormat("CVD Fail: time order apex=%s extreme=%s engulf=%s t1=%s",
+                               IntegerToString((long)timeApexMs),
+                               IntegerToString((long)timeExtremeMs),
+                               IntegerToString((long)timeEngulfCloseMs),
+                               TimeToString(t1, TIME_DATE | TIME_MINUTES));
+      return false;
+   }
+
+   long wallUpVol = 0;
+   long wallDownVol = 0;
+   int  wallTickCount = 0;
+   if(!M15CalcTickDeltaVolume(timeApexMs, timeExtremeMs, wallUpVol, wallDownVol, wallTickCount))
+   {
+      outDetail = StringFormat("CVD Fail: wall tick copy apex=%s extreme=%s",
+                               IntegerToString((long)timeApexMs),
+                               IntegerToString((long)timeExtremeMs));
+      return false;
+   }
+
+   long pushUpVol = 0;
+   long pushDownVol = 0;
+   int  pushTickCount = 0;
+   if(!M15CalcTickDeltaVolume(timeExtremeMs, timeEngulfCloseMs, pushUpVol, pushDownVol, pushTickCount))
+   {
+      outDetail = StringFormat("CVD Fail: push tick copy extreme=%s engulf=%s",
+                               IntegerToString((long)timeExtremeMs),
+                               IntegerToString((long)timeEngulfCloseMs));
+      return false;
+   }
+
+   const long wallScore = isBuy ? (wallDownVol - wallUpVol) : (wallUpVol - wallDownVol);
+   const long pushScore = isBuy ? (pushUpVol - pushDownVol) : (pushDownVol - pushUpVol);
+   const double lhs     = (double)pushScore * InputHuntCvdPushMultiplier;
+   const double rhs     = (double)wallScore;
+
+   PrintFormat("CVD Debug: WallTicks=%d PushTicks=%d | WallVol=%.0f PushVol=%.0f | apex=%I64u extreme=%I64u engulf=%I64u",
+               wallTickCount, pushTickCount, (double)wallScore, (double)pushScore,
+               timeApexMs, timeExtremeMs, timeEngulfCloseMs);
+
+   if(lhs > rhs)
+   {
+      outDetail = StringFormat("CVD Pass: Push(%lld*%.1f=%.0f) > Wall(%lld)",
+                               pushScore, InputHuntCvdPushMultiplier, lhs, wallScore);
+      return true;
+   }
+
+   outDetail = StringFormat("CVD Fail: Push(%lld*%.1f=%.0f) <= Wall(%lld)",
+                            pushScore, InputHuntCvdPushMultiplier, lhs, wallScore);
+   return false;
+}
+
+//+------------------------------------------------------------------+
 bool M15TryExecuteHuntEngulfTrade(const double barClose)
 {
    if(!g_breachHunt.active || g_breachHunt.direction == 0)
@@ -1072,6 +1503,14 @@ bool M15TryExecuteHuntEngulfTrade(const double barClose)
       return false;
    if(!isBuy && entryPrice >= stopLoss)
       return false;
+
+   string cvdDetail = "";
+   if(!M15ValidateEngulfingTickDelta(isBuy, takeProfit, cvdDetail))
+   {
+      Print("SCALP_V2 ", cvdDetail);
+      return false;
+   }
+   Print("SCALP_V2 ", cvdDetail);
 
    return M15TrySendHuntMarketOrder(isBuy, stopLoss, takeProfit);
 }
