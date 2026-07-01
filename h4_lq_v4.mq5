@@ -1,6 +1,40 @@
 //+------------------------------------------------------------------+
 //| h4_lq_v3.mq5                                                      |
 //| H4 breach hunt + M2 Engulfing Volume Absorption entry model       |
+//| v3.58: purge all chart rects per slot + orphan sweep; fix stale rects on slot reuse |
+//| v3.57: per-TF bar-close cleanup deletes mitigated/expired zone + FVG chart objects |
+//| v3.56: zone rect width = InputSmcZoneExpiryBars from zoneOriginBarTime (matches expiry) |
+//| v3.55: breach on wick or close-through; same-bar breach+mitigate; isActive=false on mitigate |
+//| v3.54: persistent zone ledger — no destructive refresh; additive registration; multi swing zones + FIFO |
+//| v3.53: leg-close flag from swing step; leg-close draws only new zone; sync rects; bias then mitigate per zone |
+//| v3.52: leg-close detected via swing history count; force fresh zone state on leg registration |
+//| v3.51: leg-close bar — register swing zone only; skip clear/breach/bias/mitigation for all zones |
+//| v3.50: swing zones always at leg close (no price filter); no unbroken overwrite; persist unmitigated ledger zones |
+//| v3.49: zone isBreached on wick entry; bias then mitigate only after breached + close outside |
+//| v3.47: zone mitigation — enter zone (wick) then close outside only (any direction); preserve swing ledger |
+//| v3.46: HTF bias — BOS sets direction; same-TF zone touch + close outside sets direction on bar close |
+//| v3.45: MTF direction HUD (W1/D1/H4/M15) replaces H4-only bias HUD |
+//| v3.44: keep all MTF FVG instances in lookback until mitigated or expired (not latest-only) |
+//| v3.43: MTF SMC FVG zone = gap itself; 1% inset on price-facing edge (not M2/swing liq. bands) |
+//| v3.41: register bull zones only below price, bear zones only above current price |
+//| v3.40: SMC zone rectangles per TF follow InputDrawMtfSwingLegs* toggles |
+//| v3.39: swing zones — completed legs only; skip active (open) leg extremes |
+//| v3.38: swing zones — dedicated slots + directional mitigation (no instant mitigate on leg-close bar) |
+//| v3.37: fix swing zones on leg close — violation only after leg end; register last closed leg |
+//| v3.36: per-TF inputs to draw MTF swing legs (W1/D1/H4/M15) on leg close |
+//| v3.35: per-TF MTF swing leg API — completed-leg highs/lows + unified replay step |
+//| v3.34: remove narrative H4 swing — H4 legs/BOS/pivots use MTF SMC tracker only |
+//| v3.33: SMC zone chart object names include TF tag (W1/D1/H4/M15) |
+//| v3.32: liquidity zones — high=[high, high+buffer], low=[low-buffer, low] (one-sided 10%) |
+//| v3.31: HTF professional bias — BOS default + zone mitigation/reversal override (W1/D1/H4) |
+//| v3.59: OptimizationData.csv logs score+context+all confluence weight inputs per valid setup |
+//| v3.30: log setup scores to ScoreDistribution.csv before score gate on valid M2 sweep pattern |
+//| v3.29: entry requires setupScore >= InputMinScore (signed; 0 blocks negative) |
+//| v3.28: optional hollow rectangles for active SMC zones |
+//| v3.27: SMC zones register/mitigate/expire on each zone TF bar close only |
+//| v3.26: risk metrics logged inline in GetOptimizedLotSize (no extra helper functions) |
+//| v3.25: log clampedRatio and riskPercent alongside setupScore on trade placement |
+//| v3.24: remove pre-entry TP3 pending-order cancel (market entry replaces limit-only guard) |
 //| v3.23: zone expiry — inactive for score after N bars on zone timeframe (default 292) |
 //| v3.22: zone mitigation — exit zone (reverse or break) excludes from score |
 //| v3.21: unbroken swing highs/lows as resistance/support in zone matrix (28 zones) |
@@ -26,7 +60,7 @@
 //| v3.01: exhaustion leg filter — min leg range % of M2 chart height (replaces min bar count) |
 //| v3.00: replace M2 touch/FVG with engulfing vol absorption + exhaustion gate |
 //+------------------------------------------------------------------+
-#define H4_LQ_V3_VERSION "3.23"
+#define H4_LQ_V3_VERSION "3.59"
 // Breach record array + hunt arming: uncomment next line to re-enable.
 // #define H4_LQ_VOLUME_BREACH_ENABLED
 #property copyright ""
@@ -39,13 +73,9 @@ input group "Tester performance"
 input bool   InputFastTesterMode = false; // true: no hunt logs, no chart objects/HUDs (faster backtest)
 
 input group "Narrative timeframes"
-input ENUM_TIMEFRAMES InputH4NarrativeTimeframe = PERIOD_H4; // primary: breach legs, BOS, liquidity pivots
-input ENUM_TIMEFRAMES InputM2NarrativeTimeframe  = PERIOD_M2;  // secondary: FVG, hunt, entry management
+input ENUM_TIMEFRAMES InputM2NarrativeTimeframe  = PERIOD_M2;  // FVG, hunt, entry management (H4 via MTF SMC)
 
 input bool   InputSwitchChartToH4       = true;
-input int    InputWarmupBars             = 500;  // 0 = off: replay closed H4 bars on attach
-input bool   InputDrawH4SwingLegVisuals = true;
-input color  InputH4SwingTrendLineColor = clrGold;
 
 input bool   InputDrawM2SwingLegs        = false; // chart trend lines/labels only; does not disable M2 swing or hunt logic
 input color  InputM2SwingLineColor       = clrMediumPurple;
@@ -65,7 +95,6 @@ input bool   InputLogHuntEvents          = true;  // Experts tab: hunt / engulf 
 
 input group "H4 BOS trade direction bias"
 input bool   InputEnableH4BosTradeDirectionBias = true;  // trade with last H4 close-cross BOS (bull/bear)
-input bool   InputShowH4BosBiasHud              = true;  // top-right â†‘ green / â†“ red (plot_swing_m2 style)
 
 const double H4_BREACH_ANCHOR_MULTIPLIER = 0.2; // wick+body vs prior 5-bar avg â€” breaches / hunt / liquidity pivots
 const double M2_SWING_ANCHOR_MULTIPLIER  = 1.0; // M2 body vs prior 5-bar avg (plot_swing_h1_m5_copy)
@@ -98,9 +127,21 @@ input int    InputEngulfSweepCountdownBars      = 2;   // M2 bars: sweep ref swi
 input group "MTF SMC confluence engine"
 input bool   InputEnableMtfSmcEngine           = true;
 input int    InputSmcFvgLookbackBars           = 50;  // W1/D1/H4/M15: scan last N bars for 3-bar FVGs
-input double InputSmcBrokenLevelBufferPercentChart = 10.0; // broken/protected swing zone half-width = N% of TF chart height
+input double InputSmcFvgZonePriceFacingInsetPercentChart = 1.0; // trim MTF FVG top (bull) / bottom (bear) by N% of TF chart height — price-facing edge
+input double InputSmcBrokenLevelBufferPercentChart = 10.0; // liquidity zone extension = N% of TF chart height above highs / below lows
 input int    InputSmcMtfWarmupBars             = 300; // 0=off: replay MTF swings on attach
 input int    InputSmcZoneExpiryBars            = 292; // zone expires when older than N bars on its TF
+
+input group "MTF swing leg chart visuals"
+input bool   InputDrawMtfSwingLegsW1   = false; // W1 swing legs + SMC zone rectangles
+input color  InputMtfSwingLegColorW1   = clrSilver;
+input bool   InputDrawMtfSwingLegsD1   = false; // D1 swing legs + SMC zone rectangles
+input color  InputMtfSwingLegColorD1   = clrDodgerBlue;
+input bool   InputDrawMtfSwingLegsH4   = true;  // H4 swing legs + SMC zone rectangles
+input color  InputMtfSwingLegColorH4   = clrGold;
+input bool   InputDrawMtfSwingLegsM15  = false; // M15 swing legs + SMC zone rectangles
+input color  InputMtfSwingLegColorM15  = clrMediumSeaGreen;
+input bool   InputShowMtfDirectionHud  = true;  // top-right W1/D1/H4/M15 professional bias arrows
 
 input group "Confluence Scoring Weights"
 input int    InputWeight_WeeklyFVG             = 10;
@@ -112,7 +153,7 @@ input int    InputWeight_Protected             = 4;
 input int    InputWeight_SwingResistance       = 5;  // unbroken swing high (bear liquidity)
 input int    InputWeight_SwingSupport          = 5;  // unbroken swing low (bull liquidity)
 input double InputClusterMultiplier            = 1.5;
-input double InputMinScore                     = 0.0;  // min |CalculateTotalTradeScore| to allow entry; 0=off
+input double InputMinScore                     = 0.0;  // min signed setupScore to allow entry; 0=block score<0
 input double InputBaseRiskPercent            = 1.0;  // equity % at max score; scaled by |score|/scoreMax
 
 input group "Timeframe Alignment Weights"
@@ -236,7 +277,7 @@ struct SMCZoneRecord
    bool               isActive;
    bool               isClustered;
    bool               isMitigated;
-   bool               priceWasInsideZone;
+   bool               isBreached;
    bool               isExpired;
    datetime           zoneOriginBarTime;
 };
@@ -248,12 +289,28 @@ struct SMCZoneMitigationLedgerEntry
    double             topPrice;
    double             bottomPrice;
    bool               isMitigated;
-   bool               priceWasInsideZone;
+   bool               isBreached;
    bool               isExpired;
    datetime           zoneOriginBarTime;
 };
 
-#define SMC_ZONE_MITIGATION_LEDGER_CAPACITY (SMC_ZONE_TYPE_COUNT * 2)
+#define SMC_ZONE_LEDGER_CAPACITY              256
+#define SMC_ZONE_MITIGATION_LEDGER_CAPACITY   (SMC_ZONE_LEDGER_CAPACITY * 2)
+
+struct SMCMtfFvgInstance
+{
+   bool               inUse;
+   ENUM_SMC_ZONE_TYPE type;
+   ENUM_TIMEFRAMES    timeframe;
+   double             topPrice;
+   double             bottomPrice;
+   bool               isMitigated;
+   bool               isBreached;
+   bool               isExpired;
+   datetime           zoneOriginBarTime;
+};
+
+#define SMC_MTF_FVG_INSTANCE_CAPACITY 256
 
 struct MTFSwingTracker
 {
@@ -267,11 +324,31 @@ struct MTFSwingTracker
    double          lastBrokenLegLow;
 };
 
+#define BIAS_BULLISH  1
+#define BIAS_BEARISH -1
+
+struct ProfessionalBiasOverrideState
+{
+   int      overrideBias;     // current TF direction: 1 bull / -1 bear / 0 unset
+   datetime overrideTime;     // TF bar open when direction last changed
+};
+
+ProfessionalBiasOverrideState g_profBiasOverrideW1;
+ProfessionalBiasOverrideState g_profBiasOverrideD1;
+ProfessionalBiasOverrideState g_profBiasOverrideH4;
+ProfessionalBiasOverrideState g_profBiasOverrideM15;
+
 #define LiquidityPoolCapacity 32
 
-const string ChartObjectNamePrefixH4SwingTrendLine = "LQ2_H4_Swing_";
-const string ChartObjectNamePrefixH4SwingLabelText = "LQ2_H4_SWLBL_";
 const string ChartObjectNamePrefixH4VolumeBreachRay = "LQ2_H4_VOL_BREACH_";
+const string PFX_MTF_W1_TR  = "LQ2_MTF_W1_TR_";
+const string PFX_MTF_W1_LBL = "LQ2_MTF_W1_LB_";
+const string PFX_MTF_D1_TR  = "LQ2_MTF_D1_TR_";
+const string PFX_MTF_D1_LBL = "LQ2_MTF_D1_LB_";
+const string PFX_MTF_H4_TR  = "LQ2_MTF_H4_TR_";
+const string PFX_MTF_H4_LBL = "LQ2_MTF_H4_LB_";
+const string PFX_MTF_M15_TR  = "LQ2_MTF_M15_TR_";
+const string PFX_MTF_M15_LBL = "LQ2_MTF_M15_LB_";
 const color  H4_VOLUME_BREACH_RAY_COLOR_UP   = clrGreen;
 const color  H4_VOLUME_BREACH_RAY_COLOR_DOWN = clrDeepPink;
 const int    H4_VOLUME_BREACH_RAY_ZORDER     = 128;
@@ -280,8 +357,12 @@ const string PFX_M2_LBL    = "LQ2_M2_LB_";
 const string PFX_M2_ANCHOR = "LQ2_M2_AN_";
 const string LQ_OBJ_PREFIX_FVG_RECT = "LQ2_M2_FVG_";
 const string LQ_OBJ_PREFIX_FVG_LBL  = "LQ2_M2_FVGT_";
-const string LQ_OBJ_HUNT_HUD        = "LQ2_HUNT_HUD";
-const string LQ_OBJ_H4_BIAS_HUD    = "LQ4_H4_BIAS";
+const string LQ_OBJ_PREFIX_SMC_ZONE_RECT = "LQ2_SMCZ_";
+const string LQ_OBJ_HUNT_HUD           = "LQ2_HUNT_HUD";
+const string LQ_OBJ_MTF_BIAS_HUD_W1    = "LQ4_MTF_BIAS_W1";
+const string LQ_OBJ_MTF_BIAS_HUD_D1    = "LQ4_MTF_BIAS_D1";
+const string LQ_OBJ_MTF_BIAS_HUD_H4    = "LQ4_MTF_BIAS_H4";
+const string LQ_OBJ_MTF_BIAS_HUD_M15   = "LQ4_MTF_BIAS_M15";
 const string LQ_OBJ_IMPULSE_BUFFER  = "LQ2_IMPULSE_BUF";
 const string LQ_OBJ_TOUCH_POINT     = "LQ2_TOUCH_PT";
 const string LQ_OBJ_IMPULSE_PREFIX      = "LQ2_IMPULSE_BUF_";
@@ -372,13 +453,9 @@ int                          g_h4LegVolumeBreachCount = 0;
 H4ActiveLegVolumeBreachTrack g_h4ActiveLegVolumeTrack;
 #endif // H4_LQ_VOLUME_BREACH_ENABLED
 
-SwingState     g_h4Swing;     // anchor 0.5 — chart legs, liquidity pivots     // anchor 0.5 â€” breaches, chart legs, liquidity pivots
-SwingState     g_h4BosSwing;  // anchor 1.0 â€” BOS close-cross levels only (no visuals)
 SwingState     g_m2Swing;
 LiquidityPool  g_liquidityPools[LiquidityPoolCapacity];
 int            g_liquidityPoolCount = 0;
-
-datetime g_lastH4BarOpen = 0;
 datetime g_lastM2BarOpen  = 0;
 
 MTFSwingTracker g_mtfSwingW1;
@@ -389,10 +466,12 @@ datetime        g_lastMtfBarOpenW1  = 0;
 datetime        g_lastMtfBarOpenD1  = 0;
 datetime        g_lastMtfBarOpenH4  = 0;
 datetime        g_lastMtfBarOpenM15 = 0;
-SMCZoneRecord   g_activeZones[SMC_ZONE_TYPE_COUNT];
+SMCZoneRecord   g_activeZones[SMC_ZONE_LEDGER_CAPACITY];
 SMCZoneMitigationLedgerEntry g_zoneMitigationLedger[SMC_ZONE_MITIGATION_LEDGER_CAPACITY];
+SMCMtfFvgInstance g_mtfFvgInstances[SMC_MTF_FVG_INSTANCE_CAPACITY];
 
 #include "ConfluenceScoring.mqh"
+#include "ScoreLogger.mqh"
 
 V2HuntSession g_v2Hunts[V2_MAX_HUNT_SESSIONS];
 
@@ -449,13 +528,15 @@ void   SwingStartNew(SwingState &swingState, const ENUM_TIMEFRAMES timeframe, co
 void   SwingExtend(SwingState &swingState, const double highPrice, const double lowPrice);
 void   DrawSwingLegLabel(const string chartObjectNamePrefix, const datetime labelBarTime,
                          const double labelPrice, const bool isUplegSwingDirection, const int keyLevelIdForLabel);
+bool   MtfSwingLegDrawEnabled(const ENUM_TIMEFRAMES timeframe);
+color  MtfSwingLegLineColor(const ENUM_TIMEFRAMES timeframe);
+void   MtfSwingLegObjectPrefixes(const ENUM_TIMEFRAMES timeframe, string &trendPrefix, string &labelPrefix);
+void   DrawMtfClosedSwingLegVisual(const Swing &leg, const ENUM_TIMEFRAMES timeframe);
+void   DeleteMtfSwingLegChartObjects();
 void   SwingCloseH4Context(SwingState &swingState, const ENUM_TIMEFRAMES timeframe,
                             const int lastClosedBarShift = 1);
-void   ProcessH4SwingStep(const int lastClosedBarShift = 1);
-void   ProcessH4BosSwingStep(const int lastClosedBarShift = 1);
 void   SwingCloseH4ToHistory(SwingState &swingState, const ENUM_TIMEFRAMES timeframe,
                               const int lastClosedBarShift = 1);
-void   WarmupH4SwingFromHistory();
 
 void   SwingCloseM2Leg(SwingState &swingState, const ENUM_TIMEFRAMES timeframe, const color swingLineColor,
                        const string chartObjectNamePrefix, const string labelPrefix,
@@ -468,9 +549,47 @@ void   ProcessSwingStepAtShift(SwingState &swingState, const ENUM_TIMEFRAMES tim
                                const bool replayOnly = false);
 void   UpdateMTFSwings();
 void   UpdateSMCZoneMatrix();
+void   SMCResetMtfFvgInstances();
+void   SMCUpdateMtfFvgInstancesMitigationForTimeframe(const ENUM_TIMEFRAMES timeframe);
+void   SMCExpireMtfFvgInstancesForTimeframe(const ENUM_TIMEFRAMES timeframe);
+void   SMCDeleteMtfFvgZoneRectanglesForTimeframe(const ENUM_TIMEFRAMES timeframe);
+void   SMCDrawMtfFvgZoneRectanglesForTimeframe(const ENUM_TIMEFRAMES timeframe);
+void   SMCClearActiveZonesForTimeframe(const ENUM_TIMEFRAMES timeframe);
+void   SMCRefreshZonesForTimeframe(const ENUM_TIMEFRAMES timeframe, MTFSwingTracker &tracker,
+                                      const bool legClosedThisBar);
+void   SMCRegisterSwingZoneFromJustClosedLeg(const MTFSwingTracker &tracker,
+                                                const ENUM_SMC_ZONE_TYPE bullSwingLowType,
+                                                const ENUM_SMC_ZONE_TYPE bearSwingHighType,
+                                                int &outRegisteredSlot);
+void   SMCSeedSwingZonesFromHistory(const MTFSwingTracker &tracker,
+                                       const ENUM_SMC_ZONE_TYPE bullSwingLowType,
+                                       const ENUM_SMC_ZONE_TYPE bearSwingHighType);
+void   SMCApplyZoneExitBiasAndMitigationForTimeframe(const ENUM_TIMEFRAMES timeframe);
+void   SMCAdvanceZoneBreachLedgerOnBarClose(const ENUM_TIMEFRAMES timeframe);
+void   SMCExpireZonesPastBarLimitForTimeframe(const ENUM_TIMEFRAMES timeframe);
+void   SMCDeleteZoneRectanglesForTimeframe(const ENUM_TIMEFRAMES timeframe);
+string SMCZoneRectangleObjectNameForSlot(const int slotIndex);
+void   SMCDeleteZoneRectangleForSlot(const int slotIndex);
+void   SMCDrawZoneRectangleForSlot(const int slotIndex);
+void   SMCDeactivateZoneLedgerSlot(const int slotIndex);
+void   SMCDeleteAllZoneRectangleObjectsForSlot(const int slotIndex);
+void   SMCCleanupMitigatedExpiredZoneChartObjectsForTimeframe(const ENUM_TIMEFRAMES timeframe);
+void   SMCSyncZoneRectanglesForTimeframe(const ENUM_TIMEFRAMES timeframe);
+void   SMCDeleteMtfFvgRectangleForInstance(const ENUM_SMC_ZONE_TYPE zoneType,
+                                              const datetime originBarTime);
+void   SMCSyncMtfFvgZoneRectanglesForTimeframe(const ENUM_TIMEFRAMES timeframe);
+void   SMCDrawZoneRectanglesForTimeframe(const ENUM_TIMEFRAMES timeframe);
+int    RegisterOrMergeZone(const ENUM_SMC_ZONE_TYPE newType, const double top, const double bottom,
+                              const datetime originBarTime, const bool forceFreshZoneState);
 void   WarmupMTFSwingsFromHistory();
+int    GetProfessionalBias(const ENUM_TIMEFRAMES timeframe);
+void   ResetProfessionalBiasOverrideState();
+void   ProfessionalBiasSetDirection(const ENUM_TIMEFRAMES timeframe, const int bias,
+                                       const datetime setBarOpen);
+void   SMCUpdateProfessionalBiasFromZoneBarClose(const ENUM_TIMEFRAMES timeframe);
 int    GetZoneTimeframeStrength(const ENUM_SMC_ZONE_TYPE type);
-void   RegisterOrMergeZone(const ENUM_SMC_ZONE_TYPE newType, const double top, const double bottom);
+void   SMCRegisterLiquidityHighZone(const ENUM_SMC_ZONE_TYPE type, const double level, const double buffer);
+void   SMCRegisterLiquidityLowZone(const ENUM_SMC_ZONE_TYPE type, const double level, const double buffer);
 void   SMCMapUnbrokenSwingZones(const MTFSwingTracker &tracker,
                                  const ENUM_SMC_ZONE_TYPE bullSwingLowType,
                                  const ENUM_SMC_ZONE_TYPE bearSwingHighType);
@@ -478,6 +597,7 @@ void   SMCUpdateActiveZonesMitigation();
 void   SMCExpireZonesPastBarLimit();
 double CalculateTotalTradeScore(const bool isBullishTrade);
 double GetMaxPossibleScore();
+bool   SetupScoreAllowsTradeEntry(const double setupScore);
 double GetOptimizedLotSize(const double entryPrice, const double stopLoss, const double score,
                             const bool isBuy, const double riskUsdFraction = 1.0);
 ENUM_TIMEFRAMES SMCZoneTypeToTimeframe(const ENUM_SMC_ZONE_TYPE type);
@@ -514,12 +634,21 @@ bool   TryDetectFairValueGapPatternOnLastClosedBarM2(bool &isBullishFairValueGap
                                                       double &fairValueGapZoneHighPrice);
 bool   DetectFairValueGapOnLastClosedBarM2(bool &isBullishFairValueGap, double &fairValueGapZoneLowPrice,
                                          double &fairValueGapZoneHighPrice);
-bool   TryLatestH4CompletedUpLegHigh(double &outHigh);
-bool   TryLatestH4CompletedDownLegLow(double &outLow);
-bool   TrySecondLastH4CompletedUpLegHigh(double &outHigh);
-bool   TrySecondLastH4CompletedDownLegLow(double &outLow);
-bool   TryNthH4CompletedSwingLeg(const int swingDirection, const int nFromLatest,
-                                  double &outLegHigh, double &outLegLow, datetime &outLegEndTime);
+bool   MtfIsSwingTimeframe(const ENUM_TIMEFRAMES timeframe);
+bool   MtfCopySwingState(const ENUM_TIMEFRAMES timeframe, SwingState &outSwingState);
+bool   MtfTryNthCompletedSwingLeg(const ENUM_TIMEFRAMES timeframe, const int swingDirection,
+                                   const int nFromLatest,
+                                   double &outLegHigh, double &outLegLow,
+                                   datetime &outLegStartTime, datetime &outLegEndTime);
+bool   MtfTryLatestCompletedUpLegHigh(const ENUM_TIMEFRAMES timeframe, double &outHigh,
+                                       datetime &outLegEndTime);
+bool   MtfTryLatestCompletedDownLegLow(const ENUM_TIMEFRAMES timeframe, double &outLow,
+                                        datetime &outLegEndTime);
+bool   MtfTryLatestUnbrokenSwingHigh(const ENUM_TIMEFRAMES timeframe, double &outLevel);
+bool   MtfTryLatestUnbrokenSwingLow(const ENUM_TIMEFRAMES timeframe, double &outLevel);
+bool   MtfTryDetectBosCrossOnBar(const ENUM_TIMEFRAMES timeframe, const int barShift,
+                                  int &outDirection, double &outBrokenLevel,
+                                  datetime &outBarOpenTime, datetime &outLegEndTime);
 bool   TryGetH4LegBarOpenTimeFromEnd(const datetime legStartTime, const datetime legEndTime,
                                       const int nFromEnd, datetime &outBarOpenTime);
 bool   FindMaxVolumeH4BarBetweenOpenTimes(const datetime rangeStartOpen, const datetime rangeEndOpen,
@@ -613,7 +742,8 @@ bool   M2WickCrossesIntoH4DownBreachBuffer(const double bandLow, const double ba
 int    GetH4TradeDirectionBias(); // 1 bull, -1 bear, 0 undefined/mixed/disabled-filter
 void   LogH4TradeDirectionBiasIfChanged();
 bool   FvgTradeAllowedByH4BosBias(const bool isBullishFairValueGap, string &outBlockReason);
-void   RefreshH4BosBiasHud();
+void   DeleteMtfDirectionHudObjects();
+void   RefreshMtfDirectionHud();
 #ifdef H4_LQ_VOLUME_BREACH_ENABLED
 bool   M2WickCrossesAboveLevel(const double level, const double barHigh, const double prevHigh,
                                const double pointSize);
@@ -644,6 +774,11 @@ void   V2DrawHuntFairValueGapZone(const int huntIndex, const bool isBullishFairV
 void   ProcessHuntEngulfingOnM2BarClose();
 void   V3ProcessM2SwingSweepSetupsOnBarClose();
 void   V3RunM2SwingSweepScansOnBarClose(const double barClose);
+bool   V3M2SwingSweepSetupPatternValid(const bool isBuy, const double barClose);
+bool   V3M2SwingSweepSetupPatternValidCore(const bool isBuy, const double barClose,
+                                             double &outStopLoss, datetime &outSignalBarOpen,
+                                             double &outRefLevel, int &outCountdown,
+                                             string &outExhaustDetail);
 void   V3TryScanM2SwingSweepSetup(const bool isBuy, const double barClose, const double setupScore);
 void   V2ProcessOneActiveHuntOnM2Bar(const int huntIndex, const double pointSize,
                                      const double barClose, const double barHigh, const double barLow,
@@ -792,7 +927,6 @@ void   RegisterHuntTradeAfterSuccessfulPlace(const bool isBuy, const double entr
                                                const double preEntryCancelTpLevel,
                                                const datetime fvgFormationTime,
                                                const datetime huntSessionId);
-void   CheckHuntPreEntryTp3CancelOnTick();
 void   CheckHuntFvgBeyondChartRangeCancelOnTick();
 bool   IsOurHuntPendingOrderTicket(const ulong orderTicket);
 bool   TryParseFormationTimeFromHuntOrderComment(const string orderComment, datetime &outFormationTime);
@@ -806,10 +940,6 @@ bool   V2TrySyncPreEntryWatchForSession(const datetime sessionId, const int hunt
                                        double &outTp3Level, double &outEntryPrice);
 bool   V2TrySyncPreEntryWatchForHunt(const int huntIndex, int &outPendingCount);
 void   V2RefreshGlobalHuntTradeWatchFromSessions();
-bool   TrySyncHuntPreEntryWatchFromPendingOrders(int &outPendingCount);
-bool   HuntMarketReachedTakeProfitLevel(const bool isBuy, const double takeProfitLevel);
-bool   SameDirectionM2BosBetweenEntryAndTp3Since(const bool isBuy, const double entryPrice,
-                                                  const double tp3Level, const datetime sinceTime);
 bool   ComputeAbsorptionLegTakeProfits(const bool isBullishFairValueGap, const double entryPrice,
                                        const double legRange, double &outTakeProfitPrices[]);
 int    V4TradeLegDirectionForFvg(const bool isBullishFairValueGap);
@@ -850,12 +980,11 @@ int OnInit()
 {
    if(InputSwitchChartToH4 && !InputFastTesterMode)
    {
-      ChartSetSymbolPeriod(0, _Symbol, InputH4NarrativeTimeframe);
+      ChartSetSymbolPeriod(0, _Symbol, PERIOD_H4);
       ChartRedraw(0);
    }
 
-   ObjectsDeleteAll(0, ChartObjectNamePrefixH4SwingTrendLine, -1, -1);
-   ObjectsDeleteAll(0, ChartObjectNamePrefixH4SwingLabelText, -1, -1);
+   DeleteMtfSwingLegChartObjects();
    ObjectsDeleteAll(0, ChartObjectNamePrefixH4VolumeBreachRay, -1, -1);
    ObjectsDeleteAll(0, PFX_M2_TREND, -1, -1);
    ObjectsDeleteAll(0, PFX_M2_LBL, -1, -1);
@@ -869,8 +998,6 @@ int OnInit()
    ObjectsDeleteAll(0, LQ_OBJ_TRADE_SWGRP_RECT_PREFIX, -1, -1);
    ObjectsDeleteAll(0, LQ_OBJ_TRADE_SWGRP_LINE_PREFIX, -1, -1);
 
-   ZeroMemory(g_h4Swing);
-   ZeroMemory(g_h4BosSwing);
    ZeroMemory(g_m2Swing);
    g_liquidityPoolCount = 0;
 
@@ -880,11 +1007,12 @@ int OnInit()
    H4ResetActiveLegVolumeBreachTrack();
 #endif
    ResetH4BosBiasState();
+   ResetProfessionalBiasOverrideState();
    ResetHuntTradeState();
 
-   WarmupH4SwingFromHistory();
    WarmupM2SwingFromHistory();
    WarmupMTFSwingsFromHistory();
+   SMCResetActiveZones();
    UpdateSMCZoneMatrix();
    ResetH4BosBiasState();
 #ifdef H4_LQ_VOLUME_BREACH_ENABLED
@@ -895,7 +1023,6 @@ int OnInit()
    g_h4LastLoggedEffectiveBias = GetH4TradeDirectionBias();
    g_h4EffectiveBiasLogReady   = true;
 
-   g_lastH4BarOpen = iTime(_Symbol, InputH4NarrativeTimeframe, 0);
    g_lastM2BarOpen  = iTime(_Symbol, InputM2NarrativeTimeframe, 0);
    if(InputEnableMtfSmcEngine)
    {
@@ -910,9 +1037,8 @@ int OnInit()
 
    if(H4LqLoggingEnabled())
    {
-      PrintFormat("%s v%s | primary=%s secondary=%s fastTester=%s",
+      PrintFormat("%s v%s | H4=MTF_SMC M2=%s fastTester=%s",
                   H4_LQ_LOG_PREFIX, H4_LQ_V3_VERSION,
-                  EnumToString(InputH4NarrativeTimeframe),
                   EnumToString(InputM2NarrativeTimeframe),
                   InputFastTesterMode ? "Y" : "N");
    }
@@ -920,27 +1046,25 @@ int OnInit()
    if(H4LqChartDrawEnabled())
    {
       RefreshLiquidityHuntHud();
-      RefreshH4BosBiasHud();
+      RefreshMtfDirectionHud();
       ChartRedraw(0);
    }
-   EventSetTimer(1);
    return(INIT_SUCCEEDED);
 }
 
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
-   EventKillTimer();
-   ObjectsDeleteAll(0, ChartObjectNamePrefixH4SwingTrendLine, -1, -1);
-   ObjectsDeleteAll(0, ChartObjectNamePrefixH4SwingLabelText, -1, -1);
+   DeleteMtfSwingLegChartObjects();
    ObjectsDeleteAll(0, ChartObjectNamePrefixH4VolumeBreachRay, -1, -1);
    ObjectsDeleteAll(0, PFX_M2_TREND, -1, -1);
    ObjectsDeleteAll(0, PFX_M2_LBL, -1, -1);
    ObjectsDeleteAll(0, PFX_M2_ANCHOR, -1, -1);
    ObjectsDeleteAll(0, LQ_OBJ_PREFIX_FVG_RECT, -1, -1);
    ObjectsDeleteAll(0, LQ_OBJ_PREFIX_FVG_LBL, -1, -1);
+   ObjectsDeleteAll(0, LQ_OBJ_PREFIX_SMC_ZONE_RECT, -1, -1);
    ObjectDelete(0, LQ_OBJ_HUNT_HUD);
-   ObjectDelete(0, LQ_OBJ_H4_BIAS_HUD);
+   DeleteMtfDirectionHudObjects();
    ObjectsDeleteAll(0, LQ_OBJ_IMPULSE_PREFIX, -1, -1);
    ObjectsDeleteAll(0, LQ_OBJ_TOUCH_RECALC_PREFIX, -1, -1);
    ObjectsDeleteAll(0, LQ_OBJ_TOUCH_POINT, -1, -1);
@@ -949,38 +1073,13 @@ void OnDeinit(const int reason)
 }
 
 //+------------------------------------------------------------------+
-void OnTimer()
-{
-   CheckHuntPreEntryTp3CancelOnTick();
-}
-
-//+------------------------------------------------------------------+
 void OnTick()
 {
-   CheckHuntPreEntryTp3CancelOnTick();
    UpdateMTFSwings();
    if(H4LqChartDrawEnabled())
    {
       UpdateM2SwingAnchorVisualRealtime(g_m2Swing);
       UpdateM2LiveSwingLegVisualOnTick();
-   }
-
-   const datetime tH4 = iTime(_Symbol, InputH4NarrativeTimeframe, 0);
-   if(tH4 != g_lastH4BarOpen)
-   {
-      g_lastH4BarOpen = tH4;
-      ProcessH4SwingStep(1);
-      ProcessH4BosSwingStep(1);
-      RebuildH4LiquidityPivotLevels();
-      ProcessH4BosOnH4Close(1);
-#ifdef H4_LQ_VOLUME_BREACH_ENABLED
-      if(H4LqChartDrawEnabled(InputDrawH4SwingLegVisuals))
-         RebuildAllH4VolumeBreachMarkers();
-#endif
-      if(InputEnableH4BosTradeDirectionBias)
-         LogH4TradeDirectionBiasIfChanged();
-      if(H4LqChartDrawEnabled(InputShowH4BosBiasHud))
-         RefreshH4BosBiasHud();
    }
 
    const datetime tM2 = iTime(_Symbol, InputM2NarrativeTimeframe, 0);
@@ -991,31 +1090,13 @@ void OnTick()
          ProcessHuntEngulfingOnM2BarClose();
 #ifdef H4_LQ_VOLUME_BREACH_ENABLED
       UpdateH4LegLiquidityBreachMemoryOnM2Bar();
-      if(H4LqChartDrawEnabled(InputDrawH4SwingLegVisuals))
+      if(H4LqChartDrawEnabled(InputDrawMtfSwingLegsH4))
          RebuildAllH4VolumeBreachMarkers();
 #endif
       ProcessM2SwingStep();
       ManageHuntOpenPositionsOnM2BarClose();
       if(H4LqChartDrawEnabled(InputShowLiquidityHuntHud))
          RefreshLiquidityHuntHud();
-   }
-}
-
-//+------------------------------------------------------------------+
-void WarmupH4SwingFromHistory()
-{
-   if(InputWarmupBars <= 0)
-      return;
-   const int bars = iBars(_Symbol, InputH4NarrativeTimeframe);
-   const int n = (int)MathMin(bars - 2, InputWarmupBars);
-   if(n < 1)
-      return;
-   for(int k = n; k >= 1; k--)
-   {
-      ProcessH4SwingStep(k);
-      ProcessH4BosSwingStep(k);
-      RebuildH4LiquidityPivotLevels();
-      ProcessH4BosOnH4Close(k);
    }
 }
 
@@ -1110,6 +1191,123 @@ void DrawSwingLegLabel(const string chartObjectNamePrefix, const datetime labelB
    ObjectSetInteger(0, chartObjectName, OBJPROP_SELECTABLE, false);
    ObjectSetInteger(0, chartObjectName, OBJPROP_HIDDEN, false);
    ObjectSetInteger(0, chartObjectName, OBJPROP_TIMEFRAMES, OBJ_ALL_PERIODS);
+}
+
+//+------------------------------------------------------------------+
+void DeleteMtfSwingLegChartObjects()
+{
+   ObjectsDeleteAll(0, PFX_MTF_W1_TR, -1, -1);
+   ObjectsDeleteAll(0, PFX_MTF_W1_LBL, -1, -1);
+   ObjectsDeleteAll(0, PFX_MTF_D1_TR, -1, -1);
+   ObjectsDeleteAll(0, PFX_MTF_D1_LBL, -1, -1);
+   ObjectsDeleteAll(0, PFX_MTF_H4_TR, -1, -1);
+   ObjectsDeleteAll(0, PFX_MTF_H4_LBL, -1, -1);
+   ObjectsDeleteAll(0, PFX_MTF_M15_TR, -1, -1);
+   ObjectsDeleteAll(0, PFX_MTF_M15_LBL, -1, -1);
+}
+
+//+------------------------------------------------------------------+
+bool MtfSwingLegDrawEnabled(const ENUM_TIMEFRAMES timeframe)
+{
+   if(!H4LqChartDrawEnabled())
+      return false;
+   switch(timeframe)
+   {
+      case PERIOD_W1:  return InputDrawMtfSwingLegsW1;
+      case PERIOD_D1:  return InputDrawMtfSwingLegsD1;
+      case PERIOD_H4:  return InputDrawMtfSwingLegsH4;
+      case PERIOD_M15: return InputDrawMtfSwingLegsM15;
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+color MtfSwingLegLineColor(const ENUM_TIMEFRAMES timeframe)
+{
+   switch(timeframe)
+   {
+      case PERIOD_W1:  return InputMtfSwingLegColorW1;
+      case PERIOD_D1:  return InputMtfSwingLegColorD1;
+      case PERIOD_H4:  return InputMtfSwingLegColorH4;
+      case PERIOD_M15: return InputMtfSwingLegColorM15;
+   }
+   return clrSilver;
+}
+
+//+------------------------------------------------------------------+
+void MtfSwingLegObjectPrefixes(const ENUM_TIMEFRAMES timeframe, string &trendPrefix, string &labelPrefix)
+{
+   trendPrefix = "";
+   labelPrefix = "";
+   switch(timeframe)
+   {
+      case PERIOD_W1:
+         trendPrefix = PFX_MTF_W1_TR;
+         labelPrefix = PFX_MTF_W1_LBL;
+         break;
+      case PERIOD_D1:
+         trendPrefix = PFX_MTF_D1_TR;
+         labelPrefix = PFX_MTF_D1_LBL;
+         break;
+      case PERIOD_H4:
+         trendPrefix = PFX_MTF_H4_TR;
+         labelPrefix = PFX_MTF_H4_LBL;
+         break;
+      case PERIOD_M15:
+         trendPrefix = PFX_MTF_M15_TR;
+         labelPrefix = PFX_MTF_M15_LBL;
+         break;
+   }
+}
+
+//+------------------------------------------------------------------+
+void DrawMtfClosedSwingLegVisual(const Swing &leg, const ENUM_TIMEFRAMES timeframe)
+{
+   if(!MtfSwingLegDrawEnabled(timeframe) || leg.swingDirection == 0 || leg.legStartTime == 0 || leg.legEndTime == 0)
+      return;
+
+   string trendPrefix = "";
+   string labelPrefix = "";
+   MtfSwingLegObjectPrefixes(timeframe, trendPrefix, labelPrefix);
+   if(trendPrefix == "" || labelPrefix == "")
+      return;
+
+   const string chartObjectName =
+      trendPrefix + IntegerToString((long)leg.legStartTime) + "_" + IntegerToString((long)leg.legEndTime);
+
+   double trendLineStartPrice;
+   double trendLineEndPrice;
+   if(leg.swingDirection == 1)
+   {
+      trendLineStartPrice = leg.legLowPrice;
+      trendLineEndPrice   = leg.legHighPrice;
+   }
+   else
+   {
+      trendLineStartPrice = leg.legHighPrice;
+      trendLineEndPrice   = leg.legLowPrice;
+   }
+
+   datetime tRightDraw = leg.legEndTime;
+   if(tRightDraw <= leg.legStartTime)
+      tRightDraw = leg.legStartTime + (datetime)PeriodSeconds(timeframe);
+
+   if(ObjectFind(0, chartObjectName) >= 0)
+      ObjectDelete(0, chartObjectName);
+
+   if(ObjectCreate(0, chartObjectName, OBJ_TREND, 0, leg.legStartTime, trendLineStartPrice,
+                   tRightDraw, trendLineEndPrice))
+   {
+      ObjectSetInteger(0, chartObjectName, OBJPROP_COLOR, MtfSwingLegLineColor(timeframe));
+      ObjectSetInteger(0, chartObjectName, OBJPROP_WIDTH, 1);
+      ObjectSetInteger(0, chartObjectName, OBJPROP_RAY_RIGHT, false);
+      ObjectSetInteger(0, chartObjectName, OBJPROP_SELECTABLE, false);
+      ObjectSetInteger(0, chartObjectName, OBJPROP_HIDDEN, false);
+      ObjectSetInteger(0, chartObjectName, OBJPROP_TIMEFRAMES, OBJ_ALL_PERIODS);
+   }
+
+   const bool isUplegSwingDirection = (leg.swingDirection == 1);
+   DrawSwingLegLabel(labelPrefix, leg.legEndTime, trendLineEndPrice, isUplegSwingDirection, 0);
 }
 
 //+------------------------------------------------------------------+
@@ -1356,8 +1554,7 @@ void ProcessSwingStepAtShift(SwingState &swingState, const ENUM_TIMEFRAMES timef
    }
    const double averageRangeFiveBars = (rangeBarCount > 0) ? sumRangeFivePriorBars / (double)rangeBarCount : 0.0;
 
-   const double anchorDecentMovementMultiplier =
-      (timeframe == InputH4NarrativeTimeframe) ? 0.5 : 0.2;
+   const double anchorDecentMovementMultiplier = 0.2; // M2 body vs prior 5-bar avg
    const double minDecentRange = averageRangeFiveBars * anchorDecentMovementMultiplier;
    const bool isDecentMovement =
       (timeframe == InputM2NarrativeTimeframe)
@@ -1429,43 +1626,8 @@ void SwingCloseH4Context(SwingState &swingState, const ENUM_TIMEFRAMES timeframe
    const bool   isSupplyPool  = (swingState.currentSwingLeg.swingDirection == 1);
    PushLiquidityPoolFromClosedSwing(poolLowPrice, poolHighPrice, isSupplyPool);
 
-   if(H4LqChartDrawEnabled(InputDrawH4SwingLegVisuals))
-   {
-      const string chartObjectName =
-         ChartObjectNamePrefixH4SwingTrendLine + IntegerToString((long)swingState.currentSwingLeg.legEndTime);
-
-      double trendLineStartPrice;
-      double trendLineEndPrice;
-      if(swingState.currentSwingLeg.swingDirection == 1)
-      {
-         trendLineStartPrice = swingState.currentSwingLeg.legLowPrice;
-         trendLineEndPrice   = swingState.currentSwingLeg.legHighPrice;
-      }
-      else
-      {
-         trendLineStartPrice = swingState.currentSwingLeg.legHighPrice;
-         trendLineEndPrice   = swingState.currentSwingLeg.legLowPrice;
-      }
-
-      datetime tRightDraw = swingState.currentSwingLeg.legEndTime;
-      if(tRightDraw <= swingState.currentSwingLeg.legStartTime)
-         tRightDraw = swingState.currentSwingLeg.legStartTime + (datetime)PeriodSeconds(timeframe);
-
-      if(ObjectCreate(0, chartObjectName, OBJ_TREND, 0, swingState.currentSwingLeg.legStartTime,
-                      trendLineStartPrice, tRightDraw, trendLineEndPrice))
-      {
-         ObjectSetInteger(0, chartObjectName, OBJPROP_COLOR, InputH4SwingTrendLineColor);
-         ObjectSetInteger(0, chartObjectName, OBJPROP_WIDTH, 1);
-         ObjectSetInteger(0, chartObjectName, OBJPROP_RAY_RIGHT, false);
-         ObjectSetInteger(0, chartObjectName, OBJPROP_SELECTABLE, false);
-         ObjectSetInteger(0, chartObjectName, OBJPROP_HIDDEN, false);
-         ObjectSetInteger(0, chartObjectName, OBJPROP_TIMEFRAMES, OBJ_ALL_PERIODS);
-      }
-
-      const bool isUplegSwingDirection = (swingState.currentSwingLeg.swingDirection == 1);
-      DrawSwingLegLabel(ChartObjectNamePrefixH4SwingLabelText, swingState.currentSwingLeg.legEndTime,
-                        trendLineEndPrice, isUplegSwingDirection, 0);
-   }
+   if(lastClosedBarShift == 1)
+      DrawMtfClosedSwingLegVisual(swingState.currentSwingLeg, timeframe);
 
    if(swingState.swingHistoryCount < 20)
    {
@@ -1486,6 +1648,9 @@ void SwingCloseH4ToHistory(SwingState &swingState, const ENUM_TIMEFRAMES timefra
 {
    swingState.currentSwingLeg.legEndTime = iTime(_Symbol, timeframe, lastClosedBarShift);
 
+   if(lastClosedBarShift == 1)
+      DrawMtfClosedSwingLegVisual(swingState.currentSwingLeg, timeframe);
+
    if(swingState.swingHistoryCount < 20)
    {
       swingState.swingHistory[swingState.swingHistoryCount] = swingState.currentSwingLeg;
@@ -1497,139 +1662,6 @@ void SwingCloseH4ToHistory(SwingState &swingState, const ENUM_TIMEFRAMES timefra
          swingState.swingHistory[swingHistoryIndex - 1] = swingState.swingHistory[swingHistoryIndex];
       swingState.swingHistory[19] = swingState.currentSwingLeg;
    }
-}
-
-//+------------------------------------------------------------------+
-void ProcessH4SwingStepCore(SwingState &swingState, const int lastClosedBarShift,
-                             const double anchorMultiplier, const bool useWickAndBodyForDecent,
-                             const bool withBreachSideEffects)
-{
-   const ENUM_TIMEFRAMES timeframe = InputH4NarrativeTimeframe;
-   const int         sh            = lastClosedBarShift;
-
-   const double lastClosedBarOpen  = iOpen(_Symbol, timeframe, sh);
-   const double lastClosedBarClose = iClose(_Symbol, timeframe, sh);
-   const double lastClosedBarHigh  = iHigh(_Symbol, timeframe, sh);
-   const double lastClosedBarLow   = iLow(_Symbol, timeframe, sh);
-
-   const int candleDirection =
-      (lastClosedBarClose > lastClosedBarOpen) ? 1
-      : ((lastClosedBarClose < lastClosedBarOpen) ? -1 : 0);
-
-   const double lastClosedBarBodyRange = MathAbs(lastClosedBarClose - lastClosedBarOpen);
-   const double lastClosedBarWickRange  = lastClosedBarHigh - lastClosedBarLow;
-
-   if(swingState.currentSwingLeg.swingDirection == 0)
-   {
-      if(candleDirection == 0)
-         return;
-      SwingStartNew(swingState, timeframe, candleDirection, lastClosedBarHigh, lastClosedBarLow, sh);
-      swingState.priceAnchorLevel = (lastClosedBarHigh + lastClosedBarLow) / 2.0;
-#ifdef H4_LQ_VOLUME_BREACH_ENABLED
-      if(withBreachSideEffects)
-         H4OnH4ActiveLegStarted(swingState, sh);
-#endif
-      return;
-   }
-
-   double sumRangeFivePriorBars = 0.0;
-   const int barsTotal = iBars(_Symbol, timeframe);
-   int       rangeBarCount = 0;
-   for(int barShiftIndex = sh + 1; barShiftIndex <= sh + 5; barShiftIndex++)
-   {
-      if(barShiftIndex >= barsTotal)
-         break;
-      sumRangeFivePriorBars +=
-         (iHigh(_Symbol, timeframe, barShiftIndex) - iLow(_Symbol, timeframe, barShiftIndex));
-      rangeBarCount++;
-   }
-   const double averageRangeFiveBars = (rangeBarCount > 0) ? sumRangeFivePriorBars / (double)rangeBarCount : 0.0;
-   const double minDecentRange       = averageRangeFiveBars * anchorMultiplier;
-   const bool isDecentMovement =
-      useWickAndBodyForDecent
-      ? (lastClosedBarWickRange > minDecentRange && lastClosedBarBodyRange > minDecentRange)
-      : (lastClosedBarWickRange > minDecentRange);
-
-   const double anchorForFlipCheck = swingState.priceAnchorLevel;
-   int nextSwingDirection = swingState.currentSwingLeg.swingDirection;
-   if(swingState.currentSwingLeg.swingDirection == 1 && lastClosedBarClose < anchorForFlipCheck)
-      nextSwingDirection = -1;
-   else if(swingState.currentSwingLeg.swingDirection == -1 && lastClosedBarClose > anchorForFlipCheck)
-      nextSwingDirection = 1;
-
-   if(nextSwingDirection == swingState.currentSwingLeg.swingDirection)
-   {
-      if(isDecentMovement && candleDirection == swingState.currentSwingLeg.swingDirection)
-         swingState.priceAnchorLevel = (lastClosedBarHigh + lastClosedBarLow) / 2.0;
-
-      SwingExtend(swingState, lastClosedBarHigh, lastClosedBarLow);
-#ifdef H4_LQ_VOLUME_BREACH_ENABLED
-      if(withBreachSideEffects)
-      {
-         if(g_h4ActiveLegVolumeTrack.legStartTime != swingState.currentSwingLeg.legStartTime)
-            H4OnH4ActiveLegStarted(swingState, sh);
-         else
-            H4OnH4ActiveLegBarClosed(swingState, sh);
-      }
-#endif
-      return;
-   }
-
-   SwingExtend(swingState, lastClosedBarHigh, lastClosedBarLow);
-
-#ifdef H4_LQ_VOLUME_BREACH_ENABLED
-   if(withBreachSideEffects)
-      H4OnH4ActiveLegBarClosed(swingState, sh);
-
-   if(withBreachSideEffects)
-      SwingCloseH4Context(swingState, timeframe, sh);
-   else
-      SwingCloseH4ToHistory(swingState, timeframe, sh);
-
-   Swing closedSwingLeg = swingState.swingHistory[swingState.swingHistoryCount - 1];
-   if(withBreachSideEffects)
-   {
-      H4FinalizeActiveLegVolumeBreach(closedSwingLeg);
-      V2OnH4LegClosedForHunts(closedSwingLeg.swingDirection, closedSwingLeg.legEndTime);
-   }
-#else
-   SwingCloseH4ToHistory(swingState, timeframe, sh);
-   Swing closedSwingLeg = swingState.swingHistory[swingState.swingHistoryCount - 1];
-#endif
-
-   double newSwingLegHigh = lastClosedBarHigh;
-   double newSwingLegLow  = lastClosedBarLow;
-   if(closedSwingLeg.swingDirection == 1 && nextSwingDirection == -1)
-      newSwingLegHigh = MathMax(lastClosedBarHigh, closedSwingLeg.legHighPrice);
-   else if(closedSwingLeg.swingDirection == -1 && nextSwingDirection == 1)
-      newSwingLegLow = MathMin(lastClosedBarLow, closedSwingLeg.legLowPrice);
-
-   SwingStartNew(swingState, timeframe, nextSwingDirection, newSwingLegHigh, newSwingLegLow, sh);
-   swingState.priceAnchorLevel = (lastClosedBarHigh + lastClosedBarLow) / 2.0;
-#ifdef H4_LQ_VOLUME_BREACH_ENABLED
-   if(withBreachSideEffects)
-      H4OnH4ActiveLegStarted(swingState, sh);
-#endif
-}
-
-//+------------------------------------------------------------------+
-//| H4 breach/hunt swing legs: anchor 0.5 (wick + body vs prior 5-bar avg). |
-//+------------------------------------------------------------------+
-void ProcessH4SwingStep(const int lastClosedBarShift = 1)
-{
-#ifndef H4_LQ_VOLUME_BREACH_ENABLED
-   ProcessH4SwingStepCore(g_h4Swing, lastClosedBarShift, H4_BREACH_ANCHOR_MULTIPLIER, true, false);
-#else
-   ProcessH4SwingStepCore(g_h4Swing, lastClosedBarShift, H4_BREACH_ANCHOR_MULTIPLIER, true, true);
-#endif
-}
-
-//+------------------------------------------------------------------+
-//| H4 BOS swing legs: anchor 1.0 (full range vs prior 5-bar avg), memory only. |
-//+------------------------------------------------------------------+
-void ProcessH4BosSwingStep(const int lastClosedBarShift = 1)
-{
-   ProcessH4SwingStepCore(g_h4BosSwing, lastClosedBarShift, H4_BOS_ANCHOR_MULTIPLIER, false, false);
 }
 
 //+------------------------------------------------------------------+
@@ -1673,62 +1705,14 @@ void RefreshLiquidityHuntHud()
 }
 
 //+------------------------------------------------------------------+
-//| H4 BOS cross: close cross vs latest same-dir leg on g_h4BosSwing (anchor 1.0). |
+//| H4 trade BOS — delegates to per-TF MTF swing leg BOS detect.     |
 //+------------------------------------------------------------------+
 bool TryDetectH4BosCrossOnBar(const int h4BarShift, int &outDirection,
                                double &outBrokenLevel, datetime &outBarOpenTime,
                                datetime &outLegEndTime)
 {
-   outDirection   = 0;
-   outBrokenLevel = 0.0;
-   outBarOpenTime = 0;
-   outLegEndTime  = 0;
-
-   if(h4BarShift < 0 || g_h4BosSwing.swingHistoryCount < 1)
-      return false;
-
-   const ENUM_TIMEFRAMES tf = InputH4NarrativeTimeframe;
-   const double closePrice  = iClose(_Symbol, tf, h4BarShift);
-   const double prevClose   = iClose(_Symbol, tf, h4BarShift + 1);
-   const double pointSize   = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-
-   outBarOpenTime = iTime(_Symbol, tf, h4BarShift);
-   if(outBarOpenTime == 0)
-      return false;
-
-   for(int historyIndex = g_h4BosSwing.swingHistoryCount - 1; historyIndex >= 0; historyIndex--)
-   {
-      if(g_h4BosSwing.swingHistory[historyIndex].swingDirection != 1)
-         continue;
-
-      const double legHigh = g_h4BosSwing.swingHistory[historyIndex].legHighPrice;
-      if(closePrice > legHigh + pointSize && prevClose <= legHigh + pointSize)
-      {
-         outDirection   = 1;
-         outBrokenLevel = legHigh;
-         outLegEndTime  = g_h4BosSwing.swingHistory[historyIndex].legEndTime;
-         return true;
-      }
-      break;
-   }
-
-   for(int historyIndex = g_h4BosSwing.swingHistoryCount - 1; historyIndex >= 0; historyIndex--)
-   {
-      if(g_h4BosSwing.swingHistory[historyIndex].swingDirection != -1)
-         continue;
-
-      const double legLow = g_h4BosSwing.swingHistory[historyIndex].legLowPrice;
-      if(closePrice < legLow - pointSize && prevClose >= legLow - pointSize)
-      {
-         outDirection   = -1;
-         outBrokenLevel = legLow;
-         outLegEndTime  = g_h4BosSwing.swingHistory[historyIndex].legEndTime;
-         return true;
-      }
-      break;
-   }
-
-   return false;
+   return MtfTryDetectBosCrossOnBar(PERIOD_H4, h4BarShift, outDirection, outBrokenLevel,
+                                    outBarOpenTime, outLegEndTime);
 }
 
 //+------------------------------------------------------------------+
@@ -1743,7 +1727,7 @@ bool H4BosCloseHoldsBeyondLevel(const int direction, const int h4BarShift, const
    if(direction != 1 && direction != -1)
       return false;
 
-   const double closePrice = iClose(_Symbol, InputH4NarrativeTimeframe, h4BarShift);
+   const double closePrice = iClose(_Symbol, PERIOD_H4, h4BarShift);
    const double pointSize  = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
    const double eps        = (pointSize > 0.0 ? pointSize : 0.00001);
 
@@ -1807,7 +1791,7 @@ void TryConfirmH4BosPendingOnBarClose(const int h4BarShift)
    const double   brokenLevel     = g_h4BosPendingConfirm.brokenLevel;
    const datetime legEndTime      = g_h4BosPendingConfirm.legEndTime;
    const datetime breakBarOpenTime = g_h4BosPendingConfirm.breakBarOpenTime;
-   const datetime confirmBarOpenTime = iTime(_Symbol, InputH4NarrativeTimeframe, h4BarShift);
+   const datetime confirmBarOpenTime = iTime(_Symbol, PERIOD_H4, h4BarShift);
 
    ClearH4BosPendingConfirm();
 
@@ -1837,7 +1821,7 @@ void TryConfirmH4BosPendingOnBarClose(const int h4BarShift)
                                 direction == 1 ? "bull" : "bear",
                                 TimeToString(breakBarOpenTime, TIME_DATE | TIME_MINUTES),
                                 TimeToString(confirmBarOpenTime, TIME_DATE | TIME_MINUTES),
-                                iClose(_Symbol, InputH4NarrativeTimeframe, h4BarShift),
+                                iClose(_Symbol, PERIOD_H4, h4BarShift),
                                 brokenLevel));
    }
 }
@@ -1847,7 +1831,8 @@ void TryConfirmH4BosPendingOnBarClose(const int h4BarShift)
 //+------------------------------------------------------------------+
 void ProcessH4BosOnH4Close(const int h4BarShift)
 {
-   if(h4BarShift < 1 || g_h4BosSwing.swingHistoryCount < 1)
+   SwingState h4Swing;
+   if(h4BarShift < 1 || !MtfCopySwingState(PERIOD_H4, h4Swing) || h4Swing.swingHistoryCount < 1)
       return;
 
    TryConfirmH4BosPendingOnBarClose(h4BarShift);
@@ -1975,7 +1960,7 @@ double ReferenceChartHeightForM2BarCount(const int barCount)
 //+------------------------------------------------------------------+
 double ReferenceChartHeightForH4BarCount(const int barCount)
 {
-   return ReferenceChartHeightForTimeframeBarCount(InputH4NarrativeTimeframe, barCount);
+   return ReferenceChartHeightForTimeframeBarCount(PERIOD_H4, barCount);
 }
 
 //+------------------------------------------------------------------+
@@ -2481,10 +2466,10 @@ bool BuildTradeSwingGroupTakeProfits(const bool isBullishTrade, const datetime f
 //+------------------------------------------------------------------+
 int GetH4TradeDirectionBias()
 {
-   if(!InputEnableH4BosTradeDirectionBias || !g_h4LastBosRecordValid)
+   if(!InputEnableH4BosTradeDirectionBias)
       return 0;
 
-   return g_h4LastBosRecord.direction;
+   return GetProfessionalBias(PERIOD_H4);
 }
 
 //+------------------------------------------------------------------+
@@ -2510,46 +2495,66 @@ bool FvgTradeAllowedByH4BosBias(const bool isBullishFairValueGap, string &outBlo
 }
 
 //+------------------------------------------------------------------+
-void RefreshH4BosBiasHud()
+void DeleteMtfDirectionHudObjects()
 {
-   if(!H4LqChartDrawEnabled(InputShowH4BosBiasHud))
-   {
-      ObjectDelete(0, LQ_OBJ_H4_BIAS_HUD);
-      return;
-   }
+   ObjectDelete(0, LQ_OBJ_MTF_BIAS_HUD_W1);
+   ObjectDelete(0, LQ_OBJ_MTF_BIAS_HUD_D1);
+   ObjectDelete(0, LQ_OBJ_MTF_BIAS_HUD_H4);
+   ObjectDelete(0, LQ_OBJ_MTF_BIAS_HUD_M15);
+}
 
-   if(ObjectFind(0, LQ_OBJ_H4_BIAS_HUD) < 0)
+//+------------------------------------------------------------------+
+void RefreshMtfDirectionHudRow(const string objectName, const string tfLabel,
+                                const ENUM_TIMEFRAMES timeframe, const int rowIndex)
+{
+   const int yDistance = 18 + rowIndex * 18;
+
+   if(ObjectFind(0, objectName) < 0)
    {
-      if(!ObjectCreate(0, LQ_OBJ_H4_BIAS_HUD, OBJ_LABEL, 0, 0, 0))
+      if(!ObjectCreate(0, objectName, OBJ_LABEL, 0, 0, 0))
          return;
-      ObjectSetInteger(0, LQ_OBJ_H4_BIAS_HUD, OBJPROP_CORNER, CORNER_RIGHT_UPPER);
-      ObjectSetInteger(0, LQ_OBJ_H4_BIAS_HUD, OBJPROP_ANCHOR, ANCHOR_RIGHT_UPPER);
-      ObjectSetInteger(0, LQ_OBJ_H4_BIAS_HUD, OBJPROP_XDISTANCE, 8);
-      ObjectSetInteger(0, LQ_OBJ_H4_BIAS_HUD, OBJPROP_YDISTANCE, 18);
-      ObjectSetString(0, LQ_OBJ_H4_BIAS_HUD, OBJPROP_FONT, "Arial Bold");
-      ObjectSetInteger(0, LQ_OBJ_H4_BIAS_HUD, OBJPROP_SELECTABLE, false);
-      ObjectSetInteger(0, LQ_OBJ_H4_BIAS_HUD, OBJPROP_HIDDEN, true);
+      ObjectSetInteger(0, objectName, OBJPROP_CORNER, CORNER_RIGHT_UPPER);
+      ObjectSetInteger(0, objectName, OBJPROP_ANCHOR, ANCHOR_RIGHT_UPPER);
+      ObjectSetInteger(0, objectName, OBJPROP_XDISTANCE, 8);
+      ObjectSetString(0, objectName, OBJPROP_FONT, "Arial Bold");
+      ObjectSetInteger(0, objectName, OBJPROP_SELECTABLE, false);
+      ObjectSetInteger(0, objectName, OBJPROP_HIDDEN, true);
    }
 
-   int          bias  = 0;
-   if(g_h4LastBosRecordValid)
-      bias = g_h4LastBosRecord.direction;
-   string       arrow = "â€”";
-   color        col   = clrSilver;
-   if(bias == 1)
+   ObjectSetInteger(0, objectName, OBJPROP_YDISTANCE, yDistance);
+
+   const int   bias  = GetProfessionalBias(timeframe);
+   string      arrow = ShortToString(0x2014);
+   color       col   = clrSilver;
+   if(bias == BIAS_BULLISH)
    {
-      arrow = "â†‘";
+      arrow = ShortToString(0x2191);
       col   = clrLime;
    }
-   else if(bias == -1)
+   else if(bias == BIAS_BEARISH)
    {
-      arrow = "â†“";
+      arrow = ShortToString(0x2193);
       col   = clrTomato;
    }
 
-   ObjectSetString(0, LQ_OBJ_H4_BIAS_HUD, OBJPROP_TEXT, "H4 " + arrow);
-   ObjectSetInteger(0, LQ_OBJ_H4_BIAS_HUD, OBJPROP_COLOR, col);
-   ObjectSetInteger(0, LQ_OBJ_H4_BIAS_HUD, OBJPROP_FONTSIZE, 14);
+   ObjectSetString(0, objectName, OBJPROP_TEXT, tfLabel + " " + arrow);
+   ObjectSetInteger(0, objectName, OBJPROP_COLOR, col);
+   ObjectSetInteger(0, objectName, OBJPROP_FONTSIZE, 13);
+}
+
+//+------------------------------------------------------------------+
+void RefreshMtfDirectionHud()
+{
+   if(!H4LqChartDrawEnabled(InputShowMtfDirectionHud))
+   {
+      DeleteMtfDirectionHudObjects();
+      return;
+   }
+
+   RefreshMtfDirectionHudRow(LQ_OBJ_MTF_BIAS_HUD_W1,  "W1",  PERIOD_W1,  0);
+   RefreshMtfDirectionHudRow(LQ_OBJ_MTF_BIAS_HUD_D1,  "D1",  PERIOD_D1,  1);
+   RefreshMtfDirectionHudRow(LQ_OBJ_MTF_BIAS_HUD_H4,  "H4",  PERIOD_H4,  2);
+   RefreshMtfDirectionHudRow(LQ_OBJ_MTF_BIAS_HUD_M15, "M15", PERIOD_M15, 3);
 }
 
 //+------------------------------------------------------------------+
@@ -2634,95 +2639,6 @@ bool DetectFairValueGapOnLastClosedBarM2(bool &isBullishFairValueGap, double &fa
 }
 
 //+------------------------------------------------------------------+
-bool TryLatestH4CompletedUpLegHigh(double &outHigh)
-{
-   for(int i = g_h4Swing.swingHistoryCount - 1; i >= 0; i--)
-   {
-      if(g_h4Swing.swingHistory[i].swingDirection == 1)
-      {
-         outHigh = g_h4Swing.swingHistory[i].legHighPrice;
-         return true;
-      }
-   }
-   return false;
-}
-
-//+------------------------------------------------------------------+
-bool TryLatestH4CompletedDownLegLow(double &outLow)
-{
-   for(int i = g_h4Swing.swingHistoryCount - 1; i >= 0; i--)
-   {
-      if(g_h4Swing.swingHistory[i].swingDirection == -1)
-      {
-         outLow = g_h4Swing.swingHistory[i].legLowPrice;
-         return true;
-      }
-   }
-   return false;
-}
-
-//+------------------------------------------------------------------+
-bool TrySecondLastH4CompletedUpLegHigh(double &outHigh)
-{
-   int upLegsFound = 0;
-   for(int i = g_h4Swing.swingHistoryCount - 1; i >= 0; i--)
-   {
-      if(g_h4Swing.swingHistory[i].swingDirection != 1)
-         continue;
-      upLegsFound++;
-      if(upLegsFound == 2)
-      {
-         outHigh = g_h4Swing.swingHistory[i].legHighPrice;
-         return true;
-      }
-   }
-   return false;
-}
-
-//+------------------------------------------------------------------+
-bool TrySecondLastH4CompletedDownLegLow(double &outLow)
-{
-   int downLegsFound = 0;
-   for(int i = g_h4Swing.swingHistoryCount - 1; i >= 0; i--)
-   {
-      if(g_h4Swing.swingHistory[i].swingDirection != -1)
-         continue;
-      downLegsFound++;
-      if(downLegsFound == 2)
-      {
-         outLow = g_h4Swing.swingHistory[i].legLowPrice;
-         return true;
-      }
-   }
-   return false;
-}
-
-//+------------------------------------------------------------------+
-bool TryNthH4CompletedSwingLeg(const int swingDirection, const int nFromLatest,
-                              double &outLegHigh, double &outLegLow, datetime &outLegEndTime)
-{
-   outLegEndTime = 0;
-   if(swingDirection == 0 || nFromLatest < 1)
-      return false;
-
-   int legsFound = 0;
-   for(int i = g_h4Swing.swingHistoryCount - 1; i >= 0; i--)
-   {
-      if(g_h4Swing.swingHistory[i].swingDirection != swingDirection)
-         continue;
-      legsFound++;
-      if(legsFound == nFromLatest)
-      {
-         outLegHigh    = g_h4Swing.swingHistory[i].legHighPrice;
-         outLegLow     = g_h4Swing.swingHistory[i].legLowPrice;
-         outLegEndTime = g_h4Swing.swingHistory[i].legEndTime;
-         return true;
-      }
-   }
-   return false;
-}
-
-//+------------------------------------------------------------------+
 bool TryGetH4LegBarOpenTimeFromEnd(const datetime legStartTime, const datetime legEndTime,
                                     const int nFromEnd, datetime &outBarOpenTime)
 {
@@ -2730,7 +2646,7 @@ bool TryGetH4LegBarOpenTimeFromEnd(const datetime legStartTime, const datetime l
    if(legStartTime == 0 || legEndTime == 0 || nFromEnd < 1)
       return false;
 
-   const ENUM_TIMEFRAMES timeframe = InputH4NarrativeTimeframe;
+   const ENUM_TIMEFRAMES timeframe = PERIOD_H4;
    int shiftEnd   = iBarShift(_Symbol, timeframe, legEndTime, false);
    int shiftStart = iBarShift(_Symbol, timeframe, legStartTime, false);
    if(shiftEnd < 0 || shiftStart < 0)
@@ -2759,9 +2675,9 @@ double H4BreachLevelPriceFromVolumeBar(const int swingDirection, const int h4Bar
    if(h4BarShift < 0)
       return 0.0;
    if(swingDirection == 1)
-      return iLow(_Symbol, InputH4NarrativeTimeframe, h4BarShift);
+      return iLow(_Symbol, PERIOD_H4, h4BarShift);
    if(swingDirection == -1)
-      return iHigh(_Symbol, InputH4NarrativeTimeframe, h4BarShift);
+      return iHigh(_Symbol, PERIOD_H4, h4BarShift);
    return 0.0;
 }
 
@@ -2771,7 +2687,7 @@ bool H4BarHasDecentMovementForLegDirection(const int barShift, const int legSwin
    if(barShift < 0 || legSwingDirection == 0)
       return false;
 
-   const ENUM_TIMEFRAMES timeframe = InputH4NarrativeTimeframe;
+   const ENUM_TIMEFRAMES timeframe = PERIOD_H4;
    const double barOpen  = iOpen(_Symbol, timeframe, barShift);
    const double barClose = iClose(_Symbol, timeframe, barShift);
    const double barHigh  = iHigh(_Symbol, timeframe, barShift);
@@ -3342,7 +3258,7 @@ bool H4TryGetLegLastDecentMovementBarOpen(const datetime legStartTime, const dat
    if(legStartTime == 0 || legProgressEnd == 0 || swingDirection == 0)
       return false;
 
-   const ENUM_TIMEFRAMES timeframe = InputH4NarrativeTimeframe;
+   const ENUM_TIMEFRAMES timeframe = PERIOD_H4;
    int shiftNewer = iBarShift(_Symbol, timeframe, legProgressEnd, true);
    int shiftOlder = iBarShift(_Symbol, timeframe, legStartTime, true);
    if(shiftNewer < 0 || shiftOlder < 0)
@@ -3373,7 +3289,7 @@ datetime H4ProgressEndOpenForDecentLookup(const datetime legProgressEndOpen)
    if(legProgressEndOpen == 0)
       return 0;
 
-   const ENUM_TIMEFRAMES timeframe = InputH4NarrativeTimeframe;
+   const ENUM_TIMEFRAMES timeframe = PERIOD_H4;
    const int shiftNewer = iBarShift(_Symbol, timeframe, legProgressEndOpen, true);
    if(shiftNewer < 0)
       return legProgressEndOpen;
@@ -3403,7 +3319,7 @@ bool H4TryGetVolumeBreachWindowBoundFromLastDecent(const datetime legStartTime,
                                               lastDecentOpen))
       return false;
 
-   const ENUM_TIMEFRAMES timeframe = InputH4NarrativeTimeframe;
+   const ENUM_TIMEFRAMES timeframe = PERIOD_H4;
    const int shiftDecent = iBarShift(_Symbol, timeframe, lastDecentOpen, true);
    if(shiftDecent < 0)
       return false;
@@ -3443,7 +3359,7 @@ bool H4VolumeBreachWindowShiftRangeValid(const datetime windowStartInclusive,
    if(windowStartInclusive == 0 || windowEndInclusive == 0)
       return false;
 
-   const ENUM_TIMEFRAMES timeframe = InputH4NarrativeTimeframe;
+   const ENUM_TIMEFRAMES timeframe = PERIOD_H4;
    const int shiftStartOlder = iBarShift(_Symbol, timeframe, windowStartInclusive, true);
    const int shiftEndNewer   = iBarShift(_Symbol, timeframe, windowEndInclusive, true);
    if(shiftStartOlder < 0 || shiftEndNewer < 0)
@@ -3473,7 +3389,7 @@ bool H4TryResolveLegVolumeBreachWindowEnd(const datetime legStartTime,
       return true;
    }
 
-   const ENUM_TIMEFRAMES timeframe = InputH4NarrativeTimeframe;
+   const ENUM_TIMEFRAMES timeframe = PERIOD_H4;
    const int barsTotal = iBars(_Symbol, timeframe);
    for(int shiftBound = lastClosedBarShift + 2; shiftBound >= lastClosedBarShift; shiftBound--)
    {
@@ -3502,7 +3418,7 @@ bool FindMaxVolumeH4BarBetweenOpenTimes(const datetime rangeStartOpen, const dat
    if(rangeStartOpen == 0 || rangeEndOpen == 0)
       return false;
 
-   const ENUM_TIMEFRAMES timeframe = InputH4NarrativeTimeframe;
+   const ENUM_TIMEFRAMES timeframe = PERIOD_H4;
    datetime rangeLo = rangeStartOpen;
    datetime rangeHi = rangeEndOpen;
    if(rangeLo > rangeHi)
@@ -3546,7 +3462,7 @@ void H4ScanVolumeWindowMonotonic(const int swingDirection, const datetime window
    if(swingDirection == 0 || windowStartInclusive == 0 || windowEndInclusive == 0)
       return;
 
-   const ENUM_TIMEFRAMES timeframe = InputH4NarrativeTimeframe;
+   const ENUM_TIMEFRAMES timeframe = PERIOD_H4;
    const int shiftStartOlder = iBarShift(_Symbol, timeframe, windowStartInclusive, true);
    const int shiftEndNewer   = iBarShift(_Symbol, timeframe, windowEndInclusive, true);
    if(shiftStartOlder < 0 || shiftEndNewer < 0)
@@ -3589,7 +3505,7 @@ bool ComputeH4LegVolumeBreachLevel(const Swing &lastLeg, const Swing &prevLeg, c
    datetime maxVolBarOpen = 0;
    double   breachLevel   = 0.0;
 
-   const ENUM_TIMEFRAMES timeframe = InputH4NarrativeTimeframe;
+   const ENUM_TIMEFRAMES timeframe = PERIOD_H4;
    const int shiftLegEnd   = iBarShift(_Symbol, timeframe, lastLeg.legEndTime, true);
    const int shiftLegStart = iBarShift(_Symbol, timeframe, lastLeg.legStartTime, true);
    if(shiftLegEnd < 0 || shiftLegStart < 0)
@@ -3763,7 +3679,7 @@ void H4OnH4ActiveLegBarClosed(SwingState &swingState, const int lastClosedBarShi
    if(lastClosedBarShift < 1)
       return;
 
-   const datetime lastClosedOpen = iTime(_Symbol, InputH4NarrativeTimeframe, lastClosedBarShift);
+   const datetime lastClosedOpen = iTime(_Symbol, PERIOD_H4, lastClosedBarShift);
    if(lastClosedOpen == 0)
       return;
 
@@ -3852,9 +3768,9 @@ void H4FinalizeActiveLegVolumeBreach(const Swing &closedLeg)
    {
       Swing prevLeg;
       ZeroMemory(prevLeg);
-      const bool hasPrevLeg = (g_h4Swing.swingHistoryCount > 1);
+      const bool hasPrevLeg = (g_mtfSwingH4.swing.swingHistoryCount > 1);
       if(hasPrevLeg)
-         prevLeg = g_h4Swing.swingHistory[g_h4Swing.swingHistoryCount - 2];
+         prevLeg = g_mtfSwingH4.swing.swingHistory[g_mtfSwingH4.swing.swingHistoryCount - 2];
 
       if(!ComputeH4LegVolumeBreachLevel(closedLeg, prevLeg, hasPrevLeg, breachLevel, volumeBarOpenTime))
          return;
@@ -3869,12 +3785,12 @@ void H4FinalizeActiveLegVolumeBreach(const Swing &closedLeg)
 //+------------------------------------------------------------------+
 void H4RestoreActiveLegVolumeBreachTrackFromSwing()
 {
-   if(g_h4Swing.currentSwingLeg.swingDirection == 0 || g_h4Swing.currentSwingLeg.legStartTime == 0)
+   if(g_mtfSwingH4.swing.currentSwingLeg.swingDirection == 0 || g_mtfSwingH4.swing.currentSwingLeg.legStartTime == 0)
    {
       H4ResetActiveLegVolumeBreachTrack();
       return;
    }
-   H4OnH4ActiveLegStarted(g_h4Swing);
+   H4OnH4ActiveLegStarted(g_mtfSwingH4.swing);
 }
 
 //+------------------------------------------------------------------+
@@ -3935,7 +3851,7 @@ bool IsH4BarWithinBreachBufferChartWindow(const datetime barOpenTime)
    if(barCount < 1 || barOpenTime <= 0)
       return false;
 
-   const int barShift = iBarShift(_Symbol, InputH4NarrativeTimeframe, barOpenTime, false);
+   const int barShift = iBarShift(_Symbol, PERIOD_H4, barOpenTime, false);
    if(barShift < 0)
       return false;
 
@@ -3972,15 +3888,15 @@ void RebuildH4LegVolumeBreachLevelsFromSwingHistory()
 {
    g_h4LegVolumeBreachCount = 0;
 
-   for(int legIndex = 0; legIndex < g_h4Swing.swingHistoryCount; legIndex++)
+   for(int legIndex = 0; legIndex < g_mtfSwingH4.swing.swingHistoryCount; legIndex++)
    {
-      const Swing lastLeg = g_h4Swing.swingHistory[legIndex];
+      const Swing lastLeg = g_mtfSwingH4.swing.swingHistory[legIndex];
       Swing       prevLeg;
       ZeroMemory(prevLeg);
       const bool hasPrevLeg = (legIndex > 0);
 
       if(hasPrevLeg)
-         prevLeg = g_h4Swing.swingHistory[legIndex - 1];
+         prevLeg = g_mtfSwingH4.swing.swingHistory[legIndex - 1];
 
       double breachLevel = 0.0;
       datetime volumeBarOpenTime = 0;
@@ -4008,7 +3924,7 @@ void DrawH4VolumeBreachLevelRay(const datetime legStartTime, const datetime legE
                                  const int swingDirection, const datetime volumeBarOpenTime,
                                  const double breachLevel)
 {
-   if(!H4LqChartDrawEnabled(InputDrawH4SwingLegVisuals) || legStartTime == 0 || swingDirection == 0 ||
+   if(!H4LqChartDrawEnabled(InputDrawMtfSwingLegsH4) || legStartTime == 0 || swingDirection == 0 ||
       volumeBarOpenTime == 0 || breachLevel <= 0.0)
       return;
 
@@ -4019,7 +3935,7 @@ void DrawH4VolumeBreachLevelRay(const datetime legStartTime, const datetime legE
    const string objName =
       ChartObjectNamePrefixH4VolumeBreachRay + IntegerToString((long)legStartTime);
 
-   const int h4PeriodSec = (int)PeriodSeconds(InputH4NarrativeTimeframe);
+   const int h4PeriodSec = (int)PeriodSeconds(PERIOD_H4);
    if(h4PeriodSec < 1)
       return;
 
@@ -4058,7 +3974,7 @@ void DrawH4VolumeBreachLevelRay(const datetime legStartTime, const datetime legE
 //+------------------------------------------------------------------+
 void RebuildAllH4VolumeBreachMarkers()
 {
-   if(!H4LqChartDrawEnabled(InputDrawH4SwingLegVisuals))
+   if(!H4LqChartDrawEnabled(InputDrawMtfSwingLegsH4))
    {
       ObjectsDeleteAll(0, ChartObjectNamePrefixH4VolumeBreachRay, -1, -1);
       return;
@@ -4073,8 +3989,8 @@ void RebuildAllH4VolumeBreachMarkers()
          continue;
 
       if(rec.legEndTime == 0 &&
-         (g_h4Swing.currentSwingLeg.legStartTime != rec.legStartTime ||
-          g_h4Swing.currentSwingLeg.swingDirection != rec.swingDirection))
+         (g_mtfSwingH4.swing.currentSwingLeg.legStartTime != rec.legStartTime ||
+          g_mtfSwingH4.swing.currentSwingLeg.swingDirection != rec.swingDirection))
          continue;
 
       if(rec.swept)
@@ -4167,7 +4083,7 @@ bool WasH4VolumeBreachLevelViolatedSinceFormation(const int swingDirection,
 
    const double eps = (pointSize > 0.0 ? pointSize : 0.00001);
    const int formationShift =
-      iBarShift(_Symbol, InputH4NarrativeTimeframe, levelFormedOpenTime, false);
+      iBarShift(_Symbol, PERIOD_H4, levelFormedOpenTime, false);
    if(formationShift < 0)
       return false;
 
@@ -4175,13 +4091,13 @@ bool WasH4VolumeBreachLevelViolatedSinceFormation(const int swingDirection,
    {
       if(swingDirection == 1)
       {
-         const double barLow = iLow(_Symbol, InputH4NarrativeTimeframe, barShift);
+         const double barLow = iLow(_Symbol, PERIOD_H4, barShift);
          if(barLow > 0.0 && barLow < breachLevel - eps)
             return true;
       }
       else if(swingDirection == -1)
       {
-         const double barHigh = iHigh(_Symbol, InputH4NarrativeTimeframe, barShift);
+         const double barHigh = iHigh(_Symbol, PERIOD_H4, barShift);
          if(barHigh > 0.0 && barHigh > breachLevel + eps)
             return true;
       }
@@ -4210,8 +4126,8 @@ void UpdateH4LegLiquidityBreachMemoryOnM2Bar()
       const bool isActiveLeg = (g_h4LegVolumeBreaches[i].legEndTime == 0);
       if(isActiveLeg)
       {
-         if(g_h4Swing.currentSwingLeg.legStartTime != g_h4LegVolumeBreaches[i].legStartTime ||
-            g_h4Swing.currentSwingLeg.swingDirection != g_h4LegVolumeBreaches[i].swingDirection)
+         if(g_mtfSwingH4.swing.currentSwingLeg.legStartTime != g_h4LegVolumeBreaches[i].legStartTime ||
+            g_mtfSwingH4.swing.currentSwingLeg.swingDirection != g_h4LegVolumeBreaches[i].swingDirection)
             continue;
 
          datetime volumeBarOpenTime = g_h4LegVolumeBreaches[i].volumeBarOpenTime;
@@ -4275,14 +4191,29 @@ bool TryPushH4ReplayLeg(H4ReplayLeg &replayLegs[], int &replayLegCount, const Sw
 }
 
 //+------------------------------------------------------------------+
-//| Replay one closed H4 bar into swingState; append completed legs (no hunt side effects). |
+//| Replay one closed TF bar; append completed legs (no live side effects). |
 //+------------------------------------------------------------------+
-void ProcessH4SwingStepReplay(SwingState &swingState, const int lastClosedBarShift,
-                               H4ReplayLeg &replayLegs[], int &replayLegCount,
-                               const double anchorMultiplier, const bool useWickAndBodyForDecent)
+void MtfSwingStepReplayAtShift(SwingState &swingState, const ENUM_TIMEFRAMES timeframe,
+                                const int lastClosedBarShift,
+                                H4ReplayLeg &replayLegs[], int &replayLegCount)
 {
-   const ENUM_TIMEFRAMES timeframe = InputH4NarrativeTimeframe;
-   const int         sh            = lastClosedBarShift;
+   bool unusedLegClosed = false;
+   ProcessMTFSwingStepAtShiftCollect(swingState, timeframe, lastClosedBarShift,
+                                      H4_BOS_ANCHOR_MULTIPLIER, false,
+                                      replayLegs, replayLegCount, true, unusedLegClosed);
+}
+
+//+------------------------------------------------------------------+
+//| MTF SMC Confluence Engine — Phase 1: multi-timeframe swing trackers |
+//+------------------------------------------------------------------+
+void ProcessMTFSwingStepAtShiftCollect(SwingState &swingState, const ENUM_TIMEFRAMES timeframe,
+                                        const int lastClosedBarShift, const double anchorMultiplier,
+                                        const bool useWickAndBodyForDecent,
+                                        H4ReplayLeg &replayLegs[], int &replayLegCount,
+                                        const bool collectCompletedLegs, bool &outLegClosedThisBar)
+{
+   outLegClosedThisBar = false;
+   const int sh = lastClosedBarShift;
 
    const double lastClosedBarOpen  = iOpen(_Symbol, timeframe, sh);
    const double lastClosedBarClose = iClose(_Symbol, timeframe, sh);
@@ -4342,8 +4273,20 @@ void ProcessH4SwingStepReplay(SwingState &swingState, const int lastClosedBarShi
    SwingExtend(swingState, lastClosedBarHigh, lastClosedBarLow);
 
    Swing closedSwingLeg = swingState.currentSwingLeg;
-   closedSwingLeg.legEndTime = iTime(_Symbol, timeframe, sh);
-   TryPushH4ReplayLeg(replayLegs, replayLegCount, closedSwingLeg);
+   if(collectCompletedLegs)
+   {
+      closedSwingLeg.legEndTime = iTime(_Symbol, timeframe, sh);
+      TryPushH4ReplayLeg(replayLegs, replayLegCount, closedSwingLeg);
+      outLegClosedThisBar = true;
+   }
+   else
+   {
+      SwingCloseH4ToHistory(swingState, timeframe, sh);
+      outLegClosedThisBar = true;
+      if(swingState.swingHistoryCount < 1)
+         return;
+      closedSwingLeg = swingState.swingHistory[swingState.swingHistoryCount - 1];
+   }
 
    double newSwingLegHigh = lastClosedBarHigh;
    double newSwingLegLow  = lastClosedBarLow;
@@ -4357,84 +4300,15 @@ void ProcessH4SwingStepReplay(SwingState &swingState, const int lastClosedBarShi
 }
 
 //+------------------------------------------------------------------+
-//| MTF SMC Confluence Engine — Phase 1: multi-timeframe swing trackers |
-//+------------------------------------------------------------------+
 void ProcessMTFSwingStepAtShift(SwingState &swingState, const ENUM_TIMEFRAMES timeframe,
                                  const int lastClosedBarShift, const double anchorMultiplier,
-                                 const bool useWickAndBodyForDecent)
+                                 const bool useWickAndBodyForDecent, bool &outLegClosedThisBar)
 {
-   const int sh = lastClosedBarShift;
-
-   const double lastClosedBarOpen  = iOpen(_Symbol, timeframe, sh);
-   const double lastClosedBarClose = iClose(_Symbol, timeframe, sh);
-   const double lastClosedBarHigh  = iHigh(_Symbol, timeframe, sh);
-   const double lastClosedBarLow   = iLow(_Symbol, timeframe, sh);
-
-   const int candleDirection =
-      (lastClosedBarClose > lastClosedBarOpen) ? 1
-      : ((lastClosedBarClose < lastClosedBarOpen) ? -1 : 0);
-
-   const double lastClosedBarBodyRange = MathAbs(lastClosedBarClose - lastClosedBarOpen);
-   const double lastClosedBarWickRange  = lastClosedBarHigh - lastClosedBarLow;
-
-   if(swingState.currentSwingLeg.swingDirection == 0)
-   {
-      if(candleDirection == 0)
-         return;
-      SwingStartNew(swingState, timeframe, candleDirection, lastClosedBarHigh, lastClosedBarLow, sh);
-      swingState.priceAnchorLevel = (lastClosedBarHigh + lastClosedBarLow) / 2.0;
-      return;
-   }
-
-   double sumRangeFivePriorBars = 0.0;
-   const int barsTotal = iBars(_Symbol, timeframe);
-   int       rangeBarCount = 0;
-   for(int barShiftIndex = sh + 1; barShiftIndex <= sh + 5; barShiftIndex++)
-   {
-      if(barShiftIndex >= barsTotal)
-         break;
-      sumRangeFivePriorBars +=
-         (iHigh(_Symbol, timeframe, barShiftIndex) - iLow(_Symbol, timeframe, barShiftIndex));
-      rangeBarCount++;
-   }
-   const double averageRangeFiveBars = (rangeBarCount > 0) ? sumRangeFivePriorBars / (double)rangeBarCount : 0.0;
-   const double minDecentRange       = averageRangeFiveBars * anchorMultiplier;
-   const bool isDecentMovement =
-      useWickAndBodyForDecent
-      ? (lastClosedBarWickRange > minDecentRange && lastClosedBarBodyRange > minDecentRange)
-      : (lastClosedBarWickRange > minDecentRange);
-
-   const double anchorForFlipCheck = swingState.priceAnchorLevel;
-   int nextSwingDirection = swingState.currentSwingLeg.swingDirection;
-   if(swingState.currentSwingLeg.swingDirection == 1 && lastClosedBarClose < anchorForFlipCheck)
-      nextSwingDirection = -1;
-   else if(swingState.currentSwingLeg.swingDirection == -1 && lastClosedBarClose > anchorForFlipCheck)
-      nextSwingDirection = 1;
-
-   if(nextSwingDirection == swingState.currentSwingLeg.swingDirection)
-   {
-      if(isDecentMovement && candleDirection == swingState.currentSwingLeg.swingDirection)
-         swingState.priceAnchorLevel = (lastClosedBarHigh + lastClosedBarLow) / 2.0;
-
-      SwingExtend(swingState, lastClosedBarHigh, lastClosedBarLow);
-      return;
-   }
-
-   SwingExtend(swingState, lastClosedBarHigh, lastClosedBarLow);
-   SwingCloseH4ToHistory(swingState, timeframe, sh);
-   if(swingState.swingHistoryCount < 1)
-      return;
-
-   Swing closedSwingLeg = swingState.swingHistory[swingState.swingHistoryCount - 1];
-   double newSwingLegHigh = lastClosedBarHigh;
-   double newSwingLegLow  = lastClosedBarLow;
-   if(closedSwingLeg.swingDirection == 1 && nextSwingDirection == -1)
-      newSwingLegHigh = MathMax(lastClosedBarHigh, closedSwingLeg.legHighPrice);
-   else if(closedSwingLeg.swingDirection == -1 && nextSwingDirection == 1)
-      newSwingLegLow = MathMin(lastClosedBarLow, closedSwingLeg.legLowPrice);
-
-   SwingStartNew(swingState, timeframe, nextSwingDirection, newSwingLegHigh, newSwingLegLow, sh);
-   swingState.priceAnchorLevel = (lastClosedBarHigh + lastClosedBarLow) / 2.0;
+   H4ReplayLeg unusedReplayLegs[];
+   int         unusedReplayLegCount = 0;
+   ProcessMTFSwingStepAtShiftCollect(swingState, timeframe, lastClosedBarShift, anchorMultiplier,
+                                      useWickAndBodyForDecent, unusedReplayLegs, unusedReplayLegCount,
+                                      false, outLegClosedThisBar);
 }
 
 //+------------------------------------------------------------------+
@@ -4520,6 +4394,9 @@ void SMCUpdateTrackerBosOnBar(MTFSwingTracker &tracker, const int barShift)
    tracker.lastBrokenLegEndTime = legEnd;
    tracker.lastBrokenLegHigh    = legHigh;
    tracker.lastBrokenLegLow     = legLow;
+
+   if(tracker.timeframe != 0)
+      ProfessionalBiasSetDirection(tracker.timeframe, bosDir, barOpen);
 }
 
 //+------------------------------------------------------------------+
@@ -4534,8 +4411,24 @@ void SMCUpdateTrackerOnBarClose(MTFSwingTracker &tracker, const ENUM_TIMEFRAMES 
    if(tracker.timeframe == 0)
       tracker.timeframe = timeframe;
 
-   ProcessMTFSwingStepAtShift(tracker.swing, timeframe, 1, H4_BOS_ANCHOR_MULTIPLIER, false);
+   bool legClosedThisBar = false;
+   ProcessMTFSwingStepAtShift(tracker.swing, timeframe, 1, H4_BOS_ANCHOR_MULTIPLIER, false,
+                              legClosedThisBar);
+
+   SMCRefreshZonesForTimeframe(timeframe, tracker, legClosedThisBar);
    SMCUpdateTrackerBosOnBar(tracker, 1);
+
+   if(timeframe == PERIOD_H4)
+   {
+      ProcessH4BosOnH4Close(1);
+      RebuildH4LiquidityPivotLevels();
+      if(InputEnableH4BosTradeDirectionBias)
+         LogH4TradeDirectionBiasIfChanged();
+#ifdef H4_LQ_VOLUME_BREACH_ENABLED
+      if(H4LqChartDrawEnabled(InputDrawMtfSwingLegsH4))
+         RebuildAllH4VolumeBreachMarkers();
+#endif
+   }
 }
 
 //+------------------------------------------------------------------+
@@ -4561,7 +4454,9 @@ void WarmupMTFSwingTracker(MTFSwingTracker &tracker, const ENUM_TIMEFRAMES timef
    {
       for(int k = n; k >= 1; k--)
       {
-         ProcessMTFSwingStepAtShift(tracker.swing, timeframe, k, H4_BOS_ANCHOR_MULTIPLIER, false);
+         bool unusedLegClosed = false;
+         ProcessMTFSwingStepAtShift(tracker.swing, timeframe, k, H4_BOS_ANCHOR_MULTIPLIER, false,
+                                    unusedLegClosed);
          SMCUpdateTrackerBosOnBar(tracker, k);
       }
    }
@@ -4591,7 +4486,9 @@ void UpdateMTFSwings()
    SMCUpdateTrackerOnBarClose(g_mtfSwingD1,  PERIOD_D1,  g_lastMtfBarOpenD1);
    SMCUpdateTrackerOnBarClose(g_mtfSwingH4,  PERIOD_H4,  g_lastMtfBarOpenH4);
    SMCUpdateTrackerOnBarClose(g_mtfSwingM15, PERIOD_M15, g_lastMtfBarOpenM15);
-   UpdateSMCZoneMatrix();
+
+   if(H4LqChartDrawEnabled(InputShowMtfDirectionHud))
+      RefreshMtfDirectionHud();
 }
 
 //+------------------------------------------------------------------+
@@ -4600,6 +4497,67 @@ void UpdateMTFSwings()
 bool SMCZoneTypeIsBullish(const ENUM_SMC_ZONE_TYPE type)
 {
    return type < ZONE_BEAR_WEEKLY_FVG;
+}
+
+//+------------------------------------------------------------------+
+bool SMCZoneTypeIsSwingLiquidity(const ENUM_SMC_ZONE_TYPE type)
+{
+   switch(type)
+   {
+      case ZONE_BULL_SWING_W1_LOW:
+      case ZONE_BULL_SWING_DAILY_LOW:
+      case ZONE_BULL_SWING_H4_LOW:
+      case ZONE_BULL_SWING_M15_LOW:
+      case ZONE_BEAR_SWING_W1_HIGH:
+      case ZONE_BEAR_SWING_DAILY_HIGH:
+      case ZONE_BEAR_SWING_H4_HIGH:
+      case ZONE_BEAR_SWING_M15_HIGH:
+         return true;
+      default:
+         return false;
+   }
+}
+
+//+------------------------------------------------------------------+
+bool SMCZoneTypeIsMtfFvg(const ENUM_SMC_ZONE_TYPE type)
+{
+   switch(type)
+   {
+      case ZONE_BULL_WEEKLY_FVG:
+      case ZONE_BULL_DAILY_FVG:
+      case ZONE_BULL_H4_FVG:
+      case ZONE_BULL_M15_FVG:
+      case ZONE_BEAR_WEEKLY_FVG:
+      case ZONE_BEAR_DAILY_FVG:
+      case ZONE_BEAR_H4_FVG:
+      case ZONE_BEAR_M15_FVG:
+         return true;
+      default:
+         return false;
+   }
+}
+
+//+------------------------------------------------------------------+
+bool SMCZonePassesCurrentPriceSideFilter(const ENUM_SMC_ZONE_TYPE type,
+                                          const double top, const double bottom)
+{
+   if(top <= bottom)
+      return false;
+
+   double currentPrice = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   if(currentPrice <= 0.0)
+      currentPrice = SymbolInfoDouble(_Symbol, SYMBOL_LAST);
+   if(currentPrice <= 0.0)
+      currentPrice = iClose(_Symbol, PERIOD_CURRENT, 0);
+   if(currentPrice <= 0.0)
+      return true;
+
+   const double pointSize = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   const double eps       = (pointSize > 0.0 ? pointSize : 0.00001);
+
+   if(SMCZoneTypeIsBullish(type))
+      return top < currentPrice - eps;
+   return bottom > currentPrice + eps;
 }
 
 //+------------------------------------------------------------------+
@@ -4687,6 +4645,284 @@ ENUM_TIMEFRAMES SMCZoneTypeToTimeframe(const ENUM_SMC_ZONE_TYPE type)
 }
 
 //+------------------------------------------------------------------+
+bool SMCGetMtfSwingTracker(const ENUM_TIMEFRAMES timeframe, MTFSwingTracker &tracker)
+{
+   switch(timeframe)
+   {
+      case PERIOD_W1:  tracker = g_mtfSwingW1;  return true;
+      case PERIOD_D1:  tracker = g_mtfSwingD1;  return true;
+      case PERIOD_H4:  tracker = g_mtfSwingH4;  return true;
+      case PERIOD_M15: tracker = g_mtfSwingM15; return true;
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Per-TF MTF swing leg access — completed legs + unbroken extremes. |
+//+------------------------------------------------------------------+
+bool MtfIsSwingTimeframe(const ENUM_TIMEFRAMES timeframe)
+{
+   return timeframe == PERIOD_W1 || timeframe == PERIOD_D1
+       || timeframe == PERIOD_H4 || timeframe == PERIOD_M15;
+}
+
+//+------------------------------------------------------------------+
+bool MtfCopySwingState(const ENUM_TIMEFRAMES timeframe, SwingState &outSwingState)
+{
+   MTFSwingTracker tracker;
+   if(!SMCGetMtfSwingTracker(timeframe, tracker))
+      return false;
+   outSwingState = tracker.swing;
+   return true;
+}
+
+//+------------------------------------------------------------------+
+bool MtfTryNthCompletedSwingLeg(const ENUM_TIMEFRAMES timeframe, const int swingDirection,
+                                 const int nFromLatest,
+                                 double &outLegHigh, double &outLegLow,
+                                 datetime &outLegStartTime, datetime &outLegEndTime)
+{
+   outLegHigh      = 0.0;
+   outLegLow       = 0.0;
+   outLegStartTime = 0;
+   outLegEndTime   = 0;
+   if(!MtfIsSwingTimeframe(timeframe) || swingDirection == 0 || nFromLatest < 1)
+      return false;
+
+   SwingState swingState;
+   if(!MtfCopySwingState(timeframe, swingState))
+      return false;
+
+   int legsFound = 0;
+   for(int i = swingState.swingHistoryCount - 1; i >= 0; i--)
+   {
+      const Swing leg = swingState.swingHistory[i];
+      if(leg.swingDirection != swingDirection || leg.legEndTime == 0)
+         continue;
+      legsFound++;
+      if(legsFound == nFromLatest)
+      {
+         outLegHigh      = leg.legHighPrice;
+         outLegLow       = leg.legLowPrice;
+         outLegStartTime = leg.legStartTime;
+         outLegEndTime   = leg.legEndTime;
+         return true;
+      }
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+bool MtfTryLatestCompletedUpLegHigh(const ENUM_TIMEFRAMES timeframe, double &outHigh,
+                                     datetime &outLegEndTime)
+{
+   datetime legStart = 0;
+   double   legLow   = 0.0;
+   return MtfTryNthCompletedSwingLeg(timeframe, 1, 1, outHigh, legLow, legStart, outLegEndTime);
+}
+
+//+------------------------------------------------------------------+
+bool MtfTryLatestCompletedDownLegLow(const ENUM_TIMEFRAMES timeframe, double &outLow,
+                                      datetime &outLegEndTime)
+{
+   datetime legStart = 0;
+   double   legHigh  = 0.0;
+   return MtfTryNthCompletedSwingLeg(timeframe, -1, 1, legHigh, outLow, legStart, outLegEndTime);
+}
+
+//+------------------------------------------------------------------+
+bool MtfTryLatestUnbrokenSwingHigh(const ENUM_TIMEFRAMES timeframe, double &outLevel)
+{
+   SwingState swingState;
+   if(!MtfCopySwingState(timeframe, swingState))
+      return false;
+   return SMCTryGetLatestUnbrokenSwingHigh(swingState, timeframe, outLevel);
+}
+
+//+------------------------------------------------------------------+
+bool MtfTryLatestUnbrokenSwingLow(const ENUM_TIMEFRAMES timeframe, double &outLevel)
+{
+   SwingState swingState;
+   if(!MtfCopySwingState(timeframe, swingState))
+      return false;
+   return SMCTryGetLatestUnbrokenSwingLow(swingState, timeframe, outLevel);
+}
+
+//+------------------------------------------------------------------+
+bool MtfTryDetectBosCrossOnBar(const ENUM_TIMEFRAMES timeframe, const int barShift,
+                                int &outDirection, double &outBrokenLevel,
+                                datetime &outBarOpenTime, datetime &outLegEndTime)
+{
+   outDirection   = 0;
+   outBrokenLevel = 0.0;
+   outBarOpenTime = 0;
+   outLegEndTime  = 0;
+
+   SwingState swingState;
+   if(!MtfCopySwingState(timeframe, swingState))
+      return false;
+
+   double legHigh = 0.0;
+   double legLow  = 0.0;
+   return SMCTryDetectBosOnBar(swingState, timeframe, barShift, outDirection, outBrokenLevel,
+                               outBarOpenTime, outLegEndTime, legHigh, legLow);
+}
+
+//+------------------------------------------------------------------+
+void ResetProfessionalBiasOverrideState()
+{
+   ZeroMemory(g_profBiasOverrideW1);
+   ZeroMemory(g_profBiasOverrideD1);
+   ZeroMemory(g_profBiasOverrideH4);
+   ZeroMemory(g_profBiasOverrideM15);
+}
+
+//+------------------------------------------------------------------+
+void ProfessionalBiasGetOverrideState(const ENUM_TIMEFRAMES timeframe,
+                                       int &overrideBias, datetime &overrideTime)
+{
+   overrideBias = 0;
+   overrideTime = 0;
+   if(timeframe == PERIOD_W1)
+   {
+      overrideBias = g_profBiasOverrideW1.overrideBias;
+      overrideTime = g_profBiasOverrideW1.overrideTime;
+   }
+   else if(timeframe == PERIOD_D1)
+   {
+      overrideBias = g_profBiasOverrideD1.overrideBias;
+      overrideTime = g_profBiasOverrideD1.overrideTime;
+   }
+   else if(timeframe == PERIOD_H4)
+   {
+      overrideBias = g_profBiasOverrideH4.overrideBias;
+      overrideTime = g_profBiasOverrideH4.overrideTime;
+   }
+   else if(timeframe == PERIOD_M15)
+   {
+      overrideBias = g_profBiasOverrideM15.overrideBias;
+      overrideTime = g_profBiasOverrideM15.overrideTime;
+   }
+}
+
+//+------------------------------------------------------------------+
+void ProfessionalBiasSetDirection(const ENUM_TIMEFRAMES timeframe, const int bias,
+                                     const datetime setBarOpen)
+{
+   if(bias == 0)
+      return;
+
+   if(timeframe == PERIOD_W1)
+   {
+      g_profBiasOverrideW1.overrideBias = bias;
+      g_profBiasOverrideW1.overrideTime = setBarOpen;
+   }
+   else if(timeframe == PERIOD_D1)
+   {
+      g_profBiasOverrideD1.overrideBias = bias;
+      g_profBiasOverrideD1.overrideTime = setBarOpen;
+   }
+   else if(timeframe == PERIOD_H4)
+   {
+      g_profBiasOverrideH4.overrideBias = bias;
+      g_profBiasOverrideH4.overrideTime = setBarOpen;
+   }
+   else if(timeframe == PERIOD_M15)
+   {
+      g_profBiasOverrideM15.overrideBias = bias;
+      g_profBiasOverrideM15.overrideTime = setBarOpen;
+   }
+}
+
+//+------------------------------------------------------------------+
+bool SMCZoneBarCloseRejectionBias(const double top, const double bottom,
+                                   const double barClose, const double eps,
+                                   int &outBias)
+{
+   outBias = 0;
+   if(top <= bottom || barClose <= 0.0)
+      return false;
+
+   const bool closeInside = (barClose >= bottom - eps && barClose <= top + eps);
+   if(closeInside)
+      return false;
+
+   if(barClose < bottom - eps)
+   {
+      outBias = BIAS_BEARISH;
+      return true;
+   }
+   if(barClose > top + eps)
+   {
+      outBias = BIAS_BULLISH;
+      return true;
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+void SMCUpdateProfessionalBiasFromZoneBarClose(const ENUM_TIMEFRAMES timeframe)
+{
+   const double barClose = iClose(_Symbol, timeframe, 1);
+   const datetime barOpen = iTime(_Symbol, timeframe, 1);
+   if(barClose <= 0.0 || barOpen == 0)
+      return;
+
+   const double pointSize = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   const double eps       = (pointSize > 0.0 ? pointSize : 0.00001);
+   int          rejectionBias = 0;
+
+   for(int i = 0; i < SMC_ZONE_LEDGER_CAPACITY; i++)
+   {
+      if(!g_activeZones[i].isActive || g_activeZones[i].isMitigated || g_activeZones[i].isExpired)
+         continue;
+      if(!g_activeZones[i].isBreached)
+         continue;
+      if(SMCZoneTypeToTimeframe(g_activeZones[i].type) != timeframe)
+         continue;
+
+      int zoneBias = 0;
+      if(SMCZoneBarCloseRejectionBias(g_activeZones[i].topPrice, g_activeZones[i].bottomPrice,
+                                      barClose, eps, zoneBias))
+         rejectionBias = zoneBias;
+   }
+
+   for(int f = 0; f < SMC_MTF_FVG_INSTANCE_CAPACITY; f++)
+   {
+      if(!g_mtfFvgInstances[f].inUse || g_mtfFvgInstances[f].isMitigated || g_mtfFvgInstances[f].isExpired)
+         continue;
+      if(!g_mtfFvgInstances[f].isBreached)
+         continue;
+      if(g_mtfFvgInstances[f].timeframe != timeframe)
+         continue;
+
+      int zoneBias = 0;
+      if(SMCZoneBarCloseRejectionBias(g_mtfFvgInstances[f].topPrice, g_mtfFvgInstances[f].bottomPrice,
+                                      barClose, eps, zoneBias))
+         rejectionBias = zoneBias;
+   }
+
+   if(rejectionBias != 0)
+      ProfessionalBiasSetDirection(timeframe, rejectionBias, barOpen);
+}
+
+//+------------------------------------------------------------------+
+int GetProfessionalBias(const ENUM_TIMEFRAMES timeframe)
+{
+   int storedBias = 0;
+   datetime storedBarOpen = 0;
+   ProfessionalBiasGetOverrideState(timeframe, storedBias, storedBarOpen);
+   if(storedBias != 0)
+      return storedBias;
+
+   MTFSwingTracker tracker;
+   if(!SMCGetMtfSwingTracker(timeframe, tracker))
+      return 0;
+
+   return tracker.lastBosDirection;
+}
+
+//+------------------------------------------------------------------+
 double SMCSwingLevelBufferForTimeframe(const ENUM_TIMEFRAMES timeframe)
 {
    const double pointSize = (_Point > 0.0 ? _Point : 0.00001);
@@ -4711,18 +4947,123 @@ double SMCSwingLevelBufferForZoneType(const ENUM_SMC_ZONE_TYPE type)
 //+------------------------------------------------------------------+
 void SMCResetActiveZones()
 {
-   for(int i = 0; i < SMC_ZONE_TYPE_COUNT; i++)
+   for(int i = 0; i < SMC_ZONE_LEDGER_CAPACITY; i++)
    {
-      g_activeZones[i].type               = (ENUM_SMC_ZONE_TYPE)i;
+      g_activeZones[i].type               = (ENUM_SMC_ZONE_TYPE)0;
       g_activeZones[i].topPrice           = 0.0;
       g_activeZones[i].bottomPrice        = 0.0;
       g_activeZones[i].isActive           = false;
       g_activeZones[i].isClustered        = false;
       g_activeZones[i].isMitigated        = false;
-      g_activeZones[i].priceWasInsideZone = false;
+      g_activeZones[i].isBreached         = false;
       g_activeZones[i].isExpired          = false;
       g_activeZones[i].zoneOriginBarTime  = 0;
    }
+
+   for(int i = 0; i < SMC_ZONE_MITIGATION_LEDGER_CAPACITY; i++)
+      g_zoneMitigationLedger[i].inUse = false;
+
+   SMCResetMtfFvgInstances();
+}
+
+//+------------------------------------------------------------------+
+bool SMCActiveZoneOverlapsPrices(const SMCZoneRecord &zone, const ENUM_SMC_ZONE_TYPE type,
+                                  const double top, const double bottom, const double mergeBuffer)
+{
+   if(!zone.isActive || zone.type != type)
+      return false;
+   return top > zone.bottomPrice - mergeBuffer && bottom < zone.topPrice + mergeBuffer;
+}
+
+//+------------------------------------------------------------------+
+int SMCFindActiveZoneSlotByTypeAndPrice(const ENUM_SMC_ZONE_TYPE type,
+                                         const double top, const double bottom)
+{
+   const double mergeBuffer = SMCSwingLevelBufferForZoneType(type);
+   for(int i = 0; i < SMC_ZONE_LEDGER_CAPACITY; i++)
+   {
+      if(SMCActiveZoneOverlapsPrices(g_activeZones[i], type, top, bottom, mergeBuffer))
+         return i;
+   }
+   return -1;
+}
+
+//+------------------------------------------------------------------+
+void SMCDeactivateZoneLedgerSlot(const int slotIndex)
+{
+   if(slotIndex < 0 || slotIndex >= SMC_ZONE_LEDGER_CAPACITY)
+      return;
+
+   SMCDeleteAllZoneRectangleObjectsForSlot(slotIndex);
+   g_activeZones[slotIndex].isActive           = false;
+   g_activeZones[slotIndex].isClustered        = false;
+   g_activeZones[slotIndex].isMitigated         = false;
+   g_activeZones[slotIndex].isBreached          = false;
+   g_activeZones[slotIndex].isExpired           = false;
+   g_activeZones[slotIndex].zoneOriginBarTime   = 0;
+}
+
+//+------------------------------------------------------------------+
+int SMCAllocZoneLedgerSlot()
+{
+   for(int i = 0; i < SMC_ZONE_LEDGER_CAPACITY; i++)
+   {
+      if(!g_activeZones[i].isActive)
+      {
+         SMCDeleteAllZoneRectangleObjectsForSlot(i);
+         return i;
+      }
+   }
+
+   int          evictIdx    = -1;
+   datetime     oldestOrigin = 0;
+   for(int i = 0; i < SMC_ZONE_LEDGER_CAPACITY; i++)
+   {
+      if(!g_activeZones[i].isActive)
+         continue;
+      if(g_activeZones[i].isMitigated || g_activeZones[i].isExpired)
+      {
+         evictIdx = i;
+         break;
+      }
+      if(evictIdx < 0
+         || (g_activeZones[i].zoneOriginBarTime > 0
+             && (oldestOrigin == 0 || g_activeZones[i].zoneOriginBarTime < oldestOrigin)))
+      {
+         oldestOrigin = g_activeZones[i].zoneOriginBarTime;
+         evictIdx     = i;
+      }
+   }
+
+   if(evictIdx < 0)
+      return -1;
+
+   SMCDeactivateZoneLedgerSlot(evictIdx);
+   return evictIdx;
+}
+
+//+------------------------------------------------------------------+
+void SMCApplyFreshZoneStateToSlot(const int slotIndex, const datetime originBarTime)
+{
+   if(slotIndex < 0 || slotIndex >= SMC_ZONE_LEDGER_CAPACITY)
+      return;
+
+   g_activeZones[slotIndex].isMitigated = false;
+   g_activeZones[slotIndex].isBreached  = false;
+   g_activeZones[slotIndex].isExpired   = false;
+   if(originBarTime > 0)
+      g_activeZones[slotIndex].zoneOriginBarTime = originBarTime;
+
+   const int ledgerIndex = SMCFindMitigationLedgerIndex(g_activeZones[slotIndex].type,
+                                                        g_activeZones[slotIndex].topPrice,
+                                                        g_activeZones[slotIndex].bottomPrice, true);
+   if(ledgerIndex < 0)
+      return;
+
+   g_zoneMitigationLedger[ledgerIndex].isMitigated       = false;
+   g_zoneMitigationLedger[ledgerIndex].isBreached        = false;
+   g_zoneMitigationLedger[ledgerIndex].isExpired         = false;
+   g_zoneMitigationLedger[ledgerIndex].zoneOriginBarTime = g_activeZones[slotIndex].zoneOriginBarTime;
 }
 
 //+------------------------------------------------------------------+
@@ -4762,9 +5103,9 @@ int SMCFindMitigationLedgerIndex(const ENUM_SMC_ZONE_TYPE type, const double top
    g_zoneMitigationLedger[freeIndex].type                = type;
    g_zoneMitigationLedger[freeIndex].topPrice            = top;
    g_zoneMitigationLedger[freeIndex].bottomPrice         = bottom;
-   g_zoneMitigationLedger[freeIndex].isMitigated         = false;
-   g_zoneMitigationLedger[freeIndex].priceWasInsideZone  = false;
-   g_zoneMitigationLedger[freeIndex].isExpired           = false;
+   g_zoneMitigationLedger[freeIndex].isMitigated  = false;
+   g_zoneMitigationLedger[freeIndex].isBreached   = false;
+   g_zoneMitigationLedger[freeIndex].isExpired    = false;
    const ENUM_TIMEFRAMES originTf = SMCZoneTypeToTimeframe(type);
    g_zoneMitigationLedger[freeIndex].zoneOriginBarTime   =
       (originTf != PERIOD_CURRENT ? iTime(_Symbol, originTf, 1) : 0);
@@ -4774,7 +5115,7 @@ int SMCFindMitigationLedgerIndex(const ENUM_SMC_ZONE_TYPE type, const double top
 //+------------------------------------------------------------------+
 void SMCApplyMitigationLedgerToSlot(const int slotIndex)
 {
-   if(slotIndex < 0 || slotIndex >= SMC_ZONE_TYPE_COUNT || !g_activeZones[slotIndex].isActive)
+   if(slotIndex < 0 || slotIndex >= SMC_ZONE_LEDGER_CAPACITY || !g_activeZones[slotIndex].isActive)
       return;
 
    const ENUM_SMC_ZONE_TYPE type   = g_activeZones[slotIndex].type;
@@ -4786,9 +5127,9 @@ void SMCApplyMitigationLedgerToSlot(const int slotIndex)
 
    g_zoneMitigationLedger[ledgerIndex].topPrice    = top;
    g_zoneMitigationLedger[ledgerIndex].bottomPrice = bottom;
-   g_activeZones[slotIndex].isMitigated         = g_zoneMitigationLedger[ledgerIndex].isMitigated;
-   g_activeZones[slotIndex].priceWasInsideZone  = g_zoneMitigationLedger[ledgerIndex].priceWasInsideZone;
-   g_activeZones[slotIndex].isExpired          = g_zoneMitigationLedger[ledgerIndex].isExpired;
+   g_activeZones[slotIndex].isMitigated  = g_zoneMitigationLedger[ledgerIndex].isMitigated;
+   g_activeZones[slotIndex].isBreached   = g_zoneMitigationLedger[ledgerIndex].isBreached;
+   g_activeZones[slotIndex].isExpired    = g_zoneMitigationLedger[ledgerIndex].isExpired;
    g_activeZones[slotIndex].zoneOriginBarTime   = g_zoneMitigationLedger[ledgerIndex].zoneOriginBarTime;
    if(g_activeZones[slotIndex].zoneOriginBarTime == 0)
    {
@@ -4813,9 +5154,9 @@ void SMCSaveZoneMitigationToLedger(const SMCZoneRecord &zone)
    g_zoneMitigationLedger[ledgerIndex].type               = zone.type;
    g_zoneMitigationLedger[ledgerIndex].topPrice           = zone.topPrice;
    g_zoneMitigationLedger[ledgerIndex].bottomPrice        = zone.bottomPrice;
-   g_zoneMitigationLedger[ledgerIndex].isMitigated        = zone.isMitigated;
-   g_zoneMitigationLedger[ledgerIndex].priceWasInsideZone  = zone.priceWasInsideZone;
-   g_zoneMitigationLedger[ledgerIndex].isExpired           = zone.isExpired;
+   g_zoneMitigationLedger[ledgerIndex].isMitigated  = zone.isMitigated;
+   g_zoneMitigationLedger[ledgerIndex].isBreached   = zone.isBreached;
+   g_zoneMitigationLedger[ledgerIndex].isExpired    = zone.isExpired;
    g_zoneMitigationLedger[ledgerIndex].zoneOriginBarTime    = zone.zoneOriginBarTime;
 }
 
@@ -4837,11 +5178,36 @@ bool SMCZonePastExpiryBarLimit(const ENUM_SMC_ZONE_TYPE type, const datetime zon
 }
 
 //+------------------------------------------------------------------+
+datetime SMCZoneRectangleTimeRight(const ENUM_TIMEFRAMES timeframe, const datetime zoneOriginBarTime)
+{
+   if(zoneOriginBarTime <= 0)
+      return 0;
+
+   const int periodSec = PeriodSeconds(timeframe);
+   if(periodSec <= 0)
+      return zoneOriginBarTime;
+
+   const int expiryBars = (InputSmcZoneExpiryBars > 0 ? InputSmcZoneExpiryBars : 292);
+   return zoneOriginBarTime + (datetime)(periodSec * expiryBars);
+}
+
+//+------------------------------------------------------------------+
 void SMCExpireZonesPastBarLimit()
 {
-   for(int i = 0; i < SMC_ZONE_TYPE_COUNT; i++)
+   SMCExpireZonesPastBarLimitForTimeframe(PERIOD_W1);
+   SMCExpireZonesPastBarLimitForTimeframe(PERIOD_D1);
+   SMCExpireZonesPastBarLimitForTimeframe(PERIOD_H4);
+   SMCExpireZonesPastBarLimitForTimeframe(PERIOD_M15);
+}
+
+//+------------------------------------------------------------------+
+void SMCExpireZonesPastBarLimitForTimeframe(const ENUM_TIMEFRAMES timeframe)
+{
+   for(int i = 0; i < SMC_ZONE_LEDGER_CAPACITY; i++)
    {
       if(!g_activeZones[i].isActive || g_activeZones[i].isExpired)
+         continue;
+      if(SMCZoneTypeToTimeframe(g_activeZones[i].type) != timeframe)
          continue;
 
       if(SMCZonePastExpiryBarLimit(g_activeZones[i].type, g_activeZones[i].zoneOriginBarTime))
@@ -4853,97 +5219,327 @@ void SMCExpireZonesPastBarLimit()
 }
 
 //+------------------------------------------------------------------+
-void SMCUpdateActiveZonesMitigation()
+//+------------------------------------------------------------------+
+bool SMCBarWicksIntoZone(const double top, const double bottom,
+                          const double barHigh, const double barLow, const double eps)
+{
+   return (barHigh >= bottom - eps && barLow <= top + eps);
+}
+
+//+------------------------------------------------------------------+
+bool SMCBarClosesOutsideZone(const double top, const double bottom,
+                              const double barClose, const double eps)
+{
+   return (barClose < bottom - eps || barClose > top + eps);
+}
+
+//+------------------------------------------------------------------+
+//| Gap/skip: close on far side of zone (bull below bottom, bear above top). |
+//+------------------------------------------------------------------+
+bool SMCBarClosesThroughZoneOppositeSide(const ENUM_SMC_ZONE_TYPE zoneType,
+                                          const double top, const double bottom,
+                                          const double barClose, const double eps)
+{
+   if(barClose <= 0.0)
+      return false;
+   if(SMCZoneTypeIsBullish(zoneType))
+      return barClose < bottom - eps;
+   return barClose > top + eps;
+}
+
+//+------------------------------------------------------------------+
+bool SMCZoneOriginBarDeferMitigation(const datetime barOpen, const datetime zoneOriginBarTime)
+{
+   return (zoneOriginBarTime > 0 && barOpen > 0 && barOpen <= zoneOriginBarTime);
+}
+
+//+------------------------------------------------------------------+
+//| Step 1 breach (wick OR close-through). Step 2 mitigate if close-outside. |
+//+------------------------------------------------------------------+
+bool SMCApplyZoneBreachAndMitigationOnClosedBar(bool &isBreached, bool &isMitigated,
+                                                 const ENUM_SMC_ZONE_TYPE zoneType,
+                                                 const double top, const double bottom,
+                                                 const double barHigh, const double barLow,
+                                                 const double barClose, const double eps,
+                                                 const datetime barOpen,
+                                                 const datetime zoneOriginBarTime,
+                                                 int &outBias)
+{
+   outBias = 0;
+   if(isMitigated || top <= bottom)
+      return false;
+   if(SMCZoneOriginBarDeferMitigation(barOpen, zoneOriginBarTime))
+      return false;
+   if(barClose <= 0.0 || barHigh <= 0.0 || barLow <= 0.0)
+      return false;
+
+   const bool wickBreach         = SMCBarWicksIntoZone(top, bottom, barHigh, barLow, eps);
+   const bool closeThroughBreach = SMCBarClosesThroughZoneOppositeSide(zoneType, top, bottom, barClose, eps);
+   const bool closeOutside       = SMCBarClosesOutsideZone(top, bottom, barClose, eps);
+
+   if(!isBreached && (wickBreach || closeThroughBreach))
+      isBreached = true;
+
+   if(!isBreached || !closeOutside)
+      return false;
+
+   int zoneBias = 0;
+   if(SMCZoneBarCloseRejectionBias(top, bottom, barClose, eps, zoneBias))
+      outBias = zoneBias;
+
+   isMitigated = true;
+   return true;
+}
+
+//+------------------------------------------------------------------+
+void SMCApplyZoneBreachOnClosedBar(bool &isBreached,
+                                    const ENUM_SMC_ZONE_TYPE zoneType,
+                                    const double top, const double bottom,
+                                    const double barHigh, const double barLow,
+                                    const double barClose,
+                                    const double eps,
+                                    const datetime barOpen,
+                                    const datetime zoneOriginBarTime)
+{
+   if(top <= bottom || isBreached)
+      return;
+   if(SMCZoneOriginBarDeferMitigation(barOpen, zoneOriginBarTime))
+      return;
+
+   if(SMCBarWicksIntoZone(top, bottom, barHigh, barLow, eps))
+      isBreached = true;
+   else if(barClose > 0.0
+           && SMCBarClosesThroughZoneOppositeSide(zoneType, top, bottom, barClose, eps))
+      isBreached = true;
+}
+
+//+------------------------------------------------------------------+
+void SMCApplyZoneMitigationOnClosedBar(bool &isMitigated, bool &isBreached,
+                                        const ENUM_SMC_ZONE_TYPE zoneType,
+                                        const double top, const double bottom,
+                                        const double barHigh, const double barLow,
+                                        const double barClose, const double eps,
+                                        const datetime barOpen,
+                                        const datetime zoneOriginBarTime,
+                                        int &outBias)
+{
+   SMCApplyZoneBreachAndMitigationOnClosedBar(isBreached, isMitigated, zoneType,
+                                              top, bottom, barHigh, barLow, barClose, eps,
+                                              barOpen, zoneOriginBarTime, outBias);
+}
+
+//+------------------------------------------------------------------+
+void SMCAdvanceZoneBreachLedgerOnBarClose(const ENUM_TIMEFRAMES timeframe)
 {
    const double pointSize = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
    const double eps       = (pointSize > 0.0 ? pointSize : 0.00001);
+   const double barHigh   = iHigh(_Symbol, timeframe, 1);
+   const double barLow    = iLow(_Symbol, timeframe, 1);
+   const double barClose  = iClose(_Symbol, timeframe, 1);
+   const datetime barOpen = iTime(_Symbol, timeframe, 1);
+   if(barHigh <= 0.0 || barLow <= 0.0 || barClose <= 0.0)
+      return;
 
-   for(int i = 0; i < SMC_ZONE_TYPE_COUNT; i++)
+   for(int i = 0; i < SMC_ZONE_MITIGATION_LEDGER_CAPACITY; i++)
    {
-      if(!g_activeZones[i].isActive || g_activeZones[i].isMitigated || g_activeZones[i].isExpired)
+      if(!g_zoneMitigationLedger[i].inUse || g_zoneMitigationLedger[i].isMitigated
+         || g_zoneMitigationLedger[i].isExpired)
+         continue;
+      if(SMCZoneTypeToTimeframe(g_zoneMitigationLedger[i].type) != timeframe)
          continue;
 
-      const ENUM_TIMEFRAMES tf = SMCZoneTypeToTimeframe(g_activeZones[i].type);
-      if(tf == PERIOD_CURRENT)
-         continue;
-
-      const double top       = g_activeZones[i].topPrice;
-      const double bottom    = g_activeZones[i].bottomPrice;
-      const double barClose  = iClose(_Symbol, tf, 1);
-      const double barHigh   = iHigh(_Symbol, tf, 1);
-      const double barLow    = iLow(_Symbol, tf, 1);
-      if(barClose <= 0.0)
-         continue;
-
-      const bool closeInside = (barClose >= bottom - eps && barClose <= top + eps);
-      const bool barTouches  = (barHigh >= bottom - eps && barLow <= top + eps);
-
-      if(barTouches || closeInside)
-         g_activeZones[i].priceWasInsideZone = true;
-
-      if(g_activeZones[i].priceWasInsideZone && !closeInside)
-         g_activeZones[i].isMitigated = true;
-
-      SMCSaveZoneMitigationToLedger(g_activeZones[i]);
+      int unusedBias = 0;
+      SMCApplyZoneBreachAndMitigationOnClosedBar(g_zoneMitigationLedger[i].isBreached,
+                                                  g_zoneMitigationLedger[i].isMitigated,
+                                                  g_zoneMitigationLedger[i].type,
+                                                  g_zoneMitigationLedger[i].topPrice,
+                                                  g_zoneMitigationLedger[i].bottomPrice,
+                                                  barHigh, barLow, barClose, eps, barOpen,
+                                                  g_zoneMitigationLedger[i].zoneOriginBarTime,
+                                                  unusedBias);
    }
 }
 
 //+------------------------------------------------------------------+
-void RegisterOrMergeZone(const ENUM_SMC_ZONE_TYPE newType, const double top,
-                          const double bottom)
+void SMCUpdateZoneBreachForActiveZonesTimeframe(const ENUM_TIMEFRAMES timeframe)
 {
-   if(newType < 0 || newType >= SMC_ZONE_TYPE_COUNT)
-      return;
-   if(top <= bottom)
+   SMCApplyZoneExitBiasAndMitigationForTimeframe(timeframe);
+}
+
+//+------------------------------------------------------------------+
+void SMCUpdateMtfFvgZoneBreachForTimeframe(const ENUM_TIMEFRAMES timeframe)
+{
+   // Unified in SMCApplyZoneExitBiasAndMitigationForTimeframe.
+}
+
+//+------------------------------------------------------------------+
+void SMCUpdateActiveZonesMitigation()
+{
+   SMCUpdateActiveZonesMitigationForTimeframe(PERIOD_W1);
+   SMCUpdateActiveZonesMitigationForTimeframe(PERIOD_D1);
+   SMCUpdateActiveZonesMitigationForTimeframe(PERIOD_H4);
+   SMCUpdateActiveZonesMitigationForTimeframe(PERIOD_M15);
+}
+
+//+------------------------------------------------------------------+
+void SMCUpdateActiveZonesMitigationForTimeframe(const ENUM_TIMEFRAMES timeframe)
+{
+   SMCApplyZoneExitBiasAndMitigationForTimeframe(timeframe);
+}
+
+//+------------------------------------------------------------------+
+//| Breach (wick or close-through) then mitigate (close-outside) same bar; bias on exit. |
+//+------------------------------------------------------------------+
+void SMCApplyZoneExitBiasAndMitigationForTimeframe(const ENUM_TIMEFRAMES timeframe)
+{
+   const double pointSize = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   const double eps       = (pointSize > 0.0 ? pointSize : 0.00001);
+   const double barHigh   = iHigh(_Symbol, timeframe, 1);
+   const double barLow    = iLow(_Symbol, timeframe, 1);
+   const double barClose  = iClose(_Symbol, timeframe, 1);
+   const datetime barOpen = iTime(_Symbol, timeframe, 1);
+   if(barHigh <= 0.0 || barLow <= 0.0 || barClose <= 0.0 || barOpen == 0)
       return;
 
-   const double newBuffer = SMCSwingLevelBufferForZoneType(newType);
-
-   for(int i = 0; i < SMC_ZONE_TYPE_COUNT; i++)
+   for(int i = 0; i < SMC_ZONE_LEDGER_CAPACITY; i++)
    {
-      if(!g_activeZones[i].isActive)
-         continue;
-      if(SMCZoneTypeIsBullish(newType) != SMCZoneTypeIsBullish(g_activeZones[i].type))
+      if(!g_activeZones[i].isActive || g_activeZones[i].isMitigated || g_activeZones[i].isExpired)
          continue;
 
-      const double existingTop    = g_activeZones[i].topPrice;
-      const double existingBottom = g_activeZones[i].bottomPrice;
-      const double mergeBuffer    = MathMax(newBuffer,
-                                            SMCSwingLevelBufferForZoneType(g_activeZones[i].type));
+      const ENUM_SMC_ZONE_TYPE zoneType = g_activeZones[i].type;
+      if(SMCZoneTypeToTimeframe(zoneType) != timeframe)
+         continue;
 
-      if(top > existingBottom - mergeBuffer && bottom < existingTop + mergeBuffer)
+      int zoneBias = 0;
+      const bool mitigatedNow = SMCApplyZoneBreachAndMitigationOnClosedBar(
+         g_activeZones[i].isBreached,
+         g_activeZones[i].isMitigated,
+         zoneType,
+         g_activeZones[i].topPrice,
+         g_activeZones[i].bottomPrice,
+         barHigh, barLow, barClose, eps, barOpen,
+         g_activeZones[i].zoneOriginBarTime,
+         zoneBias);
+
+      if(zoneBias != 0)
+         ProfessionalBiasSetDirection(timeframe, zoneBias, barOpen);
+
+      if(mitigatedNow)
       {
-         const int newStrength      = GetZoneTimeframeStrength(newType);
-         const int existingStrength = GetZoneTimeframeStrength(g_activeZones[i].type);
+         g_activeZones[i].isActive = false;
+         SMCSaveZoneMitigationToLedger(g_activeZones[i]);
+         SMCDeleteAllZoneRectangleObjectsForSlot(i);
+      }
+      else if(g_activeZones[i].isBreached)
+         SMCSaveZoneMitigationToLedger(g_activeZones[i]);
+   }
 
-         if(newStrength >= existingStrength)
-         {
-            g_activeZones[i].type        = newType;
-            g_activeZones[i].topPrice    = top;
-            g_activeZones[i].bottomPrice = bottom;
-            g_activeZones[i].isClustered = true;
-         }
-         else
-            g_activeZones[i].isClustered = false;
+   for(int f = 0; f < SMC_MTF_FVG_INSTANCE_CAPACITY; f++)
+   {
+      if(!g_mtfFvgInstances[f].inUse || g_mtfFvgInstances[f].isMitigated || g_mtfFvgInstances[f].isExpired)
+         continue;
+      if(g_mtfFvgInstances[f].timeframe != timeframe)
+         continue;
 
-         SMCApplyMitigationLedgerToSlot(i);
-         return;
+      int zoneBias = 0;
+      const bool mitigatedNow = SMCApplyZoneBreachAndMitigationOnClosedBar(
+         g_mtfFvgInstances[f].isBreached,
+         g_mtfFvgInstances[f].isMitigated,
+         g_mtfFvgInstances[f].type,
+         g_mtfFvgInstances[f].topPrice,
+         g_mtfFvgInstances[f].bottomPrice,
+         barHigh, barLow, barClose, eps, barOpen,
+         g_mtfFvgInstances[f].zoneOriginBarTime,
+         zoneBias);
+
+      if(zoneBias != 0)
+         ProfessionalBiasSetDirection(timeframe, zoneBias, barOpen);
+
+      if(mitigatedNow)
+      {
+         g_mtfFvgInstances[f].inUse = false;
+         SMCDeleteMtfFvgRectangleForInstance(g_mtfFvgInstances[f].type,
+                                             g_mtfFvgInstances[f].zoneOriginBarTime);
       }
    }
+}
 
-   for(int i = 0; i < SMC_ZONE_TYPE_COUNT; i++)
+//+------------------------------------------------------------------+
+bool SMCZoneRegistrationAllowed(const ENUM_SMC_ZONE_TYPE type,
+                                 const double top, const double bottom)
+{
+   if(SMCZoneTypeIsSwingLiquidity(type))
+      return true;
+
+   if(SMCZonePassesCurrentPriceSideFilter(type, top, bottom))
+      return true;
+
+   const int ledgerIndex = SMCFindMitigationLedgerIndex(type, top, bottom, false);
+   if(ledgerIndex >= 0 && g_zoneMitigationLedger[ledgerIndex].inUse
+      && !g_zoneMitigationLedger[ledgerIndex].isMitigated
+      && !g_zoneMitigationLedger[ledgerIndex].isExpired)
+      return true;
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
+int RegisterOrMergeZone(const ENUM_SMC_ZONE_TYPE newType, const double top,
+                         const double bottom, const datetime originBarTime = 0,
+                         const bool forceFreshZoneState = false)
+{
+   if(newType < 0 || newType >= SMC_ZONE_TYPE_COUNT)
+      return -1;
+   if(top <= bottom)
+      return -1;
+   if(SMCZoneTypeIsMtfFvg(newType))
+      return -1;
+   if(!SMCZoneRegistrationAllowed(newType, top, bottom))
+      return -1;
+
+   datetime origin = originBarTime;
+   if(origin <= 0)
    {
-      if(g_activeZones[i].isActive)
-         continue;
-
-      g_activeZones[i].type        = newType;
-      g_activeZones[i].topPrice    = top;
-      g_activeZones[i].bottomPrice = bottom;
-      g_activeZones[i].isActive    = true;
-      g_activeZones[i].isClustered = false;
-      SMCApplyMitigationLedgerToSlot(i);
-      return;
+      const ENUM_TIMEFRAMES originTf = SMCZoneTypeToTimeframe(newType);
+      if(originTf != PERIOD_CURRENT)
+         origin = iTime(_Symbol, originTf, 1);
    }
+
+   int slot = SMCFindActiveZoneSlotByTypeAndPrice(newType, top, bottom);
+   if(slot < 0)
+   {
+      slot = SMCAllocZoneLedgerSlot();
+      if(slot < 0)
+         return -1;
+
+      SMCDeleteAllZoneRectangleObjectsForSlot(slot);
+
+      g_activeZones[slot].type               = newType;
+      g_activeZones[slot].topPrice           = top;
+      g_activeZones[slot].bottomPrice        = bottom;
+      g_activeZones[slot].isActive           = true;
+      g_activeZones[slot].isClustered        = false;
+      g_activeZones[slot].zoneOriginBarTime  = origin;
+      if(forceFreshZoneState)
+         SMCApplyFreshZoneStateToSlot(slot, origin);
+      else
+      {
+         g_activeZones[slot].isMitigated = false;
+         g_activeZones[slot].isBreached  = false;
+         g_activeZones[slot].isExpired   = false;
+      }
+      SMCApplyMitigationLedgerToSlot(slot);
+      return slot;
+   }
+
+   g_activeZones[slot].topPrice    = top;
+   g_activeZones[slot].bottomPrice = bottom;
+   if(origin > 0)
+      g_activeZones[slot].zoneOriginBarTime = origin;
+   if(forceFreshZoneState)
+      SMCApplyFreshZoneStateToSlot(slot, origin);
+   SMCApplyMitigationLedgerToSlot(slot);
+   return slot;
 }
 
 //+------------------------------------------------------------------+
@@ -5002,17 +5598,227 @@ bool SMCFvgMitigated(const ENUM_TIMEFRAMES timeframe, const int formationNewestS
 }
 
 //+------------------------------------------------------------------+
+double SMCFvgPriceFacingInsetForTimeframe(const ENUM_TIMEFRAMES timeframe)
+{
+   if(InputSmcFvgZonePriceFacingInsetPercentChart <= 0.0)
+      return 0.0;
+
+   const int lookbackBars = MathMax(3, InputSmcFvgLookbackBars);
+   const double chartHeight = ReferenceChartHeightForTimeframeBarCount(timeframe, lookbackBars);
+   if(chartHeight <= 0.0)
+      return 0.0;
+
+   return chartHeight * (InputSmcFvgZonePriceFacingInsetPercentChart / 100.0);
+}
+
+//+------------------------------------------------------------------+
+bool SMCApplyMtfFvgGapZoneEdges(const ENUM_TIMEFRAMES timeframe, const bool isBullish,
+                                 const double gapBottom, const double gapTop,
+                                 double &outBottom, double &outTop)
+{
+   outBottom = gapBottom;
+   outTop    = gapTop;
+
+   const double inset = SMCFvgPriceFacingInsetForTimeframe(timeframe);
+   const double pointSize = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   const double minGap    = (pointSize > 0.0 ? pointSize : 0.00001);
+
+   if(inset > 0.0)
+   {
+      if(isBullish)
+         outTop = gapTop - inset;
+      else
+         outBottom = gapBottom + inset;
+   }
+
+   return outTop > outBottom + minGap;
+}
+
+//+------------------------------------------------------------------+
+void SMCResetMtfFvgInstances()
+{
+   for(int i = 0; i < SMC_MTF_FVG_INSTANCE_CAPACITY; i++)
+      g_mtfFvgInstances[i].inUse = false;
+
+   SMCDeleteMtfFvgZoneRectanglesForTimeframe(PERIOD_W1);
+   SMCDeleteMtfFvgZoneRectanglesForTimeframe(PERIOD_D1);
+   SMCDeleteMtfFvgZoneRectanglesForTimeframe(PERIOD_H4);
+   SMCDeleteMtfFvgZoneRectanglesForTimeframe(PERIOD_M15);
+}
+
+//+------------------------------------------------------------------+
+int SMCFindMtfFvgInstanceIndex(const ENUM_SMC_ZONE_TYPE type, const datetime originBarTime)
+{
+   for(int i = 0; i < SMC_MTF_FVG_INSTANCE_CAPACITY; i++)
+   {
+      if(!g_mtfFvgInstances[i].inUse)
+         continue;
+      if(g_mtfFvgInstances[i].type != type)
+         continue;
+      if(g_mtfFvgInstances[i].zoneOriginBarTime == originBarTime)
+         return i;
+   }
+   return -1;
+}
+
+//+------------------------------------------------------------------+
+int SMCAllocMtfFvgInstanceIndex()
+{
+   for(int i = 0; i < SMC_MTF_FVG_INSTANCE_CAPACITY; i++)
+   {
+      if(!g_mtfFvgInstances[i].inUse)
+         return i;
+   }
+   return -1;
+}
+
+//+------------------------------------------------------------------+
+void SMCUpsertMtfFvgInstance(const ENUM_SMC_ZONE_TYPE type, const double bottom, const double top,
+                                const datetime originBarTime)
+{
+   if(!SMCZoneTypeIsMtfFvg(type) || top <= bottom || originBarTime <= 0)
+      return;
+
+   int idx = SMCFindMtfFvgInstanceIndex(type, originBarTime);
+   if(idx < 0)
+   {
+      idx = SMCAllocMtfFvgInstanceIndex();
+      if(idx < 0)
+         return;
+
+      g_mtfFvgInstances[idx].inUse              = true;
+      g_mtfFvgInstances[idx].type               = type;
+      g_mtfFvgInstances[idx].timeframe          = SMCZoneTypeToTimeframe(type);
+      g_mtfFvgInstances[idx].isMitigated = false;
+      g_mtfFvgInstances[idx].isBreached  = false;
+      g_mtfFvgInstances[idx].isExpired   = false;
+      g_mtfFvgInstances[idx].zoneOriginBarTime  = originBarTime;
+   }
+
+   g_mtfFvgInstances[idx].topPrice    = top;
+   g_mtfFvgInstances[idx].bottomPrice = bottom;
+}
+
+//+------------------------------------------------------------------+
+void SMCUpdateMtfFvgInstancesMitigationForTimeframe(const ENUM_TIMEFRAMES timeframe)
+{
+   // FVG exit bias + mitigation handled in SMCApplyZoneExitBiasAndMitigationForTimeframe.
+}
+
+//+------------------------------------------------------------------+
+void SMCExpireMtfFvgInstancesForTimeframe(const ENUM_TIMEFRAMES timeframe)
+{
+   for(int i = 0; i < SMC_MTF_FVG_INSTANCE_CAPACITY; i++)
+   {
+      if(!g_mtfFvgInstances[i].inUse || g_mtfFvgInstances[i].isExpired)
+         continue;
+      if(g_mtfFvgInstances[i].timeframe != timeframe)
+         continue;
+
+      if(SMCZonePastExpiryBarLimit(g_mtfFvgInstances[i].type, g_mtfFvgInstances[i].zoneOriginBarTime))
+         g_mtfFvgInstances[i].isExpired = true;
+   }
+}
+
+//+------------------------------------------------------------------+
+string SMCMtfFvgRectangleObjectName(const ENUM_SMC_ZONE_TYPE zoneType, const datetime originBarTime)
+{
+   const ENUM_TIMEFRAMES zoneTf = SMCZoneTypeToTimeframe(zoneType);
+   return LQ_OBJ_PREFIX_SMC_ZONE_RECT + SMCZoneTimeframeTag(zoneTf) + "_FVG_"
+          + IntegerToString((long)originBarTime);
+}
+
+//+------------------------------------------------------------------+
+void SMCDeleteMtfFvgZoneRectanglesForTimeframe(const ENUM_TIMEFRAMES timeframe)
+{
+   const string prefix = LQ_OBJ_PREFIX_SMC_ZONE_RECT + SMCZoneTimeframeTag(timeframe) + "_FVG_";
+   ObjectsDeleteAll(0, prefix, -1, -1);
+}
+
+//+------------------------------------------------------------------+
+void SMCDeleteMtfFvgRectangleForInstance(const ENUM_SMC_ZONE_TYPE zoneType,
+                                            const datetime originBarTime)
+{
+   const string objName = SMCMtfFvgRectangleObjectName(zoneType, originBarTime);
+   if(ObjectFind(0, objName) >= 0)
+      ObjectDelete(0, objName);
+}
+
+//+------------------------------------------------------------------+
+void SMCDrawMtfFvgRectangleForInstance(const int instanceIndex)
+{
+   if(instanceIndex < 0 || instanceIndex >= SMC_MTF_FVG_INSTANCE_CAPACITY)
+      return;
+   if(!g_mtfFvgInstances[instanceIndex].inUse || g_mtfFvgInstances[instanceIndex].isMitigated
+      || g_mtfFvgInstances[instanceIndex].isExpired)
+      return;
+
+   const ENUM_TIMEFRAMES timeframe = g_mtfFvgInstances[instanceIndex].timeframe;
+   if(!MtfSwingLegDrawEnabled(timeframe))
+      return;
+
+   const datetime timeLeft = g_mtfFvgInstances[instanceIndex].zoneOriginBarTime;
+   const datetime timeRight = SMCZoneRectangleTimeRight(timeframe, timeLeft);
+   const string objName = SMCMtfFvgRectangleObjectName(g_mtfFvgInstances[instanceIndex].type,
+                                                        g_mtfFvgInstances[instanceIndex].zoneOriginBarTime);
+   const double top    = g_mtfFvgInstances[instanceIndex].topPrice;
+   const double bottom = g_mtfFvgInstances[instanceIndex].bottomPrice;
+   if(timeLeft <= 0 || timeRight <= 0 || top <= bottom)
+      return;
+
+   if(ObjectFind(0, objName) < 0)
+   {
+      if(!ObjectCreate(0, objName, OBJ_RECTANGLE, 0, timeLeft, top, timeRight, bottom))
+         return;
+   }
+   else
+   {
+      ObjectSetInteger(0, objName, OBJPROP_TIME, 0, timeLeft);
+      ObjectSetDouble(0, objName, OBJPROP_PRICE, 0, top);
+      ObjectSetInteger(0, objName, OBJPROP_TIME, 1, timeRight);
+      ObjectSetDouble(0, objName, OBJPROP_PRICE, 1, bottom);
+   }
+
+   const color rectColor = SMCZoneTypeIsBullish(g_mtfFvgInstances[instanceIndex].type)
+                           ? clrLimeGreen : clrDeepPink;
+   ObjectSetInteger(0, objName, OBJPROP_COLOR, rectColor);
+   ObjectSetInteger(0, objName, OBJPROP_STYLE, STYLE_SOLID);
+   ObjectSetInteger(0, objName, OBJPROP_WIDTH, 1);
+   ObjectSetInteger(0, objName, OBJPROP_FILL, false);
+   ObjectSetInteger(0, objName, OBJPROP_BACK, true);
+   ObjectSetInteger(0, objName, OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, objName, OBJPROP_HIDDEN, false);
+   ObjectSetInteger(0, objName, OBJPROP_TIMEFRAMES, OBJ_ALL_PERIODS);
+}
+
+//+------------------------------------------------------------------+
+void SMCSyncMtfFvgZoneRectanglesForTimeframe(const ENUM_TIMEFRAMES timeframe)
+{
+   for(int i = 0; i < SMC_MTF_FVG_INSTANCE_CAPACITY; i++)
+   {
+      if(g_mtfFvgInstances[i].timeframe != timeframe)
+         continue;
+
+      if(g_mtfFvgInstances[i].inUse && !g_mtfFvgInstances[i].isMitigated && !g_mtfFvgInstances[i].isExpired)
+         SMCDrawMtfFvgRectangleForInstance(i);
+      else if(g_mtfFvgInstances[i].zoneOriginBarTime > 0)
+         SMCDeleteMtfFvgRectangleForInstance(g_mtfFvgInstances[i].type,
+                                             g_mtfFvgInstances[i].zoneOriginBarTime);
+   }
+}
+
+//+------------------------------------------------------------------+
+void SMCDrawMtfFvgZoneRectanglesForTimeframe(const ENUM_TIMEFRAMES timeframe)
+{
+   SMCSyncMtfFvgZoneRectanglesForTimeframe(timeframe);
+}
+
+//+------------------------------------------------------------------+
 void SMCMapUnmitigatedFvgsForTimeframe(const ENUM_TIMEFRAMES timeframe,
                                         const ENUM_SMC_ZONE_TYPE bullZoneType,
                                         const ENUM_SMC_ZONE_TYPE bearZoneType)
 {
    const int lookback = MathMax(3, InputSmcFvgLookbackBars);
-   int       bestBullMid = -1;
-   double    bestBullBottom = 0.0;
-   double    bestBullTop    = 0.0;
-   int       bestBearMid = -1;
-   double    bestBearBottom = 0.0;
-   double    bestBearTop    = 0.0;
 
    for(int middleShift = 2; middleShift <= lookback; middleShift++)
    {
@@ -5026,31 +5832,23 @@ void SMCMapUnmitigatedFvgsForTimeframe(const ENUM_TIMEFRAMES timeframe,
       if(SMCFvgMitigated(timeframe, formationNewestShift, isBullish, bottom, top))
          continue;
 
-      if(isBullish)
-      {
-         if(bestBullMid < 0 || middleShift < bestBullMid)
-         {
-            bestBullMid    = middleShift;
-            bestBullBottom = bottom;
-            bestBullTop    = top;
-         }
-      }
-      else if(bestBearMid < 0 || middleShift < bestBearMid)
-      {
-         bestBearMid    = middleShift;
-         bestBearBottom = bottom;
-         bestBearTop    = top;
-      }
-   }
+      const ENUM_SMC_ZONE_TYPE zoneType = isBullish ? bullZoneType : bearZoneType;
+      double regBottom = 0.0;
+      double regTop    = 0.0;
+      if(!SMCApplyMtfFvgGapZoneEdges(timeframe, isBullish, bottom, top, regBottom, regTop))
+         continue;
 
-   if(bestBullMid >= 0)
-      RegisterOrMergeZone(bullZoneType, bestBullTop, bestBullBottom);
-   if(bestBearMid >= 0)
-      RegisterOrMergeZone(bearZoneType, bestBearTop, bestBearBottom);
+      const datetime origin = iTime(_Symbol, timeframe, middleShift);
+      if(origin <= 0)
+         continue;
+
+      SMCUpsertMtfFvgInstance(zoneType, regBottom, regTop, origin);
+   }
 }
 
 //+------------------------------------------------------------------+
 bool SMCSwingExtremeViolatedSinceLegEnd(const ENUM_TIMEFRAMES timeframe,
+                                         const datetime legStartTime,
                                          const datetime legEndTime,
                                          const bool checkHighViolation,
                                          const double level)
@@ -5058,16 +5856,25 @@ bool SMCSwingExtremeViolatedSinceLegEnd(const ENUM_TIMEFRAMES timeframe,
    const double pointSize = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
    const double eps       = (pointSize > 0.0 ? pointSize : 0.00001);
 
-   int startShift = 1;
-   if(legEndTime > 0)
-   {
-      const int legEndShift = iBarShift(_Symbol, timeframe, legEndTime, true);
-      if(legEndShift >= 0)
-         startShift = legEndShift - 1;
-   }
+   const int barsTotal = iBars(_Symbol, timeframe);
+   if(barsTotal < 2)
+      return false;
 
-   for(int barShift = startShift; barShift >= 1; barShift--)
+   for(int barShift = 1; barShift < barsTotal; barShift++)
    {
+      const datetime barOpen = iTime(_Symbol, timeframe, barShift);
+      if(barOpen == 0)
+         continue;
+
+      // Completed leg: only count closes on bars strictly after leg end (not the closing bar itself).
+      if(legEndTime > 0)
+      {
+         if(barOpen <= legEndTime)
+            continue;
+      }
+      else if(legStartTime > 0 && barOpen < legStartTime)
+         continue;
+
       const double barClose = iClose(_Symbol, timeframe, barShift);
       if(checkHighViolation && barClose > level + eps)
          return true;
@@ -5084,18 +5891,6 @@ bool SMCTryGetLatestUnbrokenSwingHigh(const SwingState &swingState,
 {
    outLevel = 0.0;
 
-   if(swingState.currentSwingLeg.swingDirection == 1 &&
-      swingState.currentSwingLeg.legHighPrice > 0.0)
-   {
-      const double legHigh = swingState.currentSwingLeg.legHighPrice;
-      if(!SMCSwingExtremeViolatedSinceLegEnd(timeframe, swingState.currentSwingLeg.legEndTime,
-                                             true, legHigh))
-      {
-         outLevel = legHigh;
-         return true;
-      }
-   }
-
    for(int historyIndex = swingState.swingHistoryCount - 1; historyIndex >= 0; historyIndex--)
    {
       if(swingState.swingHistory[historyIndex].swingDirection != 1)
@@ -5105,6 +5900,7 @@ bool SMCTryGetLatestUnbrokenSwingHigh(const SwingState &swingState,
       if(legHigh <= 0.0)
          continue;
       if(!SMCSwingExtremeViolatedSinceLegEnd(timeframe,
+                                             swingState.swingHistory[historyIndex].legStartTime,
                                              swingState.swingHistory[historyIndex].legEndTime,
                                              true, legHigh))
       {
@@ -5123,18 +5919,6 @@ bool SMCTryGetLatestUnbrokenSwingLow(const SwingState &swingState,
 {
    outLevel = 0.0;
 
-   if(swingState.currentSwingLeg.swingDirection == -1 &&
-      swingState.currentSwingLeg.legLowPrice > 0.0)
-   {
-      const double legLow = swingState.currentSwingLeg.legLowPrice;
-      if(!SMCSwingExtremeViolatedSinceLegEnd(timeframe, swingState.currentSwingLeg.legEndTime,
-                                             false, legLow))
-      {
-         outLevel = legLow;
-         return true;
-      }
-   }
-
    for(int historyIndex = swingState.swingHistoryCount - 1; historyIndex >= 0; historyIndex--)
    {
       if(swingState.swingHistory[historyIndex].swingDirection != -1)
@@ -5144,6 +5928,7 @@ bool SMCTryGetLatestUnbrokenSwingLow(const SwingState &swingState,
       if(legLow <= 0.0)
          continue;
       if(!SMCSwingExtremeViolatedSinceLegEnd(timeframe,
+                                             swingState.swingHistory[historyIndex].legStartTime,
                                              swingState.swingHistory[historyIndex].legEndTime,
                                              false, legLow))
       {
@@ -5156,22 +5941,96 @@ bool SMCTryGetLatestUnbrokenSwingLow(const SwingState &swingState,
 }
 
 //+------------------------------------------------------------------+
+void SMCRegisterDedicatedSwingHighZone(const ENUM_SMC_ZONE_TYPE type, const double level,
+                                        const double buffer, const datetime originBarTime = 0,
+                                        const bool forceFreshZoneState = false)
+{
+   if(level <= 0.0 || buffer <= 0.0)
+      return;
+   RegisterOrMergeZone(type, level + buffer, level, originBarTime, forceFreshZoneState);
+}
+
+//+------------------------------------------------------------------+
+void SMCRegisterDedicatedSwingLowZone(const ENUM_SMC_ZONE_TYPE type, const double level,
+                                         const double buffer, const datetime originBarTime = 0,
+                                         const bool forceFreshZoneState = false)
+{
+   if(level <= 0.0 || buffer <= 0.0)
+      return;
+   RegisterOrMergeZone(type, level, level - buffer, originBarTime, forceFreshZoneState);
+}
+
+//+------------------------------------------------------------------+
+void SMCRegisterLiquidityHighZone(const ENUM_SMC_ZONE_TYPE type, const double level, const double buffer)
+{
+   if(level <= 0.0 || buffer <= 0.0)
+      return;
+   RegisterOrMergeZone(type, level + buffer, level, 0, false);
+}
+
+//+------------------------------------------------------------------+
+void SMCRegisterLiquidityLowZone(const ENUM_SMC_ZONE_TYPE type, const double level, const double buffer)
+{
+   if(level <= 0.0 || buffer <= 0.0)
+      return;
+   RegisterOrMergeZone(type, level, level - buffer, 0, false);
+}
+
+//+------------------------------------------------------------------+
+void SMCSeedSwingZonesFromHistory(const MTFSwingTracker &tracker,
+                                   const ENUM_SMC_ZONE_TYPE bullSwingLowType,
+                                   const ENUM_SMC_ZONE_TYPE bearSwingHighType)
+{
+   if(tracker.timeframe == 0 || tracker.swing.swingHistoryCount <= 0)
+      return;
+
+   const double buffer = SMCSwingLevelBufferForTimeframe(tracker.timeframe);
+   for(int historyIndex = 0; historyIndex < tracker.swing.swingHistoryCount; historyIndex++)
+   {
+      const Swing leg = tracker.swing.swingHistory[historyIndex];
+      if(leg.legEndTime <= 0)
+         continue;
+
+      if(leg.swingDirection == 1 && leg.legHighPrice > 0.0)
+         SMCRegisterDedicatedSwingHighZone(bearSwingHighType, leg.legHighPrice, buffer, leg.legEndTime, false);
+      else if(leg.swingDirection == -1 && leg.legLowPrice > 0.0)
+         SMCRegisterDedicatedSwingLowZone(bullSwingLowType, leg.legLowPrice, buffer, leg.legEndTime, false);
+   }
+}
+
+//+------------------------------------------------------------------+
 void SMCMapUnbrokenSwingZones(const MTFSwingTracker &tracker,
                                const ENUM_SMC_ZONE_TYPE bullSwingLowType,
                                const ENUM_SMC_ZONE_TYPE bearSwingHighType)
 {
-   if(tracker.timeframe == 0)
+   SMCSeedSwingZonesFromHistory(tracker, bullSwingLowType, bearSwingHighType);
+}
+
+//+------------------------------------------------------------------+
+void SMCRegisterSwingZoneFromJustClosedLeg(const MTFSwingTracker &tracker,
+                                             const ENUM_SMC_ZONE_TYPE bullSwingLowType,
+                                             const ENUM_SMC_ZONE_TYPE bearSwingHighType,
+                                             int &outRegisteredSlot)
+{
+   outRegisteredSlot = -1;
+   if(tracker.swing.swingHistoryCount <= 0)
       return;
 
-   const double buffer = SMCSwingLevelBufferForTimeframe(tracker.timeframe);
+   const Swing  closedLeg = tracker.swing.swingHistory[tracker.swing.swingHistoryCount - 1];
+   const double buffer    = SMCSwingLevelBufferForTimeframe(tracker.timeframe);
+   if(closedLeg.legEndTime <= 0)
+      return;
 
-   double swingHigh = 0.0;
-   if(SMCTryGetLatestUnbrokenSwingHigh(tracker.swing, tracker.timeframe, swingHigh))
-      RegisterOrMergeZone(bearSwingHighType, swingHigh + buffer, swingHigh - buffer);
-
-   double swingLow = 0.0;
-   if(SMCTryGetLatestUnbrokenSwingLow(tracker.swing, tracker.timeframe, swingLow))
-      RegisterOrMergeZone(bullSwingLowType, swingLow + buffer, swingLow - buffer);
+   if(closedLeg.swingDirection == 1 && closedLeg.legHighPrice > 0.0)
+      outRegisteredSlot = RegisterOrMergeZone(bearSwingHighType,
+                                              closedLeg.legHighPrice + buffer,
+                                              closedLeg.legHighPrice,
+                                              closedLeg.legEndTime, true);
+   else if(closedLeg.swingDirection == -1 && closedLeg.legLowPrice > 0.0)
+      outRegisteredSlot = RegisterOrMergeZone(bullSwingLowType,
+                                              closedLeg.legLowPrice,
+                                              closedLeg.legLowPrice - buffer,
+                                              closedLeg.legEndTime, true);
 }
 
 //+------------------------------------------------------------------+
@@ -5188,24 +6047,384 @@ void SMCMapBrokenStructuralZone(const MTFSwingTracker &tracker,
 
    if(tracker.lastBosDirection == 1)
    {
-      RegisterOrMergeZone(bullBrokenHighType,
-                          tracker.lastBosLevel + buffer,
-                          tracker.lastBosLevel - buffer);
+      SMCRegisterLiquidityHighZone(bullBrokenHighType, tracker.lastBosLevel, buffer);
       if(tracker.lastBrokenLegLow > 0.0)
-         RegisterOrMergeZone(bullProtectedLowType,
-                             tracker.lastBrokenLegLow + buffer,
-                             tracker.lastBrokenLegLow - buffer);
+         SMCRegisterLiquidityLowZone(bullProtectedLowType, tracker.lastBrokenLegLow, buffer);
    }
    else if(tracker.lastBosDirection == -1)
    {
-      RegisterOrMergeZone(bearBrokenLowType,
-                          tracker.lastBosLevel + buffer,
-                          tracker.lastBosLevel - buffer);
+      SMCRegisterLiquidityLowZone(bearBrokenLowType, tracker.lastBosLevel, buffer);
       if(tracker.lastBrokenLegHigh > 0.0)
-         RegisterOrMergeZone(bearProtectedHighType,
-                             tracker.lastBrokenLegHigh + buffer,
-                             tracker.lastBrokenLegHigh - buffer);
+         SMCRegisterLiquidityHighZone(bearProtectedHighType, tracker.lastBrokenLegHigh, buffer);
    }
+}
+
+//+------------------------------------------------------------------+
+void SMCClearActiveZonesForTimeframe(const ENUM_TIMEFRAMES timeframe)
+{
+   for(int i = 0; i < SMC_ZONE_TYPE_COUNT; i++)
+   {
+      const ENUM_SMC_ZONE_TYPE slotType = g_activeZones[i].isActive
+         ? g_activeZones[i].type
+         : (ENUM_SMC_ZONE_TYPE)i;
+      if(SMCZoneTypeToTimeframe(slotType) != timeframe)
+         continue;
+      if(SMCZoneTypeIsMtfFvg(slotType))
+         continue;
+
+      g_activeZones[i].type               = (ENUM_SMC_ZONE_TYPE)i;
+      g_activeZones[i].topPrice           = 0.0;
+      g_activeZones[i].bottomPrice        = 0.0;
+      g_activeZones[i].isActive           = false;
+      g_activeZones[i].isClustered        = false;
+      g_activeZones[i].isMitigated  = false;
+      g_activeZones[i].isBreached   = false;
+      g_activeZones[i].isExpired    = false;
+      g_activeZones[i].zoneOriginBarTime  = 0;
+   }
+}
+
+//+------------------------------------------------------------------+
+string SMCZoneTimeframeTag(const ENUM_TIMEFRAMES timeframe)
+{
+   switch(timeframe)
+   {
+      case PERIOD_W1:  return "W1";
+      case PERIOD_D1:  return "D1";
+      case PERIOD_H4:  return "H4";
+      case PERIOD_M15: return "M15";
+   }
+   return "TF";
+}
+
+//+------------------------------------------------------------------+
+string SMCZoneRectangleObjectNameFromRecord(const ENUM_SMC_ZONE_TYPE zoneType,
+                                             const int slotIndex,
+                                             const datetime zoneOriginBarTime)
+{
+   if(zoneType < 0 || zoneType >= SMC_ZONE_TYPE_COUNT || zoneOriginBarTime <= 0)
+      return "";
+
+   const ENUM_TIMEFRAMES zoneTf = SMCZoneTypeToTimeframe(zoneType);
+   return LQ_OBJ_PREFIX_SMC_ZONE_RECT + SMCZoneTimeframeTag(zoneTf) + "_"
+          + IntegerToString((int)zoneType) + "_S" + IntegerToString(slotIndex) + "_"
+          + IntegerToString((long)zoneOriginBarTime);
+}
+
+//+------------------------------------------------------------------+
+string SMCZoneRectangleObjectNameForSlot(const int slotIndex)
+{
+   if(slotIndex < 0 || slotIndex >= SMC_ZONE_LEDGER_CAPACITY)
+      return "";
+
+   return SMCZoneRectangleObjectNameFromRecord(g_activeZones[slotIndex].type, slotIndex,
+                                               g_activeZones[slotIndex].zoneOriginBarTime);
+}
+
+//+------------------------------------------------------------------+
+void SMCDeleteZoneRectangleForSlot(const int slotIndex)
+{
+   const string objName = SMCZoneRectangleObjectNameForSlot(slotIndex);
+   if(objName != "" && ObjectFind(0, objName) >= 0)
+      ObjectDelete(0, objName);
+
+   if(slotIndex >= 0 && slotIndex < SMC_ZONE_TYPE_COUNT)
+   {
+      const ENUM_SMC_ZONE_TYPE zoneType = (ENUM_SMC_ZONE_TYPE)slotIndex;
+      const string legacyName = LQ_OBJ_PREFIX_SMC_ZONE_RECT + IntegerToString(slotIndex);
+      if(ObjectFind(0, legacyName) >= 0)
+         ObjectDelete(0, legacyName);
+
+      const string legacyTfName = LQ_OBJ_PREFIX_SMC_ZONE_RECT + SMCZoneTimeframeTag(SMCZoneTypeToTimeframe(zoneType))
+                                + "_" + IntegerToString(slotIndex);
+      if(ObjectFind(0, legacyTfName) >= 0)
+         ObjectDelete(0, legacyTfName);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Delete every non-FVG zone rectangle tied to a ledger slot index.  |
+//+------------------------------------------------------------------+
+void SMCDeleteAllZoneRectangleObjectsForSlot(const int slotIndex)
+{
+   if(slotIndex < 0 || slotIndex >= SMC_ZONE_LEDGER_CAPACITY)
+      return;
+
+   SMCDeleteZoneRectangleForSlot(slotIndex);
+
+   const string slotToken = "_S" + IntegerToString(slotIndex) + "_";
+   const int total = ObjectsTotal(0, 0, -1);
+   for(int o = total - 1; o >= 0; o--)
+   {
+      const string objName = ObjectName(0, o, 0, -1);
+      if(StringFind(objName, LQ_OBJ_PREFIX_SMC_ZONE_RECT) != 0)
+         continue;
+      if(StringFind(objName, "_FVG_") >= 0)
+         continue;
+      if(StringFind(objName, slotToken) < 0)
+         continue;
+      ObjectDelete(0, objName);
+   }
+}
+
+//+------------------------------------------------------------------+
+bool SMCZoneChartObjectShouldRemain(const string objName, const ENUM_TIMEFRAMES timeframe)
+{
+   if(objName == "")
+      return false;
+
+   for(int i = 0; i < SMC_ZONE_LEDGER_CAPACITY; i++)
+   {
+      if(!g_activeZones[i].isActive || g_activeZones[i].isMitigated || g_activeZones[i].isExpired)
+         continue;
+      if(SMCZoneTypeToTimeframe(g_activeZones[i].type) != timeframe)
+         continue;
+      if(SMCZoneRectangleObjectNameForSlot(i) == objName)
+         return true;
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+bool SMCMtfFvgChartObjectShouldRemain(const string objName, const ENUM_TIMEFRAMES timeframe)
+{
+   if(objName == "")
+      return false;
+
+   for(int f = 0; f < SMC_MTF_FVG_INSTANCE_CAPACITY; f++)
+   {
+      if(!g_mtfFvgInstances[f].inUse || g_mtfFvgInstances[f].isMitigated || g_mtfFvgInstances[f].isExpired)
+         continue;
+      if(g_mtfFvgInstances[f].timeframe != timeframe)
+         continue;
+      if(SMCMtfFvgRectangleObjectName(g_mtfFvgInstances[f].type,
+                                      g_mtfFvgInstances[f].zoneOriginBarTime) == objName)
+         return true;
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+void SMCSweepOrphanZoneChartObjectsForTimeframe(const ENUM_TIMEFRAMES timeframe)
+{
+   const string zonePrefix = LQ_OBJ_PREFIX_SMC_ZONE_RECT + SMCZoneTimeframeTag(timeframe) + "_";
+   const string fvgPrefix  = zonePrefix + "FVG_";
+   const int total = ObjectsTotal(0, 0, -1);
+
+   for(int o = total - 1; o >= 0; o--)
+   {
+      const string objName = ObjectName(0, o, 0, -1);
+      if(StringFind(objName, zonePrefix) != 0)
+         continue;
+
+      if(StringFind(objName, fvgPrefix) == 0)
+      {
+         if(!SMCMtfFvgChartObjectShouldRemain(objName, timeframe))
+            ObjectDelete(0, objName);
+         continue;
+      }
+
+      if(!SMCZoneChartObjectShouldRemain(objName, timeframe))
+         ObjectDelete(0, objName);
+   }
+}
+
+//+------------------------------------------------------------------+
+void SMCDrawZoneRectangleForSlot(const int slotIndex)
+{
+   if(slotIndex < 0 || slotIndex >= SMC_ZONE_LEDGER_CAPACITY)
+      return;
+   if(!g_activeZones[slotIndex].isActive || g_activeZones[slotIndex].isMitigated || g_activeZones[slotIndex].isExpired)
+      return;
+   if(SMCZoneTypeIsMtfFvg(g_activeZones[slotIndex].type))
+      return;
+
+   const ENUM_TIMEFRAMES timeframe = SMCZoneTypeToTimeframe(g_activeZones[slotIndex].type);
+   if(!MtfSwingLegDrawEnabled(timeframe))
+      return;
+
+   const datetime timeLeft = (g_activeZones[slotIndex].zoneOriginBarTime > 0
+                              ? g_activeZones[slotIndex].zoneOriginBarTime
+                              : iTime(_Symbol, timeframe, 1));
+   const datetime timeRight = SMCZoneRectangleTimeRight(timeframe, timeLeft);
+   const string objName = SMCZoneRectangleObjectNameForSlot(slotIndex);
+   const double top = g_activeZones[slotIndex].topPrice;
+   const double bottom = g_activeZones[slotIndex].bottomPrice;
+   if(timeRight <= 0 || timeLeft <= 0 || top <= bottom || objName == "")
+      return;
+
+   if(ObjectFind(0, objName) < 0)
+   {
+      if(!ObjectCreate(0, objName, OBJ_RECTANGLE, 0, timeLeft, top, timeRight, bottom))
+         return;
+   }
+   else
+   {
+      ObjectSetInteger(0, objName, OBJPROP_TIME, 0, timeLeft);
+      ObjectSetDouble(0, objName, OBJPROP_PRICE, 0, top);
+      ObjectSetInteger(0, objName, OBJPROP_TIME, 1, timeRight);
+      ObjectSetDouble(0, objName, OBJPROP_PRICE, 1, bottom);
+   }
+
+   const color rectColor = SMCZoneTypeIsBullish(g_activeZones[slotIndex].type) ? clrLimeGreen : clrDeepPink;
+   ObjectSetInteger(0, objName, OBJPROP_COLOR, rectColor);
+   ObjectSetInteger(0, objName, OBJPROP_STYLE, STYLE_SOLID);
+   ObjectSetInteger(0, objName, OBJPROP_WIDTH, 1);
+   ObjectSetInteger(0, objName, OBJPROP_FILL, false);
+   ObjectSetInteger(0, objName, OBJPROP_BACK, true);
+   ObjectSetInteger(0, objName, OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, objName, OBJPROP_HIDDEN, false);
+   ObjectSetInteger(0, objName, OBJPROP_TIMEFRAMES, OBJ_ALL_PERIODS);
+}
+
+//+------------------------------------------------------------------+
+void SMCSyncZoneRectanglesForTimeframe(const ENUM_TIMEFRAMES timeframe)
+{
+   for(int i = 0; i < SMC_ZONE_LEDGER_CAPACITY; i++)
+   {
+      if(!g_activeZones[i].isActive)
+         continue;
+      if(SMCZoneTypeIsMtfFvg(g_activeZones[i].type))
+         continue;
+      if(SMCZoneTypeToTimeframe(g_activeZones[i].type) != timeframe)
+         continue;
+
+      if(g_activeZones[i].isMitigated || g_activeZones[i].isExpired)
+         SMCDeleteAllZoneRectangleObjectsForSlot(i);
+      else
+         SMCDrawZoneRectangleForSlot(i);
+   }
+}
+
+//+------------------------------------------------------------------+
+void SMCCleanupMitigatedExpiredZoneChartObjectsForTimeframe(const ENUM_TIMEFRAMES timeframe)
+{
+   for(int i = 0; i < SMC_ZONE_LEDGER_CAPACITY; i++)
+   {
+      if(g_activeZones[i].isMitigated || g_activeZones[i].isExpired || !g_activeZones[i].isActive)
+      {
+         SMCDeleteAllZoneRectangleObjectsForSlot(i);
+         continue;
+      }
+
+      const ENUM_SMC_ZONE_TYPE zoneType = g_activeZones[i].type;
+      if(zoneType < 0 || zoneType >= SMC_ZONE_TYPE_COUNT)
+         continue;
+      if(SMCZoneTypeIsMtfFvg(zoneType))
+         continue;
+      if(SMCZoneTypeToTimeframe(zoneType) != timeframe)
+         continue;
+   }
+
+   for(int f = 0; f < SMC_MTF_FVG_INSTANCE_CAPACITY; f++)
+   {
+      if(g_mtfFvgInstances[f].timeframe != timeframe)
+         continue;
+      if(g_mtfFvgInstances[f].zoneOriginBarTime <= 0)
+         continue;
+
+      if(!g_mtfFvgInstances[f].inUse || g_mtfFvgInstances[f].isMitigated || g_mtfFvgInstances[f].isExpired)
+         SMCDeleteMtfFvgRectangleForInstance(g_mtfFvgInstances[f].type,
+                                             g_mtfFvgInstances[f].zoneOriginBarTime);
+   }
+
+   SMCSweepOrphanZoneChartObjectsForTimeframe(timeframe);
+}
+
+//+------------------------------------------------------------------+
+void SMCDeleteZoneRectanglesForTimeframe(const ENUM_TIMEFRAMES timeframe)
+{
+   const string prefix = LQ_OBJ_PREFIX_SMC_ZONE_RECT + SMCZoneTimeframeTag(timeframe) + "_";
+   const int total = ObjectsTotal(0, 0, -1);
+   for(int o = total - 1; o >= 0; o--)
+   {
+      const string objName = ObjectName(0, o, 0, -1);
+      if(StringFind(objName, prefix) == 0 && StringFind(objName, "_FVG_") < 0)
+         ObjectDelete(0, objName);
+   }
+}
+
+//+------------------------------------------------------------------+
+void SMCDrawZoneRectanglesForTimeframe(const ENUM_TIMEFRAMES timeframe)
+{
+   SMCSyncZoneRectanglesForTimeframe(timeframe);
+}
+
+//+------------------------------------------------------------------+
+void SMCRefreshZonesForTimeframe(const ENUM_TIMEFRAMES timeframe, MTFSwingTracker &tracker,
+                                  const bool legClosedThisBar)
+{
+   if(!InputEnableMtfSmcEngine)
+      return;
+
+   if(legClosedThisBar)
+   {
+      int registeredSlot = -1;
+      switch(timeframe)
+      {
+         case PERIOD_W1:
+            SMCRegisterSwingZoneFromJustClosedLeg(tracker, ZONE_BULL_SWING_W1_LOW, ZONE_BEAR_SWING_W1_HIGH,
+                                                  registeredSlot);
+            break;
+         case PERIOD_D1:
+            SMCRegisterSwingZoneFromJustClosedLeg(tracker, ZONE_BULL_SWING_DAILY_LOW, ZONE_BEAR_SWING_DAILY_HIGH,
+                                                  registeredSlot);
+            break;
+         case PERIOD_H4:
+            SMCRegisterSwingZoneFromJustClosedLeg(tracker, ZONE_BULL_SWING_H4_LOW, ZONE_BEAR_SWING_H4_HIGH,
+                                                  registeredSlot);
+            break;
+         case PERIOD_M15:
+            SMCRegisterSwingZoneFromJustClosedLeg(tracker, ZONE_BULL_SWING_M15_LOW, ZONE_BEAR_SWING_M15_HIGH,
+                                                  registeredSlot);
+            break;
+         default:
+            return;
+      }
+
+      if(registeredSlot >= 0)
+         SMCDrawZoneRectangleForSlot(registeredSlot);
+      SMCCleanupMitigatedExpiredZoneChartObjectsForTimeframe(timeframe);
+      return;
+   }
+
+   switch(timeframe)
+   {
+      case PERIOD_W1:
+         SMCMapUnmitigatedFvgsForTimeframe(PERIOD_W1, ZONE_BULL_WEEKLY_FVG, ZONE_BEAR_WEEKLY_FVG);
+         break;
+
+      case PERIOD_D1:
+         SMCMapUnmitigatedFvgsForTimeframe(PERIOD_D1, ZONE_BULL_DAILY_FVG, ZONE_BEAR_DAILY_FVG);
+         SMCMapBrokenStructuralZone(tracker,
+                                    ZONE_BULL_BROKEN_DAILY_HIGH, ZONE_BEAR_BROKEN_DAILY_LOW,
+                                    ZONE_BULL_PROTECTED_DAILY_LOW, ZONE_BEAR_PROTECTED_DAILY_HIGH);
+         break;
+
+      case PERIOD_H4:
+         SMCMapUnmitigatedFvgsForTimeframe(PERIOD_H4, ZONE_BULL_H4_FVG, ZONE_BEAR_H4_FVG);
+         SMCMapBrokenStructuralZone(tracker,
+                                    ZONE_BULL_BROKEN_H4_HIGH, ZONE_BEAR_BROKEN_H4_LOW,
+                                    ZONE_BULL_PROTECTED_H4_LOW, ZONE_BEAR_PROTECTED_H4_HIGH);
+         break;
+
+      case PERIOD_M15:
+         SMCMapUnmitigatedFvgsForTimeframe(PERIOD_M15, ZONE_BULL_M15_FVG, ZONE_BEAR_M15_FVG);
+         SMCMapBrokenStructuralZone(tracker,
+                                    ZONE_BULL_BROKEN_M15_HIGH, ZONE_BEAR_BROKEN_M15_LOW,
+                                    ZONE_BULL_PROTECTED_M15_LOW, ZONE_BEAR_PROTECTED_M15_HIGH);
+         break;
+
+      default:
+         return;
+   }
+
+   SMCApplyZoneExitBiasAndMitigationForTimeframe(timeframe);
+   SMCExpireZonesPastBarLimitForTimeframe(timeframe);
+   SMCExpireMtfFvgInstancesForTimeframe(timeframe);
+   SMCCleanupMitigatedExpiredZoneChartObjectsForTimeframe(timeframe);
+   SMCSyncZoneRectanglesForTimeframe(timeframe);
+   SMCSyncMtfFvgZoneRectanglesForTimeframe(timeframe);
 }
 
 //+------------------------------------------------------------------+
@@ -5214,27 +6433,15 @@ void UpdateSMCZoneMatrix()
    if(!InputEnableMtfSmcEngine)
       return;
 
-   SMCResetActiveZones();
+   SMCSeedSwingZonesFromHistory(g_mtfSwingW1,  ZONE_BULL_SWING_W1_LOW,  ZONE_BEAR_SWING_W1_HIGH);
+   SMCSeedSwingZonesFromHistory(g_mtfSwingD1,  ZONE_BULL_SWING_DAILY_LOW, ZONE_BEAR_SWING_DAILY_HIGH);
+   SMCSeedSwingZonesFromHistory(g_mtfSwingH4,  ZONE_BULL_SWING_H4_LOW,  ZONE_BEAR_SWING_H4_HIGH);
+   SMCSeedSwingZonesFromHistory(g_mtfSwingM15, ZONE_BULL_SWING_M15_LOW, ZONE_BEAR_SWING_M15_HIGH);
 
-   SMCMapUnmitigatedFvgsForTimeframe(PERIOD_W1,  ZONE_BULL_WEEKLY_FVG, ZONE_BEAR_WEEKLY_FVG);
-   SMCMapUnmitigatedFvgsForTimeframe(PERIOD_D1,  ZONE_BULL_DAILY_FVG,  ZONE_BEAR_DAILY_FVG);
-   SMCMapUnmitigatedFvgsForTimeframe(PERIOD_H4,  ZONE_BULL_H4_FVG,      ZONE_BEAR_H4_FVG);
-   SMCMapUnmitigatedFvgsForTimeframe(PERIOD_M15, ZONE_BULL_M15_FVG,     ZONE_BEAR_M15_FVG);
-
-   SMCMapUnbrokenSwingZones(g_mtfSwingW1,  ZONE_BULL_SWING_W1_LOW,    ZONE_BEAR_SWING_W1_HIGH);
-   SMCMapUnbrokenSwingZones(g_mtfSwingD1,  ZONE_BULL_SWING_DAILY_LOW, ZONE_BEAR_SWING_DAILY_HIGH);
-   SMCMapUnbrokenSwingZones(g_mtfSwingH4,  ZONE_BULL_SWING_H4_LOW,    ZONE_BEAR_SWING_H4_HIGH);
-   SMCMapUnbrokenSwingZones(g_mtfSwingM15, ZONE_BULL_SWING_M15_LOW,   ZONE_BEAR_SWING_M15_HIGH);
-
-   SMCMapBrokenStructuralZone(g_mtfSwingD1,  ZONE_BULL_BROKEN_DAILY_HIGH, ZONE_BEAR_BROKEN_DAILY_LOW,
-                              ZONE_BULL_PROTECTED_DAILY_LOW, ZONE_BEAR_PROTECTED_DAILY_HIGH);
-   SMCMapBrokenStructuralZone(g_mtfSwingH4,  ZONE_BULL_BROKEN_H4_HIGH,    ZONE_BEAR_BROKEN_H4_LOW,
-                              ZONE_BULL_PROTECTED_H4_LOW,    ZONE_BEAR_PROTECTED_H4_HIGH);
-   SMCMapBrokenStructuralZone(g_mtfSwingM15, ZONE_BULL_BROKEN_M15_HIGH,   ZONE_BEAR_BROKEN_M15_LOW,
-                              ZONE_BULL_PROTECTED_M15_LOW,   ZONE_BEAR_PROTECTED_M15_HIGH);
-
-   SMCUpdateActiveZonesMitigation();
-   SMCExpireZonesPastBarLimit();
+   SMCRefreshZonesForTimeframe(PERIOD_W1,  g_mtfSwingW1,  false);
+   SMCRefreshZonesForTimeframe(PERIOD_D1,  g_mtfSwingD1,  false);
+   SMCRefreshZonesForTimeframe(PERIOD_H4,  g_mtfSwingH4,  false);
+   SMCRefreshZonesForTimeframe(PERIOD_M15, g_mtfSwingM15, false);
 }
 
 //+------------------------------------------------------------------+
@@ -5249,7 +6456,7 @@ void RebuildH4LiquidityPivotLevels()
    if(InputH4LiquidityPivotLookbackBars < 2)
       return;
 
-   const int barsTotal = iBars(_Symbol, InputH4NarrativeTimeframe);
+   const int barsTotal = iBars(_Symbol, PERIOD_H4);
    if(barsTotal < 3)
       return;
 
@@ -5264,8 +6471,7 @@ void RebuildH4LiquidityPivotLevels()
    ZeroMemory(replaySwing);
 
    for(int shift = maxShift; shift >= 1; shift--)
-      ProcessH4SwingStepReplay(replaySwing, shift, replayLegs, replayLegCount,
-                                H4_BREACH_ANCHOR_MULTIPLIER, true);
+      MtfSwingStepReplayAtShift(replaySwing, PERIOD_H4, shift, replayLegs, replayLegCount);
 
    if(replayLegCount <= 0)
       return;
@@ -5836,6 +7042,12 @@ double CalculateVolumeForFixedUsdRisk(const bool isBuy, const double entryPrice,
 }
 
 //+------------------------------------------------------------------+
+bool SetupScoreAllowsTradeEntry(const double setupScore)
+{
+   return (setupScore >= InputMinScore)|| true;
+}
+
+//+------------------------------------------------------------------+
 double GetOptimizedLotSize(const double entryPrice, const double stopLoss, const double score,
                             const bool isBuy, const double riskUsdFraction = 1.0)
 {
@@ -5847,6 +7059,10 @@ double GetOptimizedLotSize(const double entryPrice, const double stopLoss, const
    const double clampedRatio   = MathMax(0.1, MathMin(2.0, alignmentRatio));
    const double riskPercent    = InputBaseRiskPercent * clampedRatio;
    const double riskUsd        = AccountInfoDouble(ACCOUNT_EQUITY) * riskPercent / 100.0 * riskUsdFraction;
+
+   LogHuntEvent("RISK_SIZE",
+                StringFormat("setupScore=%.2f clampedRatio=%.3f riskPercent=%.3f%% legFrac=%.3f riskUsd=%.2f",
+                             score, clampedRatio, riskPercent, riskUsdFraction, riskUsd));
 
    return CalculateVolumeForFixedUsdRisk(isBuy, entryPrice, stopLoss, riskUsd);
 }
@@ -5993,81 +7209,6 @@ bool TryDetectM2PriceBreakBelowLatestDownLegLow(double &outBrokenLevel)
       }
       break;
    }
-   return false;
-}
-
-//+------------------------------------------------------------------+
-//| Buy: bull M2 BOS (close cross above up-leg high) with level strictly between entry and TP3. |
-//| Sell: bear M2 BOS (close cross below down-leg low) with level strictly between TP3 and entry. |
-//+------------------------------------------------------------------+
-bool SameDirectionM2BosBetweenEntryAndTp3Since(const bool isBuy, const double entryPrice,
-                                                const double tp3Level, const datetime sinceTime)
-{
-   if(entryPrice <= 0.0 || tp3Level <= 0.0 || sinceTime == 0)
-      return false;
-   if(g_m2Swing.swingHistoryCount < 1)
-      return false;
-
-   const double zoneLow  = MathMin(entryPrice, tp3Level);
-   const double zoneHigh = MathMax(entryPrice, tp3Level);
-   if(zoneHigh - zoneLow <= 0.0)
-      return false;
-
-   const double pointSize = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-   const double tolerance = (pointSize > 0.0 ? pointSize : 0.00001);
-
-   for(int historyIndex = 0; historyIndex < g_m2Swing.swingHistoryCount; historyIndex++)
-   {
-      const int legDirection = g_m2Swing.swingHistory[historyIndex].swingDirection;
-      double brokenLevel     = 0.0;
-
-      if(isBuy)
-      {
-         if(legDirection != 1)
-            continue;
-         brokenLevel = g_m2Swing.swingHistory[historyIndex].legHighPrice;
-         if(brokenLevel <= zoneLow + tolerance || brokenLevel >= zoneHigh - tolerance)
-            continue;
-      }
-      else
-      {
-         if(legDirection != -1)
-            continue;
-         brokenLevel = g_m2Swing.swingHistory[historyIndex].legLowPrice;
-         if(brokenLevel <= zoneLow + tolerance || brokenLevel >= zoneHigh - tolerance)
-            continue;
-      }
-
-      datetime scanFromTime = g_m2Swing.swingHistory[historyIndex].legEndTime;
-      if(scanFromTime < sinceTime)
-         scanFromTime = sinceTime;
-
-      int barShift = iBarShift(_Symbol, InputM2NarrativeTimeframe, scanFromTime, true);
-      if(barShift < 1)
-         barShift = 1;
-
-      const int maxShift = iBars(_Symbol, InputM2NarrativeTimeframe) - 2;
-      if(maxShift < 1)
-         continue;
-
-      for(int shift = barShift; shift >= 1; shift--)
-      {
-         if(shift + 1 > maxShift)
-            continue;
-
-         const double closePrice = iClose(_Symbol, InputM2NarrativeTimeframe, shift);
-         const double prevClose  = iClose(_Symbol, InputM2NarrativeTimeframe, shift + 1);
-
-         if(isBuy)
-         {
-            if(closePrice > brokenLevel + tolerance && prevClose <= brokenLevel + tolerance)
-               return true;
-         }
-         else if(closePrice < brokenLevel - tolerance && prevClose >= brokenLevel - tolerance)
-            return true;
-      }
-   }
-
    return false;
 }
 
@@ -6473,64 +7614,6 @@ void EnsureHuntTradeSessionCommentPrefixFromOrdersOrPositions()
          g_huntTradeSessionCommentPrefix = comment;
       return;
    }
-}
-
-//+------------------------------------------------------------------+
-bool TrySyncHuntPreEntryWatchFromPendingOrders(int &outPendingCount)
-{
-   outPendingCount = 0;
-   for(int huntIndex = 0; huntIndex < V2_MAX_HUNT_SESSIONS; huntIndex++)
-   {
-      int sessionPending = 0;
-      if(V2TrySyncPreEntryWatchForHunt(huntIndex, sessionPending))
-         outPendingCount += sessionPending;
-   }
-
-   if(outPendingCount <= 0)
-      return false;
-
-   V2RefreshGlobalHuntTradeWatchFromSessions();
-   return (g_huntPreEntryCancelTpLevel > 0.0);
-}
-
-//+------------------------------------------------------------------+
-bool HuntMarketReachedTakeProfitLevel(const bool isBuy, const double takeProfitLevel)
-{
-   if(takeProfitLevel <= 0.0)
-      return false;
-
-   const double pointSize = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-   const double tolerance = (pointSize > 0.0 ? pointSize : 0.00001);
-
-   const double bid    = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   const double ask    = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-   const double highM1 = iHigh(_Symbol, PERIOD_M1, 0);
-   const double lowM1  = iLow(_Symbol, PERIOD_M1, 0);
-   const double highM2 = iHigh(_Symbol, InputM2NarrativeTimeframe, 0);
-   const double lowM2  = iLow(_Symbol, InputM2NarrativeTimeframe, 0);
-
-   if(isBuy)
-   {
-      if(ask >= takeProfitLevel - tolerance)
-         return true;
-      if(bid >= takeProfitLevel - tolerance)
-         return true;
-      if(highM1 >= takeProfitLevel - tolerance)
-         return true;
-      if(highM2 >= takeProfitLevel - tolerance)
-         return true;
-      return false;
-   }
-
-   if(bid <= takeProfitLevel + tolerance)
-      return true;
-   if(ask <= takeProfitLevel + tolerance)
-      return true;
-   if(lowM1 <= takeProfitLevel + tolerance)
-      return true;
-   if(lowM2 <= takeProfitLevel + tolerance)
-      return true;
-   return false;
 }
 
 //+------------------------------------------------------------------+
@@ -7262,111 +8345,10 @@ void CheckHuntFvgBeyondChartRangeCancelOnTick()
 }
 
 //+------------------------------------------------------------------+
-void CheckHuntPreEntryTp3CancelOnTick()
-{
-   datetime sessionIds[];
-   if(!V2CollectUniquePendingHuntSessionIds(sessionIds, 8))
-      return;
-
-   const double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   const double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-
-   for(int sessionIndex = 0; sessionIndex < ArraySize(sessionIds); sessionIndex++)
-   {
-      const datetime sessionId = sessionIds[sessionIndex];
-      if(V2HuntHasOpenPositionForSession(sessionId))
-         continue;
-
-      const int huntIndex = V2FindHuntSlotBySessionId(sessionId);
-      int pendingCount = 0;
-      bool isBuy = false;
-      double tp3Level = 0.0;
-      double entryPrice = 0.0;
-      if(!V2TrySyncPreEntryWatchForSession(sessionId, huntIndex, pendingCount,
-                                           isBuy, tp3Level, entryPrice))
-         continue;
-
-      if(!HuntMarketReachedTakeProfitLevel(isBuy, tp3Level))
-         continue;
-
-      datetime sinceTime = 0;
-      if(huntIndex >= 0)
-         sinceTime = g_v2Hunts[huntIndex].ordersFvgFormationTime;
-      if(sinceTime == 0)
-      {
-         const string prefix = V2HuntTradeCommentPrefix(sessionId);
-         for(int orderIndex = OrdersTotal() - 1; orderIndex >= 0; orderIndex--)
-         {
-            const ulong ticket = OrderGetTicket(orderIndex);
-            if(ticket == 0 || !OrderSelect(ticket))
-               continue;
-            const string comment = OrderGetString(ORDER_COMMENT);
-            if(StringFind(comment, prefix) != 0)
-               continue;
-            if(TryParseFormationTimeFromHuntOrderComment(comment, sinceTime))
-               break;
-         }
-      }
-
-      if(SameDirectionM2BosBetweenEntryAndTp3Since(isBuy, entryPrice, tp3Level, sinceTime))
-      {
-         if(huntIndex >= 0)
-            V2LogHuntEvent(huntIndex, "HUNT_TP3_PREENTRY_BOS_KEEP",
-                           StringFormat("TP3=%.5f touched â€” same-dir M2 BOS between entry=%.5f and TP3 since %s",
-                                        tp3Level, entryPrice,
-                                        TimeToString(sinceTime, TIME_DATE | TIME_MINUTES)));
-         else
-            LogHuntEvent("HUNT_TP3_PREENTRY_BOS_KEEP",
-                         StringFormat("HS%lld TP3=%.5f touched â€” same-dir M2 BOS between entry=%.5f and TP3",
-                                      (long)sessionId, tp3Level, entryPrice));
-         continue;
-      }
-
-      CancelOurHuntPendingOrders(sessionId);
-
-      int remainingForSession = 0;
-      bool dummyBuy = false;
-      double dummyTp3 = 0.0;
-      double dummyEntry = 0.0;
-      V2TrySyncPreEntryWatchForSession(sessionId, huntIndex, remainingForSession,
-                                       dummyBuy, dummyTp3, dummyEntry);
-
-      if(remainingForSession > 0)
-      {
-         if(huntIndex >= 0)
-            V2LogHuntEvent(huntIndex, "HUNT_TP3_PREENTRY_FAIL",
-                           StringFormat("TP3=%.5f hit but %d pendings remain (bid=%.5f ask=%.5f)",
-                                        tp3Level, remainingForSession, bid, ask));
-         else
-            LogHuntEvent("HUNT_TP3_PREENTRY_FAIL",
-                         StringFormat("HS%lld TP3=%.5f hit but %d pendings remain (bid=%.5f ask=%.5f)",
-                                      (long)sessionId, tp3Level, remainingForSession, bid, ask));
-         continue;
-      }
-
-      if(huntIndex >= 0)
-      {
-         V2ClearHuntPreEntryWatchForHunt(huntIndex);
-         V2LogHuntEvent(huntIndex, "HUNT_TP3_PREENTRY_CANCEL",
-                        StringFormat("pending removed: TP3=%.5f entry=%.5f %s pend=%d bid=%.5f ask=%.5f hiM2=%.5f loM2=%.5f",
-                                     tp3Level, entryPrice, isBuy ? "buy" : "sell", pendingCount, bid, ask,
-                                     iHigh(_Symbol, InputM2NarrativeTimeframe, 0), iLow(_Symbol, InputM2NarrativeTimeframe, 0)));
-      }
-      else
-         LogHuntEvent("HUNT_TP3_PREENTRY_CANCEL",
-                      StringFormat("HS%lld pending removed: TP3=%.5f entry=%.5f %s pend=%d bid=%.5f ask=%.5f",
-                                   (long)sessionId, tp3Level, entryPrice, isBuy ? "buy" : "sell",
-                                   pendingCount, bid, ask));
-   }
-
-   V2RefreshGlobalHuntTradeWatchFromSessions();
-}
-
-//+------------------------------------------------------------------+
 //| Bull: bid > top+1% M2 chart rng â†’ BuyLimit @ top+1%; else market buy.          |
 //| Bear: ask < lowâˆ’1% M2 chart rng â†’ SellLimit @ lowâˆ’1%; else market sell.         |
 //+------------------------------------------------------------------+
-// Latest completed H4 same-dir leg (g_h4Swing 0.5). TP = 0.9x / 1.4x / 1.9x from entry.
+// Latest completed H4 same-dir leg (MTF SMC). TP = 0.9x / 1.4x / 1.9x from entry.
 //+------------------------------------------------------------------+
 int V4TradeLegDirectionForFvg(const bool isBullishFairValueGap)
 {
@@ -7418,7 +8400,8 @@ bool V4ResolveH4SameDirLegRangeForTp(const bool isBullishFairValueGap, double &o
 
    double legHigh = 0.0;
    double legLow  = 0.0;
-   if(!TryNthH4CompletedSwingLeg(tradeLegDir, 1, legHigh, legLow, outLegEndTime))
+   datetime legStart = 0;
+   if(!MtfTryNthCompletedSwingLeg(PERIOD_H4, tradeLegDir, 1, legHigh, legLow, legStart, outLegEndTime))
       return false;
 
    outLegRange = legHigh - legLow;
@@ -7628,6 +8611,12 @@ bool TryPlaceTouchVolumeBarTradeSetup(const int huntIndex, const bool isBuy,
 
    double normalizedEntry = NormalizeDouble(entryPrice, _Digits);
    const double setupScore = CalculateTotalTradeScore(isBuy);
+   if(!SetupScoreAllowsTradeEntry(setupScore))
+   {
+      V2LogHuntEvent(huntIndex, "TRADE_SKIP",
+                     StringFormat("setupScore=%.2f < min %.2f", setupScore, InputMinScore));
+      return false;
+   }
 
    const datetime formationTime = maxVolBarOpenTime;
    double takeProfitPrices[];
@@ -7809,6 +8798,12 @@ bool TryPlaceOppositeFvgTradeSetup(const bool isBullishFairValueGap, const doubl
    double normalizedEntry = NormalizeDouble(entryPrice, _Digits);
    const bool isBuy       = isBullishFairValueGap;
    const double setupScore = CalculateTotalTradeScore(isBuy);
+   if(!SetupScoreAllowsTradeEntry(setupScore))
+   {
+      V2LogHuntEvent(huntIndex, "TRADE_SKIP",
+                     StringFormat("setupScore=%.2f < min %.2f", setupScore, InputMinScore));
+      return false;
+   }
 
    double takeProfitPrices[];
    int    takeProfitCount = 0;
@@ -7911,6 +8906,13 @@ bool TryPlaceEngulfAbsorptionTradeSetup(const int huntIndex, const bool isBuy,
    if(huntIndex >= 0 && V2IsHuntSessionStillActive(huntSessionId))
    {
       V2LogHuntEvent(huntIndex, "TRADE_SKIP", "hunt still ON — orders after engulf signal");
+      return false;
+   }
+
+   if(!SetupScoreAllowsTradeEntry(setupScore))
+   {
+      V2LogHuntEvent(huntIndex, "TRADE_SKIP",
+                     StringFormat("setupScore=%.2f < min %.2f", setupScore, InputMinScore));
       return false;
    }
 
@@ -9340,9 +10342,19 @@ bool V3ComputeEngulfStopLoss(const bool isBuy, const int candle1Shift, const int
 }
 
 //+------------------------------------------------------------------+
-void V3TryScanM2SwingSweepSetup(const bool isBuy, const double barClose, const double setupScore)
+bool V3M2SwingSweepSetupPatternValidCore(const bool isBuy, const double barClose,
+                                          double &outStopLoss, datetime &outSignalBarOpen,
+                                          double &outRefLevel, int &outCountdown,
+                                          string &outExhaustDetail)
 {
+   outStopLoss = 0.0;
+   outSignalBarOpen = 0;
+   outRefLevel = 0.0;
+   outCountdown = 0;
+   outExhaustDetail = "";
+
    const int countdown = MathMax(1, InputEngulfSweepCountdownBars);
+   outCountdown = countdown;
 
    double refLevel = 0.0;
    double windowSlExtreme = 0.0;
@@ -9351,12 +10363,77 @@ void V3TryScanM2SwingSweepSetup(const bool isBuy, const double barClose, const d
    string sweepDetail = "";
    if(!V3DetectM2SwingSweepRejectInCountdown(isBuy, countdown, refLevel, windowSlExtreme,
                                               c1Shift, c2Shift, sweepDetail))
-      return;
+      return false;
 
    const ENUM_TIMEFRAMES timeframe = InputM2NarrativeTimeframe;
 
    string localBandDetail = "";
    if(!V3EngulfPairLocalExtremeBandValid(isBuy, countdown, refLevel, localBandDetail))
+      return false;
+
+   string exhaustDetail = "";
+   if(!V3ValidateM2LegExhaustion(isBuy, exhaustDetail))
+      return false;
+
+   const double stopLoss = NormalizeDouble(windowSlExtreme, _Digits);
+   if(stopLoss <= 0.0 || (isBuy && stopLoss >= barClose) || (!isBuy && stopLoss <= barClose))
+      return false;
+
+   outStopLoss = stopLoss;
+   outSignalBarOpen = iTime(_Symbol, timeframe, c2Shift);
+   outRefLevel = refLevel;
+   outExhaustDetail = exhaustDetail;
+   return true;
+}
+
+//+------------------------------------------------------------------+
+bool V3M2SwingSweepSetupPatternValid(const bool isBuy, const double barClose)
+{
+   double stopLoss = 0.0;
+   datetime signalBarOpen = 0;
+   double refLevel = 0.0;
+   int countdown = 0;
+   string exhaustDetail = "";
+   return V3M2SwingSweepSetupPatternValidCore(isBuy, barClose, stopLoss, signalBarOpen,
+                                                refLevel, countdown, exhaustDetail);
+}
+
+//+------------------------------------------------------------------+
+void V3TryScanM2SwingSweepSetup(const bool isBuy, const double barClose, const double setupScore)
+{
+   double stopLoss = 0.0;
+   datetime signalBarOpen = 0;
+   double refLevel = 0.0;
+   int countdown = 0;
+   string exhaustDetail = "";
+   if(V3M2SwingSweepSetupPatternValidCore(isBuy, barClose, stopLoss, signalBarOpen,
+                                           refLevel, countdown, exhaustDetail))
+   {
+      const double entryPrice = barClose;
+
+      V2LogHuntEvent(-1, "SWEEP_SIGNAL",
+                     StringFormat("%s entry=%.5f sl=%.5f ref=%.5f cd=%d %s bar=%s",
+                                  isBuy ? "bull" : "bear", entryPrice, stopLoss, refLevel, countdown,
+                                  exhaustDetail,
+                                  TimeToString(signalBarOpen, TIME_DATE | TIME_MINUTES)));
+
+      TryPlaceEngulfAbsorptionTradeSetup(-1, isBuy, entryPrice, stopLoss,
+                                          signalBarOpen, signalBarOpen, setupScore);
+      return;
+   }
+
+   const int countdownBars = MathMax(1, InputEngulfSweepCountdownBars);
+
+   double windowSlExtreme = 0.0;
+   int    c1Shift = 0;
+   int    c2Shift = 0;
+   string sweepDetail = "";
+   if(!V3DetectM2SwingSweepRejectInCountdown(isBuy, countdownBars, refLevel, windowSlExtreme,
+                                              c1Shift, c2Shift, sweepDetail))
+      return;
+
+   string localBandDetail = "";
+   if(!V3EngulfPairLocalExtremeBandValid(isBuy, countdownBars, refLevel, localBandDetail))
    {
       V2LogHuntEvent(-1, "SWEEP_SKIP",
                      StringFormat("%s local extreme band fail — %s",
@@ -9364,7 +10441,6 @@ void V3TryScanM2SwingSweepSetup(const bool isBuy, const double barClose, const d
       return;
    }
 
-   string exhaustDetail = "";
    if(!V3ValidateM2LegExhaustion(isBuy, exhaustDetail))
    {
       V2LogHuntEvent(-1, "SWEEP_SKIP",
@@ -9373,36 +10449,21 @@ void V3TryScanM2SwingSweepSetup(const bool isBuy, const double barClose, const d
       return;
    }
 
-   const double stopLoss = NormalizeDouble(windowSlExtreme, _Digits);
-   if(stopLoss <= 0.0 || (isBuy && stopLoss >= barClose) || (!isBuy && stopLoss <= barClose))
-   {
+   const double slCheck = NormalizeDouble(windowSlExtreme, _Digits);
+   if(slCheck <= 0.0 || (isBuy && slCheck >= barClose) || (!isBuy && slCheck <= barClose))
       V2LogHuntEvent(-1, "SWEEP_SKIP",
                      StringFormat("%s SL vs entry invalid", isBuy ? "bull" : "bear"));
-      return;
-   }
-
-   const datetime signalBarOpen = iTime(_Symbol, timeframe, c2Shift);
-   const double   entryPrice    = barClose;
-
-   V2LogHuntEvent(-1, "SWEEP_SIGNAL",
-                  StringFormat("%s entry=%.5f sl=%.5f ref=%.5f cd=%d %s bar=%s",
-                               isBuy ? "bull" : "bear", entryPrice, stopLoss, refLevel, countdown,
-                               exhaustDetail,
-                               TimeToString(signalBarOpen, TIME_DATE | TIME_MINUTES)));
-
-   TryPlaceEngulfAbsorptionTradeSetup(-1, isBuy, entryPrice, stopLoss,
-                                       signalBarOpen, signalBarOpen, setupScore);
 }
 
 //+------------------------------------------------------------------+
 void V3RunM2SwingSweepScansOnBarClose(const double barClose)
 {
    const double bullScore = CalculateTotalTradeScore(true);
-   if(MathAbs(bullScore) >= InputMinScore)
+   if(SetupScoreAllowsTradeEntry(bullScore))
       V3TryScanM2SwingSweepSetup(true, barClose, bullScore);
 
    const double bearScore = CalculateTotalTradeScore(false);
-   if(MathAbs(bearScore) >= InputMinScore)
+   if(SetupScoreAllowsTradeEntry(bearScore))
       V3TryScanM2SwingSweepSetup(false, barClose, bearScore);
 }
 
@@ -9424,7 +10485,7 @@ void V3TryScanEngulfAbsorptionOnM2Close(const int huntIndex, const double barClo
 
    const bool   isBuy  = V2HuntExpectsBullishFvg(huntIndex);
    const double score  = CalculateTotalTradeScore(isBuy);
-   if(MathAbs(score) < InputMinScore)
+   if(!SetupScoreAllowsTradeEntry(score))
       return;
 
    V3TryScanM2SwingSweepSetup(isBuy, barClose, score);
@@ -9599,7 +10660,7 @@ bool TryGetActiveH4LegVolumeBreachLevel(double &outBreachLevel, datetime &outVol
    outBreachLevel       = 0.0;
    outVolumeBarOpenTime = 0;
 
-   const Swing activeLeg = g_h4Swing.currentSwingLeg;
+   const Swing activeLeg = g_mtfSwingH4.swing.currentSwingLeg;
    if(activeLeg.swingDirection == 0 || activeLeg.legStartTime == 0)
       return false;
 
@@ -9641,7 +10702,7 @@ bool TryDetectH4WickLiquidityBreach(const double barHigh, const double barLow,
    if(InputH4BreachBufferChartBarCount < 1)
       return false;
 
-   const Swing activeLeg = g_h4Swing.currentSwingLeg;
+   const Swing activeLeg = g_mtfSwingH4.swing.currentSwingLeg;
    if(activeLeg.swingDirection != 0 && activeLeg.legStartTime != 0)
    {
       double breachLevel = 0.0;
@@ -9657,9 +10718,9 @@ bool TryDetectH4WickLiquidityBreach(const double barHigh, const double barLow,
       }
    }
 
-   for(int legIndex = g_h4Swing.swingHistoryCount - 1; legIndex >= 0; legIndex--)
+   for(int legIndex = g_mtfSwingH4.swing.swingHistoryCount - 1; legIndex >= 0; legIndex--)
    {
-      const Swing leg = g_h4Swing.swingHistory[legIndex];
+      const Swing leg = g_mtfSwingH4.swing.swingHistory[legIndex];
       if(leg.swingDirection != 1 || leg.legEndTime == 0)
          continue;
 
@@ -9678,9 +10739,9 @@ bool TryDetectH4WickLiquidityBreach(const double barHigh, const double barLow,
          return true;
    }
 
-   for(int legIndex = g_h4Swing.swingHistoryCount - 1; legIndex >= 0; legIndex--)
+   for(int legIndex = g_mtfSwingH4.swing.swingHistoryCount - 1; legIndex >= 0; legIndex--)
    {
-      const Swing leg = g_h4Swing.swingHistory[legIndex];
+      const Swing leg = g_mtfSwingH4.swing.swingHistory[legIndex];
       if(leg.swingDirection != -1 || leg.legEndTime == 0)
          continue;
 
@@ -9705,6 +10766,26 @@ bool TryDetectH4WickLiquidityBreach(const double barHigh, const double barLow,
 #endif // H4_LQ_VOLUME_BREACH_ENABLED
 
 //+------------------------------------------------------------------+
+void V3LogSetupScoreForOptimization(const double score, const string context)
+{
+   LogAllSetupScores(score, context,
+                     InputWeight_WeeklyFVG,
+                     InputWeight_DailyFVG,
+                     InputWeight_H4FVG,
+                     InputWeight_M15FVG,
+                     InputWeight_Breaker,
+                     InputWeight_Protected,
+                     InputWeight_SwingResistance,
+                     InputWeight_SwingSupport,
+                     InputClusterMultiplier,
+                     InputMinScore,
+                     InputWeight_W1_BOS,
+                     InputWeight_D1_BOS,
+                     InputWeight_H4_BOS,
+                     InputWeight_M15_BOS);
+}
+
+//+------------------------------------------------------------------+
 void ProcessHuntEngulfingOnM2BarClose()
 {
    if(!InputEnableEngulfHuntAfterH4Breach)
@@ -9713,24 +10794,22 @@ void ProcessHuntEngulfingOnM2BarClose()
    const double barClose = iClose(_Symbol, InputM2NarrativeTimeframe, 1);
 
    const double bullScore = CalculateTotalTradeScore(true);
-   if(MathAbs(bullScore) < InputMinScore)
-   {
-      if(H4LqLoggingEnabled() && InputMinScore > 0.0)
-         V2LogHuntEvent(-1, "SWEEP_SKIP",
-                        StringFormat("bull score %.2f < min %.2f", bullScore, InputMinScore));
-   }
-   else
+   if(V3M2SwingSweepSetupPatternValid(true, barClose))
+      V3LogSetupScoreForOptimization(bullScore, "bull");
+   if(SetupScoreAllowsTradeEntry(bullScore))
       V3TryScanM2SwingSweepSetup(true, barClose, bullScore);
+   else if(H4LqLoggingEnabled())
+      V2LogHuntEvent(-1, "SWEEP_SKIP",
+                     StringFormat("bull setupScore=%.2f < min %.2f", bullScore, InputMinScore));
 
    const double bearScore = CalculateTotalTradeScore(false);
-   if(MathAbs(bearScore) < InputMinScore)
-   {
-      if(H4LqLoggingEnabled() && InputMinScore > 0.0)
-         V2LogHuntEvent(-1, "SWEEP_SKIP",
-                        StringFormat("bear score %.2f < min %.2f", bearScore, InputMinScore));
-   }
-   else
+   if(V3M2SwingSweepSetupPatternValid(false, barClose))
+      V3LogSetupScoreForOptimization(bearScore, "bear");
+   if(SetupScoreAllowsTradeEntry(bearScore))
       V3TryScanM2SwingSweepSetup(false, barClose, bearScore);
+   else if(H4LqLoggingEnabled())
+      V2LogHuntEvent(-1, "SWEEP_SKIP",
+                     StringFormat("bear setupScore=%.2f < min %.2f", bearScore, InputMinScore));
 }
 
 //+------------------------------------------------------------------+

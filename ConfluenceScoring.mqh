@@ -6,6 +6,8 @@
 #ifndef CONFLUENCE_SCORING_MQH
 #define CONFLUENCE_SCORING_MQH
 
+int GetProfessionalBias(const ENUM_TIMEFRAMES timeframe);
+
 //+------------------------------------------------------------------+
 bool SMCZoneTypeIsBullish(const ENUM_SMC_ZONE_TYPE type);
 
@@ -70,7 +72,7 @@ double CalculateTotalTradeScore(const bool isBullishTrade)
 {
    double locationScore = 0.0;
 
-   for(int i = 0; i < SMC_ZONE_TYPE_COUNT; i++)
+   for(int i = 0; i < SMC_ZONE_LEDGER_CAPACITY; i++)
    {
       if(!g_activeZones[i].isActive)
          continue;
@@ -87,15 +89,29 @@ double CalculateTotalTradeScore(const bool isBullishTrade)
       locationScore += weight;
    }
 
+   for(int f = 0; f < SMC_MTF_FVG_INSTANCE_CAPACITY; f++)
+   {
+      if(!g_mtfFvgInstances[f].inUse)
+         continue;
+      if(g_mtfFvgInstances[f].isMitigated)
+         continue;
+      if(g_mtfFvgInstances[f].isExpired)
+         continue;
+      if(SMCZoneTypeIsBullish(g_mtfFvgInstances[f].type) != isBullishTrade)
+         continue;
+
+      locationScore += (double)GetOptimizedZoneWeight(g_mtfFvgInstances[f].type);
+   }
+
    const int tradeDir = (isBullishTrade ? 1 : -1);
    double alignmentScore = 0.0;
-   alignmentScore += SMCAlignmentContribution(g_mtfSwingW1.lastBosDirection,
+   alignmentScore += SMCAlignmentContribution(GetProfessionalBias(PERIOD_W1),
                                               InputWeight_W1_BOS, tradeDir);
-   alignmentScore += SMCAlignmentContribution(g_mtfSwingD1.lastBosDirection,
+   alignmentScore += SMCAlignmentContribution(GetProfessionalBias(PERIOD_D1),
                                               InputWeight_D1_BOS, tradeDir);
-   alignmentScore += SMCAlignmentContribution(g_mtfSwingH4.lastBosDirection,
+   alignmentScore += SMCAlignmentContribution(GetProfessionalBias(PERIOD_H4),
                                               InputWeight_H4_BOS, tradeDir);
-   alignmentScore += SMCAlignmentContribution(g_mtfSwingM15.lastBosDirection,
+   alignmentScore += SMCAlignmentContribution(GetProfessionalBias(PERIOD_M15),
                                               InputWeight_M15_BOS, tradeDir);
 
    return locationScore + alignmentScore;
