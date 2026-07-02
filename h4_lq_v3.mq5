@@ -1,7 +1,8 @@
 //+------------------------------------------------------------------+
 //| h4_lq_v3.mq5                                                      |
 //| H4 breach hunt + M2 Engulfing Volume Absorption entry model       |
-//| v3.69: comment unused cluster multiplier — isClustered is never set true |
+//| v3.71: one shared optimization CSV row per permutation (weights + ScoreP100/P90) |
+//| v3.70: in-memory top-K score buffer (score>0 only); single CSV flush on deinit |
 //| v3.69: comment cluster multiplier (cluster flag unused) + remove from optimization CSV permutation |
 //| v3.68: replace Protected/Swing weights with per-TF HighLow zone weights (W1/D1/H4/M15) |
 //| v3.67: FVG min gap on registered (post-inset) height; cascade-mitigate overlapping FVG peers |
@@ -70,7 +71,7 @@
 //| v3.01: exhaustion leg filter — min leg range % of M2 chart height (replaces min bar count) |
 //| v3.00: replace M2 touch/FVG with engulfing vol absorption + exhaustion gate |
 //+------------------------------------------------------------------+
-#define H4_LQ_V3_VERSION "3.69"
+#define H4_LQ_V3_VERSION "3.71"
 // Breach record array + hunt arming: uncomment next line to re-enable.
 // #define H4_LQ_VOLUME_BREACH_ENABLED
 #property copyright ""
@@ -166,6 +167,9 @@ input int    InputWeight_M15_HighLowZones      = 2;  // M15 swing/protected high
 // input double InputClusterMultiplier            = 1.5; // unused (isClustered is never set true)
 input double InputMinScore                     = 0.0;  // min signed setupScore to allow entry; 0=block score<0
 input double InputBaseRiskPercent            = 1.0;  // equity % at max score; scaled by |score|/scoreMax
+
+input group "Optimization score logging"
+input int    InputScoreLogTopCount             = 100; // top positive scores kept in RAM; flushed once on deinit; 0=off
 
 input group "Timeframe Alignment Weights"
 input int    InputWeight_W1_BOS                = 16;
@@ -1013,7 +1017,8 @@ int OnInit()
                                   InputWeight_W1_BOS,
                                   InputWeight_D1_BOS,
                                   InputWeight_H4_BOS,
-                                  InputWeight_M15_BOS);
+                                  InputWeight_M15_BOS,
+                                  InputScoreLogTopCount);
    }
 
    if(H4LqLoggingEnabled())
@@ -1036,6 +1041,9 @@ int OnInit()
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
+   if(InputEnableEngulfHuntAfterH4Breach)
+      FlushScoreLogToFile();
+
    DeleteMtfSwingLegChartObjects();
    ObjectsDeleteAll(0, ChartObjectNamePrefixH4VolumeBreachRay, -1, -1);
    ObjectsDeleteAll(0, PFX_M2_TREND, -1, -1);
@@ -10720,9 +10728,9 @@ bool TryDetectH4WickLiquidityBreach(const double barHigh, const double barLow,
 #endif // H4_LQ_VOLUME_BREACH_ENABLED
 
 //+------------------------------------------------------------------+
-void V3LogSetupScoreForOptimization(const double score, const string context)
+void V3LogSetupScoreForOptimization(const double score)
 {
-   LogAllSetupScores(score, context);
+   LogAllSetupScores(score);
 }
 
 //+------------------------------------------------------------------+
@@ -10734,8 +10742,8 @@ void ProcessHuntEngulfingOnM2BarClose()
    const double barClose = iClose(_Symbol, InputM2NarrativeTimeframe, 1);
 
    const double bullScore = CalculateTotalTradeScore(true);
-   if(V3M2SwingSweepSetupPatternValid(true, barClose))
-      V3LogSetupScoreForOptimization(bullScore, "bull");
+   if(bullScore > 0.0 && V3M2SwingSweepSetupPatternValid(true, barClose))
+      V3LogSetupScoreForOptimization(bullScore);
    if(SetupScoreAllowsTradeEntry(bullScore))
       V3TryScanM2SwingSweepSetup(true, barClose, bullScore);
    else if(H4LqLoggingEnabled())
@@ -10743,8 +10751,8 @@ void ProcessHuntEngulfingOnM2BarClose()
                      StringFormat("bull setupScore=%.2f < min %.2f", bullScore, InputMinScore));
 
    const double bearScore = CalculateTotalTradeScore(false);
-   if(V3M2SwingSweepSetupPatternValid(false, barClose))
-      V3LogSetupScoreForOptimization(bearScore, "bear");
+   if(bearScore > 0.0 && V3M2SwingSweepSetupPatternValid(false, barClose))
+      V3LogSetupScoreForOptimization(bearScore);
    if(SetupScoreAllowsTradeEntry(bearScore))
       V3TryScanM2SwingSweepSetup(false, barClose, bearScore);
    else if(H4LqLoggingEnabled())

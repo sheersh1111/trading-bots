@@ -1,52 +1,108 @@
 //+------------------------------------------------------------------+
-//| ScoreLogger.mqh - Per-permutation optimization score CSV logger  |
+//| ScoreLogger.mqh - Optimization permutation summary CSV logger    |
+//| In-memory top-K buffer per pass; one shared CSV on deinit        |
 //+------------------------------------------------------------------+
 
-string g_scoreLogCsvFileName = "";
+#define SCORE_LOG_SUMMARY_CSV "OptimizationData\\permutation_scores.csv"
+
+double g_allScores[];
+int    g_scoreLogTopCapacity = 0;
+int    g_scoreLogCount       = 0;
+bool   g_scoreLogEnabled     = false;
+
+int    g_scoreLogHdrWeeklyFvg  = 0;
+int    g_scoreLogHdrDailyFvg   = 0;
+int    g_scoreLogHdrH4Fvg      = 0;
+int    g_scoreLogHdrM15Fvg     = 0;
+int    g_scoreLogHdrW1HighLow  = 0;
+int    g_scoreLogHdrD1HighLow  = 0;
+int    g_scoreLogHdrH4HighLow  = 0;
+int    g_scoreLogHdrM15HighLow = 0;
+double g_scoreLogHdrMinScore   = 0.0;
+int    g_scoreLogHdrW1Bos      = 0;
+int    g_scoreLogHdrD1Bos      = 0;
+int    g_scoreLogHdrH4Bos      = 0;
+int    g_scoreLogHdrM15Bos     = 0;
 
 //+------------------------------------------------------------------+
-string ScoreLogFormatPermDouble(const double value)
+void ResetScoreLogBuffer(const int topCapacity)
 {
-   string s = DoubleToString(value, 2);
-   StringReplace(s, ".", "p");
-   StringReplace(s, "-", "m");
-   return s;
+   g_scoreLogTopCapacity = MathMax(0, topCapacity);
+   g_scoreLogCount       = 0;
+   ArrayResize(g_allScores, 0);
 }
 
 //+------------------------------------------------------------------+
-string ScoreLogBuildPermutationKey(const int weightWeeklyFvg,
-                                   const int weightDailyFvg,
-                                   const int weightH4Fvg,
-                                   const int weightM15Fvg,
-                                   const int weightW1HighLow,
-                                   const int weightD1HighLow,
-                                   const int weightH4HighLow,
-                                   const int weightM15HighLow,
-                                   const double minScore,
-                                   const int weightW1Bos,
-                                   const int weightD1Bos,
-                                   const int weightH4Bos,
-                                   const int weightM15Bos)
+int ScoreLogFindMinScoreIndex()
 {
-   return StringFormat("W%d_D%d_H%d_M%d_HL%d_%d_%d_%d_MS%s_BOS%d_%d_%d_%d",
-                       weightWeeklyFvg,
-                       weightDailyFvg,
-                       weightH4Fvg,
-                       weightM15Fvg,
-                       weightW1HighLow,
-                       weightD1HighLow,
-                       weightH4HighLow,
-                       weightM15HighLow,
-                       ScoreLogFormatPermDouble(minScore),
-                       weightW1Bos,
-                       weightD1Bos,
-                       weightH4Bos,
-                       weightM15Bos);
+   if(g_scoreLogCount <= 0)
+      return -1;
+
+   int minIdx = 0;
+   for(int i = 1; i < g_scoreLogCount; i++)
+   {
+      if(g_allScores[i] < g_allScores[minIdx])
+         minIdx = i;
+   }
+   return minIdx;
 }
 
 //+------------------------------------------------------------------+
-// One CSV per input permutation (overwritten each optimization pass).
-// Top section: WeightName,WeightValue — then Timestamp,Score,Context rows.
+void ScoreLogSortBufferDescending()
+{
+   for(int i = 0; i < g_scoreLogCount - 1; i++)
+   {
+      for(int j = i + 1; j < g_scoreLogCount; j++)
+      {
+         if(g_allScores[j] <= g_allScores[i])
+            continue;
+
+         const double swapScore = g_allScores[i];
+         g_allScores[i] = g_allScores[j];
+         g_allScores[j] = swapScore;
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+bool ScoreLogSummaryFileNeedsHeader()
+{
+   if(!FileIsExist(SCORE_LOG_SUMMARY_CSV))
+      return true;
+
+   int fileHandle = FileOpen(SCORE_LOG_SUMMARY_CSV, FILE_READ | FILE_CSV | FILE_SHARE_READ, ',');
+   if(fileHandle == INVALID_HANDLE)
+      return true;
+
+   const bool needsHeader = (FileSize(fileHandle) <= 0);
+   FileClose(fileHandle);
+   return needsHeader;
+}
+
+//+------------------------------------------------------------------+
+void ScoreLogWriteSummaryHeader(const int fileHandle)
+{
+   FileWrite(fileHandle,
+             "WeeklyFVG",
+             "DailyFVG",
+             "H4FVG",
+             "M15FVG",
+             "W1_HighLowZones",
+             "D1_HighLowZones",
+             "H4_HighLowZones",
+             "M15_HighLowZones",
+             "MinScore",
+             "W1_BOS",
+             "D1_BOS",
+             "H4_BOS",
+             "M15_BOS",
+             "TopScoreCount",
+             "ScoreP100",
+             "ScoreP90");
+}
+
+//+------------------------------------------------------------------+
+// Store permutation weights + reset in-memory top-K buffer (no disk I/O).
 void InitScoreLogPermutationFile(const int weightWeeklyFvg,
                                  const int weightDailyFvg,
                                  const int weightH4Fvg,
@@ -59,63 +115,96 @@ void InitScoreLogPermutationFile(const int weightWeeklyFvg,
                                  const int weightW1Bos,
                                  const int weightD1Bos,
                                  const int weightH4Bos,
-                                 const int weightM15Bos)
+                                 const int weightM15Bos,
+                                 const int topScoreCapacity)
 {
-   FolderCreate("OptimizationData", FILE_SHARE_WRITE);
+   g_scoreLogHdrWeeklyFvg  = weightWeeklyFvg;
+   g_scoreLogHdrDailyFvg   = weightDailyFvg;
+   g_scoreLogHdrH4Fvg      = weightH4Fvg;
+   g_scoreLogHdrM15Fvg     = weightM15Fvg;
+   g_scoreLogHdrW1HighLow  = weightW1HighLow;
+   g_scoreLogHdrD1HighLow  = weightD1HighLow;
+   g_scoreLogHdrH4HighLow  = weightH4HighLow;
+   g_scoreLogHdrM15HighLow = weightM15HighLow;
+   g_scoreLogHdrMinScore   = minScore;
+   g_scoreLogHdrW1Bos      = weightW1Bos;
+   g_scoreLogHdrD1Bos      = weightD1Bos;
+   g_scoreLogHdrH4Bos      = weightH4Bos;
+   g_scoreLogHdrM15Bos     = weightM15Bos;
 
-   const string permKey = ScoreLogBuildPermutationKey(weightWeeklyFvg, weightDailyFvg,
-                                                      weightH4Fvg, weightM15Fvg,
-                                                      weightW1HighLow, weightD1HighLow,
-                                                      weightH4HighLow, weightM15HighLow,
-                                                      minScore,
-                                                      weightW1Bos, weightD1Bos,
-                                                      weightH4Bos, weightM15Bos);
-   g_scoreLogCsvFileName = "OptimizationData\\perm_" + permKey + ".csv";
+   ResetScoreLogBuffer(topScoreCapacity);
+   g_scoreLogEnabled = (topScoreCapacity > 0);
 
-   int fileHandle = FileOpen(g_scoreLogCsvFileName,
-                             FILE_WRITE | FILE_CSV | FILE_SHARE_WRITE, ',');
-   if(fileHandle == INVALID_HANDLE)
-   {
-      g_scoreLogCsvFileName = "";
-      return;
-   }
-
-   FileWrite(fileHandle, "WeightName", "WeightValue");
-   FileWrite(fileHandle, "WeeklyFVG", IntegerToString(weightWeeklyFvg));
-   FileWrite(fileHandle, "DailyFVG", IntegerToString(weightDailyFvg));
-   FileWrite(fileHandle, "H4FVG", IntegerToString(weightH4Fvg));
-   FileWrite(fileHandle, "M15FVG", IntegerToString(weightM15Fvg));
-   FileWrite(fileHandle, "W1_HighLowZones", IntegerToString(weightW1HighLow));
-   FileWrite(fileHandle, "D1_HighLowZones", IntegerToString(weightD1HighLow));
-   FileWrite(fileHandle, "H4_HighLowZones", IntegerToString(weightH4HighLow));
-   FileWrite(fileHandle, "M15_HighLowZones", IntegerToString(weightM15HighLow));
-   FileWrite(fileHandle, "MinScore", DoubleToString(minScore, 2));
-   FileWrite(fileHandle, "W1_BOS", IntegerToString(weightW1Bos));
-   FileWrite(fileHandle, "D1_BOS", IntegerToString(weightD1Bos));
-   FileWrite(fileHandle, "H4_BOS", IntegerToString(weightH4Bos));
-   FileWrite(fileHandle, "M15_BOS", IntegerToString(weightM15Bos));
-   FileWrite(fileHandle, "", "");
-   FileWrite(fileHandle, "Timestamp", "Score", "Context");
-   FileClose(fileHandle);
+   if(g_scoreLogEnabled)
+      FolderCreate("OptimizationData", FILE_SHARE_WRITE);
 }
 
 //+------------------------------------------------------------------+
-void LogAllSetupScores(const double score, const string context)
+// Keep top-K positive scores in RAM; discard scores <= 0 and below current minimum.
+void LogAllSetupScores(const double score)
 {
-   if(g_scoreLogCsvFileName == "")
+   if(!g_scoreLogEnabled)
+      return;
+   if(score <= 0.0)
       return;
 
+   if(g_scoreLogCount < g_scoreLogTopCapacity)
+   {
+      const int idx = g_scoreLogCount;
+      ArrayResize(g_allScores, idx + 1);
+      g_allScores[idx] = score;
+      g_scoreLogCount++;
+      return;
+   }
+
+   const int minIdx = ScoreLogFindMinScoreIndex();
+   if(minIdx < 0 || score <= g_allScores[minIdx])
+      return;
+
+   g_allScores[minIdx] = score;
+}
+
+//+------------------------------------------------------------------+
+// Append one summary row for this permutation to the shared CSV.
+void FlushScoreLogToFile()
+{
+   if(!g_scoreLogEnabled || g_scoreLogCount <= 0)
+      return;
+
+   ScoreLogSortBufferDescending();
+
+   const double scoreP100 = g_allScores[0];
+   double scoreP90        = scoreP100;
+   if(g_scoreLogCount >= 2)
+      scoreP90 = g_allScores[g_scoreLogCount - 2];
+
    const int openFlags = FILE_READ | FILE_WRITE | FILE_CSV | FILE_SHARE_WRITE;
-   int fileHandle = FileOpen(g_scoreLogCsvFileName, openFlags, ',');
+   int fileHandle = FileOpen(SCORE_LOG_SUMMARY_CSV, openFlags, ',');
    if(fileHandle == INVALID_HANDLE)
       return;
 
-   if(FileSize(fileHandle) > 0)
+   if(ScoreLogSummaryFileNeedsHeader())
+      ScoreLogWriteSummaryHeader(fileHandle);
+   else if(FileSize(fileHandle) > 0)
       FileSeek(fileHandle, 0, SEEK_END);
 
    FileWrite(fileHandle,
-             TimeToString(TimeCurrent(), TIME_DATE | TIME_SECONDS),
-             DoubleToString(score, 2),
-             context);
+             IntegerToString(g_scoreLogHdrWeeklyFvg),
+             IntegerToString(g_scoreLogHdrDailyFvg),
+             IntegerToString(g_scoreLogHdrH4Fvg),
+             IntegerToString(g_scoreLogHdrM15Fvg),
+             IntegerToString(g_scoreLogHdrW1HighLow),
+             IntegerToString(g_scoreLogHdrD1HighLow),
+             IntegerToString(g_scoreLogHdrH4HighLow),
+             IntegerToString(g_scoreLogHdrM15HighLow),
+             DoubleToString(g_scoreLogHdrMinScore, 2),
+             IntegerToString(g_scoreLogHdrW1Bos),
+             IntegerToString(g_scoreLogHdrD1Bos),
+             IntegerToString(g_scoreLogHdrH4Bos),
+             IntegerToString(g_scoreLogHdrM15Bos),
+             IntegerToString(g_scoreLogCount),
+             DoubleToString(scoreP100, 2),
+             DoubleToString(scoreP90, 2));
+
    FileClose(fileHandle);
 }
