@@ -28,30 +28,27 @@ int GetOptimizedZoneWeight(const ENUM_SMC_ZONE_TYPE type)
       case ZONE_BULL_M15_FVG:
       case ZONE_BEAR_M15_FVG:
          return InputWeight_M15FVG;
-      case ZONE_BULL_BROKEN_DAILY_HIGH:
-      case ZONE_BULL_BROKEN_H4_HIGH:
-      case ZONE_BULL_BROKEN_M15_HIGH:
-      case ZONE_BEAR_BROKEN_DAILY_LOW:
-      case ZONE_BEAR_BROKEN_H4_LOW:
-      case ZONE_BEAR_BROKEN_M15_LOW:
-         return InputWeight_Breaker;
       case ZONE_BULL_PROTECTED_DAILY_LOW:
-      case ZONE_BULL_PROTECTED_H4_LOW:
-      case ZONE_BULL_PROTECTED_M15_LOW:
       case ZONE_BEAR_PROTECTED_DAILY_HIGH:
+         return InputWeight_D1_HighLowZones;
+      case ZONE_BULL_PROTECTED_H4_LOW:
       case ZONE_BEAR_PROTECTED_H4_HIGH:
+         return InputWeight_H4_HighLowZones;
+      case ZONE_BULL_PROTECTED_M15_LOW:
       case ZONE_BEAR_PROTECTED_M15_HIGH:
-         return InputWeight_Protected;
+         return InputWeight_M15_HighLowZones;
       case ZONE_BULL_SWING_W1_LOW:
-      case ZONE_BULL_SWING_DAILY_LOW:
-      case ZONE_BULL_SWING_H4_LOW:
-      case ZONE_BULL_SWING_M15_LOW:
-         return InputWeight_SwingSupport;
       case ZONE_BEAR_SWING_W1_HIGH:
+         return InputWeight_W1_HighLowZones;
+      case ZONE_BULL_SWING_DAILY_LOW:
       case ZONE_BEAR_SWING_DAILY_HIGH:
+         return InputWeight_D1_HighLowZones;
+      case ZONE_BULL_SWING_H4_LOW:
       case ZONE_BEAR_SWING_H4_HIGH:
+         return InputWeight_H4_HighLowZones;
+      case ZONE_BULL_SWING_M15_LOW:
       case ZONE_BEAR_SWING_M15_HIGH:
-         return InputWeight_SwingResistance;
+         return InputWeight_M15_HighLowZones;
    }
    return 1;
 }
@@ -83,9 +80,10 @@ double CalculateTotalTradeScore(const bool isBullishTrade)
       if(SMCZoneTypeIsBullish(g_activeZones[i].type) != isBullishTrade)
          continue;
 
-      double weight = (double)GetOptimizedZoneWeight(g_activeZones[i].type);
-      if(g_activeZones[i].isClustered)
-         weight *= InputClusterMultiplier;
+      const double weight = (double)GetOptimizedZoneWeight(g_activeZones[i].type);
+      // Cluster multiplier unused — isClustered is never set true in zone registration.
+      // if(g_activeZones[i].isClustered)
+      //    weight *= InputClusterMultiplier;
       locationScore += weight;
    }
 
@@ -122,12 +120,13 @@ double GetMaxPossibleScore()
 {
    double zoneWeightSum = (double)InputWeight_WeeklyFVG + (double)InputWeight_DailyFVG
                         + (double)InputWeight_H4FVG + (double)InputWeight_M15FVG
-                        + 3.0 * (double)InputWeight_Breaker + 3.0 * (double)InputWeight_Protected
-                        + 4.0 * (double)InputWeight_SwingSupport
-                        + 4.0 * (double)InputWeight_SwingResistance;
-
-   if(InputClusterMultiplier > 0.0)
-      zoneWeightSum *= InputClusterMultiplier;
+                        + (double)InputWeight_D1_HighLowZones
+                        + (double)InputWeight_H4_HighLowZones
+                        + (double)InputWeight_M15_HighLowZones
+                        + 2.0 * (double)InputWeight_W1_HighLowZones
+                        + 2.0 * (double)InputWeight_D1_HighLowZones
+                        + 2.0 * (double)InputWeight_H4_HighLowZones
+                        + 2.0 * (double)InputWeight_M15_HighLowZones;
 
    const double alignmentWeightSum = (double)InputWeight_W1_BOS + (double)InputWeight_D1_BOS
                                  + (double)InputWeight_H4_BOS + (double)InputWeight_M15_BOS;
