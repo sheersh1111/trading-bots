@@ -1,9 +1,9 @@
 //+------------------------------------------------------------------+
 //| ScoreLogger.mqh - Optimization permutation summary CSV logger    |
-//| In-memory top-K buffer per pass; one shared CSV on deinit        |
+//| In-memory top-K buffer per pass; upsert one shared CSV on deinit |
 //+------------------------------------------------------------------+
 
-#define SCORE_LOG_SUMMARY_CSV "OptimizationData\\permutation_scores.csv"
+#define SCORE_LOG_SUMMARY_CSV "optimization_permutation_summary.csv"
 
 double g_allScores[];
 int    g_scoreLogTopCapacity = 0;
@@ -23,6 +23,26 @@ int    g_scoreLogHdrW1Bos      = 0;
 int    g_scoreLogHdrD1Bos      = 0;
 int    g_scoreLogHdrH4Bos      = 0;
 int    g_scoreLogHdrM15Bos     = 0;
+
+struct ScoreLogSummaryRow
+{
+   int    weeklyFvg;
+   int    dailyFvg;
+   int    h4Fvg;
+   int    m15Fvg;
+   int    w1HighLow;
+   int    d1HighLow;
+   int    h4HighLow;
+   int    m15HighLow;
+   double minScore;
+   int    w1Bos;
+   int    d1Bos;
+   int    h4Bos;
+   int    m15Bos;
+   int    topScoreCount;
+   double scoreP100;
+   double scoreP90;
+};
 
 //+------------------------------------------------------------------+
 void ResetScoreLogBuffer(const int topCapacity)
@@ -65,21 +85,6 @@ void ScoreLogSortBufferDescending()
 }
 
 //+------------------------------------------------------------------+
-bool ScoreLogSummaryFileNeedsHeader()
-{
-   if(!FileIsExist(SCORE_LOG_SUMMARY_CSV))
-      return true;
-
-   int fileHandle = FileOpen(SCORE_LOG_SUMMARY_CSV, FILE_READ | FILE_CSV | FILE_SHARE_READ, ',');
-   if(fileHandle == INVALID_HANDLE)
-      return true;
-
-   const bool needsHeader = (FileSize(fileHandle) <= 0);
-   FileClose(fileHandle);
-   return needsHeader;
-}
-
-//+------------------------------------------------------------------+
 void ScoreLogWriteSummaryHeader(const int fileHandle)
 {
    FileWrite(fileHandle,
@@ -99,6 +104,162 @@ void ScoreLogWriteSummaryHeader(const int fileHandle)
              "TopScoreCount",
              "ScoreP100",
              "ScoreP90");
+}
+
+//+------------------------------------------------------------------+
+bool ScoreLogReadSummaryRow(const int fileHandle, ScoreLogSummaryRow &row)
+{
+   if(FileIsEnding(fileHandle))
+      return false;
+
+   row.weeklyFvg     = (int)StringToInteger(FileReadString(fileHandle));
+   row.dailyFvg      = (int)StringToInteger(FileReadString(fileHandle));
+   row.h4Fvg         = (int)StringToInteger(FileReadString(fileHandle));
+   row.m15Fvg        = (int)StringToInteger(FileReadString(fileHandle));
+   row.w1HighLow     = (int)StringToInteger(FileReadString(fileHandle));
+   row.d1HighLow     = (int)StringToInteger(FileReadString(fileHandle));
+   row.h4HighLow     = (int)StringToInteger(FileReadString(fileHandle));
+   row.m15HighLow    = (int)StringToInteger(FileReadString(fileHandle));
+   row.minScore      = StringToDouble(FileReadString(fileHandle));
+   row.w1Bos         = (int)StringToInteger(FileReadString(fileHandle));
+   row.d1Bos         = (int)StringToInteger(FileReadString(fileHandle));
+   row.h4Bos         = (int)StringToInteger(FileReadString(fileHandle));
+   row.m15Bos        = (int)StringToInteger(FileReadString(fileHandle));
+   row.topScoreCount = (int)StringToInteger(FileReadString(fileHandle));
+   row.scoreP100     = StringToDouble(FileReadString(fileHandle));
+   row.scoreP90      = StringToDouble(FileReadString(fileHandle));
+   return true;
+}
+
+//+------------------------------------------------------------------+
+void ScoreLogWriteSummaryRow(const int fileHandle, const ScoreLogSummaryRow &row)
+{
+   FileWrite(fileHandle,
+             IntegerToString(row.weeklyFvg),
+             IntegerToString(row.dailyFvg),
+             IntegerToString(row.h4Fvg),
+             IntegerToString(row.m15Fvg),
+             IntegerToString(row.w1HighLow),
+             IntegerToString(row.d1HighLow),
+             IntegerToString(row.h4HighLow),
+             IntegerToString(row.m15HighLow),
+             DoubleToString(row.minScore, 2),
+             IntegerToString(row.w1Bos),
+             IntegerToString(row.d1Bos),
+             IntegerToString(row.h4Bos),
+             IntegerToString(row.m15Bos),
+             IntegerToString(row.topScoreCount),
+             DoubleToString(row.scoreP100, 2),
+             DoubleToString(row.scoreP90, 2));
+}
+
+//+------------------------------------------------------------------+
+bool ScoreLogRowMatchesCurrentPermutation(const ScoreLogSummaryRow &row)
+{
+   if(row.weeklyFvg != g_scoreLogHdrWeeklyFvg)
+      return false;
+   if(row.dailyFvg != g_scoreLogHdrDailyFvg)
+      return false;
+   if(row.h4Fvg != g_scoreLogHdrH4Fvg)
+      return false;
+   if(row.m15Fvg != g_scoreLogHdrM15Fvg)
+      return false;
+   if(row.w1HighLow != g_scoreLogHdrW1HighLow)
+      return false;
+   if(row.d1HighLow != g_scoreLogHdrD1HighLow)
+      return false;
+   if(row.h4HighLow != g_scoreLogHdrH4HighLow)
+      return false;
+   if(row.m15HighLow != g_scoreLogHdrM15HighLow)
+      return false;
+   if(MathAbs(row.minScore - g_scoreLogHdrMinScore) > 0.001)
+      return false;
+   if(row.w1Bos != g_scoreLogHdrW1Bos)
+      return false;
+   if(row.d1Bos != g_scoreLogHdrD1Bos)
+      return false;
+   if(row.h4Bos != g_scoreLogHdrH4Bos)
+      return false;
+   if(row.m15Bos != g_scoreLogHdrM15Bos)
+      return false;
+   return true;
+}
+
+//+------------------------------------------------------------------+
+void ScoreLogBuildCurrentSummaryRow(ScoreLogSummaryRow &row,
+                                     const double scoreP100,
+                                     const double scoreP90)
+{
+   row.weeklyFvg     = g_scoreLogHdrWeeklyFvg;
+   row.dailyFvg      = g_scoreLogHdrDailyFvg;
+   row.h4Fvg         = g_scoreLogHdrH4Fvg;
+   row.m15Fvg        = g_scoreLogHdrM15Fvg;
+   row.w1HighLow     = g_scoreLogHdrW1HighLow;
+   row.d1HighLow     = g_scoreLogHdrD1HighLow;
+   row.h4HighLow     = g_scoreLogHdrH4HighLow;
+   row.m15HighLow    = g_scoreLogHdrM15HighLow;
+   row.minScore      = g_scoreLogHdrMinScore;
+   row.w1Bos         = g_scoreLogHdrW1Bos;
+   row.d1Bos         = g_scoreLogHdrD1Bos;
+   row.h4Bos         = g_scoreLogHdrH4Bos;
+   row.m15Bos        = g_scoreLogHdrM15Bos;
+   row.topScoreCount = g_scoreLogCount;
+   row.scoreP100     = scoreP100;
+   row.scoreP90      = scoreP90;
+}
+
+//+------------------------------------------------------------------+
+int ScoreLogLoadSummaryRows(ScoreLogSummaryRow &rows[])
+{
+   ArrayResize(rows, 0);
+   if(!FileIsExist(SCORE_LOG_SUMMARY_CSV))
+      return 0;
+
+   const int readFlags = FILE_READ | FILE_CSV | FILE_SHARE_READ;
+   int fileHandle = FileOpen(SCORE_LOG_SUMMARY_CSV, readFlags, ',');
+   if(fileHandle == INVALID_HANDLE)
+      return 0;
+
+   if(!FileIsEnding(fileHandle))
+   {
+      for(int col = 0; col < 16; col++)
+      {
+         if(FileIsEnding(fileHandle))
+            break;
+         FileReadString(fileHandle);
+      }
+   }
+
+   while(!FileIsEnding(fileHandle))
+   {
+      ScoreLogSummaryRow row;
+      if(!ScoreLogReadSummaryRow(fileHandle, row))
+         break;
+
+      const int idx = ArraySize(rows);
+      ArrayResize(rows, idx + 1);
+      rows[idx] = row;
+   }
+
+   FileClose(fileHandle);
+   return ArraySize(rows);
+}
+
+//+------------------------------------------------------------------+
+bool ScoreLogWriteAllSummaryRows(const ScoreLogSummaryRow &rows[])
+{
+   const int writeFlags = FILE_WRITE | FILE_CSV | FILE_SHARE_WRITE;
+   int fileHandle = FileOpen(SCORE_LOG_SUMMARY_CSV, writeFlags, ',');
+   if(fileHandle == INVALID_HANDLE)
+      return false;
+
+   ScoreLogWriteSummaryHeader(fileHandle);
+   const int rowCount = ArraySize(rows);
+   for(int i = 0; i < rowCount; i++)
+      ScoreLogWriteSummaryRow(fileHandle, rows[i]);
+
+   FileClose(fileHandle);
+   return true;
 }
 
 //+------------------------------------------------------------------+
@@ -134,9 +295,6 @@ void InitScoreLogPermutationFile(const int weightWeeklyFvg,
 
    ResetScoreLogBuffer(topScoreCapacity);
    g_scoreLogEnabled = (topScoreCapacity > 0);
-
-   if(g_scoreLogEnabled)
-      FolderCreate("OptimizationData", FILE_SHARE_WRITE);
 }
 
 //+------------------------------------------------------------------+
@@ -165,7 +323,7 @@ void LogAllSetupScores(const double score)
 }
 
 //+------------------------------------------------------------------+
-// Append one summary row for this permutation to the shared CSV.
+// Upsert one summary row for this permutation into the shared CSV.
 void FlushScoreLogToFile()
 {
    if(!g_scoreLogEnabled || g_scoreLogCount <= 0)
@@ -178,33 +336,30 @@ void FlushScoreLogToFile()
    if(g_scoreLogCount >= 2)
       scoreP90 = g_allScores[g_scoreLogCount - 2];
 
-   const int openFlags = FILE_READ | FILE_WRITE | FILE_CSV | FILE_SHARE_WRITE;
-   int fileHandle = FileOpen(SCORE_LOG_SUMMARY_CSV, openFlags, ',');
-   if(fileHandle == INVALID_HANDLE)
-      return;
+   ScoreLogSummaryRow currentRow;
+   ScoreLogBuildCurrentSummaryRow(currentRow, scoreP100, scoreP90);
 
-   if(ScoreLogSummaryFileNeedsHeader())
-      ScoreLogWriteSummaryHeader(fileHandle);
-   else if(FileSize(fileHandle) > 0)
-      FileSeek(fileHandle, 0, SEEK_END);
+   ScoreLogSummaryRow rows[];
+   const int rowCount = ScoreLogLoadSummaryRows(rows);
 
-   FileWrite(fileHandle,
-             IntegerToString(g_scoreLogHdrWeeklyFvg),
-             IntegerToString(g_scoreLogHdrDailyFvg),
-             IntegerToString(g_scoreLogHdrH4Fvg),
-             IntegerToString(g_scoreLogHdrM15Fvg),
-             IntegerToString(g_scoreLogHdrW1HighLow),
-             IntegerToString(g_scoreLogHdrD1HighLow),
-             IntegerToString(g_scoreLogHdrH4HighLow),
-             IntegerToString(g_scoreLogHdrM15HighLow),
-             DoubleToString(g_scoreLogHdrMinScore, 2),
-             IntegerToString(g_scoreLogHdrW1Bos),
-             IntegerToString(g_scoreLogHdrD1Bos),
-             IntegerToString(g_scoreLogHdrH4Bos),
-             IntegerToString(g_scoreLogHdrM15Bos),
-             IntegerToString(g_scoreLogCount),
-             DoubleToString(scoreP100, 2),
-             DoubleToString(scoreP90, 2));
+   int matchIndex = -1;
+   for(int i = 0; i < rowCount; i++)
+   {
+      if(ScoreLogRowMatchesCurrentPermutation(rows[i]))
+      {
+         matchIndex = i;
+         break;
+      }
+   }
 
-   FileClose(fileHandle);
+   if(matchIndex >= 0)
+      rows[matchIndex] = currentRow;
+   else
+   {
+      const int idx = ArraySize(rows);
+      ArrayResize(rows, idx + 1);
+      rows[idx] = currentRow;
+   }
+
+   ScoreLogWriteAllSummaryRows(rows);
 }
