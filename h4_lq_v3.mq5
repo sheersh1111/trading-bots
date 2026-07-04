@@ -1,6 +1,14 @@
 //+------------------------------------------------------------------+
 //| h4_lq_v3.mq5                                                      |
 //| H4 breach hunt + M2 Engulfing Volume Absorption entry model       |
+//| v3.81: score log — running int P100 only (no g_allScores array); flush on deinit |
+//| v3.80: solo TP fallback respects 10% proximity vs cluster TPs + other chosen levels |
+//| v3.79: swing TP fallback — individual swing levels when cluster TPs < 3 (same R:R + front-run) |
+//| v3.78: score CSV write/read switch; P100/P90 from all positive scores (not top-K) |
+//| v3.77: zone location score only when bull setup low / bear setup high is inside zone |
+//| v3.76: in-memory score logging storage disabled (ScoreP100 risk lookup still active) |
+//| v3.75: score-logging CSV output disabled (ScoreP100 risk lookup still active) |
+//| v3.74: tester risk sizing uses ScoreP100 from permutation summary CSV (fallback: theoretical max) |
 //| v3.73: upsert permutation row in shared optimization_permutation_summary.csv |
 //| v3.72: score summary CSV in agent Files root (not OptimizationData subfolder) |
 //| v3.71: one shared optimization CSV row per permutation (weights + ScoreP100/P90) |
@@ -73,7 +81,7 @@
 //| v3.01: exhaustion leg filter — min leg range % of M2 chart height (replaces min bar count) |
 //| v3.00: replace M2 touch/FVG with engulfing vol absorption + exhaustion gate |
 //+------------------------------------------------------------------+
-#define H4_LQ_V3_VERSION "3.73"
+#define H4_LQ_V3_VERSION "3.81"
 // Breach record array + hunt arming: uncomment next line to re-enable.
 // #define H4_LQ_VOLUME_BREACH_ENABLED
 #property copyright ""
@@ -168,10 +176,10 @@ input int    InputWeight_H4_HighLowZones       = 5;  // H4 swing/protected highs
 input int    InputWeight_M15_HighLowZones      = 2;  // M15 swing/protected highs+lows (same default as M15 FVG)
 // input double InputClusterMultiplier            = 1.5; // unused (isClustered is never set true)
 input double InputMinScore                     = 0.0;  // min signed setupScore to allow entry; 0=block score<0
-input double InputBaseRiskPercent            = 1.0;  // equity % at max score; scaled by |score|/scoreMax
+input double InputBaseRiskPercent            = 1.0;  // equity % at ScoreP100 (tester) or theoretical max; scaled by |score|/denom
 
 input group "Optimization score logging"
-input int    InputScoreLogTopCount             = 100; // top positive scores kept in RAM; flushed once on deinit; 0=off
+input bool   InputScoreLogWriteCsv             = false; // true=write ScoreP100 CSV on deinit; false=read CSV for tester risk sizing
 
 input group "Timeframe Alignment Weights"
 input int    InputWeight_W1_BOS                = 16;
@@ -578,8 +586,11 @@ void   SMCMapUnbrokenSwingZones(const MTFSwingTracker &tracker,
                                  const ENUM_SMC_ZONE_TYPE bearSwingHighType);
 void   SMCUpdateActiveZonesMitigation();
 void   SMCExpireZonesPastBarLimit();
-double CalculateTotalTradeScore(const bool isBullishTrade);
-double GetMaxPossibleScore();
+double CalculateTotalTradeScore(const bool isBullishTrade, const double setupLow, const double setupHigh);
+bool   V3ResolveSetupExtremesForZoneScoring(const bool isBuy, double &outSetupLow, double &outSetupHigh);
+double CalculateSetupTradeScore(const bool isBullishTrade);
+double CalculateSetupTradeScoreFromStopLoss(const bool isBuy, const double stopLossPrice);
+double GetRiskNormalizationScore();
 bool   SetupScoreAllowsTradeEntry(const double setupScore);
 double GetOptimizedLotSize(const double entryPrice, const double stopLoss, const double score,
                             const bool isBuy, const double riskUsdFraction = 1.0);
@@ -1020,7 +1031,26 @@ int OnInit()
                                   InputWeight_D1_BOS,
                                   InputWeight_H4_BOS,
                                   InputWeight_M15_BOS,
-                                  InputScoreLogTopCount);
+                                  InputScoreLogWriteCsv);
+
+      if(!InputScoreLogWriteCsv && MQLInfoInteger(MQL_TESTER))
+      {
+         if(InitRiskScoreP100FromPermutationSummary())
+         {
+            PrintFormat("%s v%s | score CSV read mode ScoreP100=%d",
+                        H4_LQ_LOG_PREFIX, H4_LQ_V3_VERSION, (int)MathRound(g_riskScoreP100));
+         }
+         else if(H4LqLoggingEnabled())
+         {
+            PrintFormat("%s v%s | score CSV read mode fallback theoretical max=%.2f",
+                        H4_LQ_LOG_PREFIX, H4_LQ_V3_VERSION, GetMaxPossibleScore());
+         }
+      }
+      else if(InputScoreLogWriteCsv && H4LqLoggingEnabled())
+      {
+         PrintFormat("%s v%s | score CSV write mode (flush on deinit)",
+                     H4_LQ_LOG_PREFIX, H4_LQ_V3_VERSION);
+      }
    }
 
    if(H4LqLoggingEnabled())
@@ -1043,7 +1073,7 @@ int OnInit()
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
-   if(InputEnableEngulfHuntAfterH4Breach)
+   if(InputEnableEngulfHuntAfterH4Breach && InputScoreLogWriteCsv)
       FlushScoreLogToFile();
 
    DeleteMtfSwingLegChartObjects();
@@ -2067,7 +2097,70 @@ void SortTakeProfitLevelsNearestFirst(const bool isBuy, double &tpPrices[], cons
 }
 
 //+------------------------------------------------------------------+
-//| Group swing extremes â†’ qualifying line TPs (min R:R) + optional chart zones. |
+bool TakeProfitLevelWithinProximityBand(const double tpLinePrice,
+                                        const double &existingTpPrices[],
+                                        const int existingTpCount,
+                                        const double proximityBand)
+{
+   if(proximityBand <= 0.0 || existingTpCount < 1)
+      return false;
+
+   for(int i = 0; i < existingTpCount; i++)
+   {
+      if(MathAbs(existingTpPrices[i] - tpLinePrice) <= proximityBand)
+         return true;
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+int AppendIndividualSwingTakeProfitLevels(const bool isBuy, const double entryPrice,
+                                          const double stopLossPrice,
+                                          const M2SwingExtremePoint &points[], const int pointCount,
+                                          const double frontRunOffset, const double proximityBand,
+                                          double &outTakeProfitPrices[], int &outTakeProfitCount,
+                                          const int maxTakeProfitCount, int &outSkippedRewardToRisk,
+                                          int &outSkippedProximity)
+{
+   outSkippedRewardToRisk = 0;
+   outSkippedProximity    = 0;
+   int added = 0;
+   for(int i = 0; i < pointCount && outTakeProfitCount < maxTakeProfitCount; i++)
+   {
+      double linePrice = points[i].extremePrice;
+      if(frontRunOffset > 0.0)
+      {
+         if(isBuy)
+            linePrice -= frontRunOffset;
+         else
+            linePrice += frontRunOffset;
+      }
+
+      if(TakeProfitLevelWithinProximityBand(linePrice, outTakeProfitPrices, outTakeProfitCount,
+                                            proximityBand))
+      {
+         outSkippedProximity++;
+         continue;
+      }
+
+      if(!SwingGroupLineMeetsMinRiskReward(isBuy, entryPrice, stopLossPrice, linePrice,
+                                           InputTradeSwingTpMinRewardToRisk))
+      {
+         outSkippedRewardToRisk++;
+         continue;
+      }
+
+      const int beforeCount = outTakeProfitCount;
+      AppendUniqueTakeProfitLevel(outTakeProfitPrices, outTakeProfitCount, linePrice);
+      if(outTakeProfitCount > beforeCount)
+         added++;
+   }
+   return added;
+}
+
+//+------------------------------------------------------------------+
+//| Group swing extremes → qualifying line TPs (min R:R) + optional chart zones. |
+//| Falls back to individual swing levels when cluster count < LQ_TP_COUNT.        |
 //+------------------------------------------------------------------+
 bool BuildTradeSwingGroupTakeProfits(const bool isBullishTrade, const datetime formationTime,
                                      const double entryPrice, const double stopLossPrice,
@@ -2099,6 +2192,10 @@ bool BuildTradeSwingGroupTakeProfits(const bool isBullishTrade, const datetime f
 
    const double proximityBand =
       chartHeight * (InputTradeSwingProximityPercentOfChartRange / 100.0);
+   const double frontRunOffset =
+      (InputTradeSwingTpFrontRunPercentOfChartRange > 0.0)
+      ? chartHeight * (InputTradeSwingTpFrontRunPercentOfChartRange / 100.0)
+      : 0.0;
 
    bool used[];
    ArrayResize(used, pointCount);
@@ -2171,9 +2268,8 @@ bool BuildTradeSwingGroupTakeProfits(const bool isBullishTrade, const datetime f
       if(mostRecentTime <= 0)
          continue;
 
-      if(InputTradeSwingTpFrontRunPercentOfChartRange > 0.0)
+      if(frontRunOffset > 0.0)
       {
-         const double frontRunOffset = chartHeight * (InputTradeSwingTpFrontRunPercentOfChartRange / 100.0);
          if(isBuy)
             linePrice -= frontRunOffset;
          else
@@ -2251,12 +2347,27 @@ bool BuildTradeSwingGroupTakeProfits(const bool isBullishTrade, const datetime f
       groupSeq++;
    }
 
+   int soloAdded          = 0;
+   int soloSkippedRR      = 0;
+   int soloSkippedProx    = 0;
+   const int clusterTpCount = outTakeProfitCount;
+   if(outTakeProfitCount < LQ_TP_COUNT)
+   {
+      soloAdded = AppendIndividualSwingTakeProfitLevels(isBuy, entryPrice, stopLossPrice,
+                                                        points, pointCount, frontRunOffset,
+                                                        proximityBand,
+                                                        outTakeProfitPrices, outTakeProfitCount,
+                                                        LQ_TP_COUNT, soloSkippedRR,
+                                                        soloSkippedProx);
+   }
+
    if(outTakeProfitCount < 1)
    {
       LogHuntEvent("TRADE_SWGRP_SKIP",
-                   StringFormat("%s no TP lines met min R:R %.2f (skipped=%d)",
+                   StringFormat("%s no TP lines met min R:R %.2f clusterSkipped=%d soloSkippedRR=%d soloSkippedProx=%d",
                                 isBullishTrade ? "bull" : "bear",
-                                InputTradeSwingTpMinRewardToRisk, groupsSkipped));
+                                InputTradeSwingTpMinRewardToRisk, groupsSkipped,
+                                soloSkippedRR, soloSkippedProx));
       return false;
    }
 
@@ -2265,10 +2376,18 @@ bool BuildTradeSwingGroupTakeProfits(const bool isBullishTrade, const datetime f
    if(outTakeProfitCount > LQ_TP_COUNT)
       outTakeProfitCount = LQ_TP_COUNT;
 
+   if(soloAdded > 0)
+   {
+      LogHuntEvent("TRADE_SWGRP_SOLO",
+                   StringFormat("%s soloTps=%d clusterTps=%d soloSkippedRR=%d soloSkippedProx=%d",
+                                isBullishTrade ? "bull" : "bear", soloAdded,
+                                clusterTpCount, soloSkippedRR, soloSkippedProx));
+   }
+
    LogHuntEvent("TRADE_SWGRP_TP",
-                StringFormat("%s tps=%d drawn=%d skippedRR=%d nearest=%.5f farthest=%.5f",
+                StringFormat("%s tps=%d clusterDrawn=%d clusterSkippedRR=%d soloAdded=%d nearest=%.5f farthest=%.5f",
                              isBullishTrade ? "bull" : "bear", outTakeProfitCount, groupSeq,
-                             groupsSkipped, outTakeProfitPrices[0],
+                             groupsSkipped, soloAdded, outTakeProfitPrices[0],
                              outTakeProfitPrices[outTakeProfitCount - 1]));
 
    if(H4LqChartDrawEnabled(InputDrawTradeSwingGroupTpZones))
@@ -7015,18 +7134,18 @@ bool SetupScoreAllowsTradeEntry(const double setupScore)
 double GetOptimizedLotSize(const double entryPrice, const double stopLoss, const double score,
                             const bool isBuy, const double riskUsdFraction = 1.0)
 {
-   const double maxPossible = GetMaxPossibleScore();
-   if(maxPossible <= 0.0 || InputBaseRiskPercent <= 0.0 || riskUsdFraction <= 0.0)
+   const double scoreDenom = GetRiskNormalizationScore();
+   if(scoreDenom <= 0.0 || InputBaseRiskPercent <= 0.0 || riskUsdFraction <= 0.0)
       return 0.0;
 
-   const double alignmentRatio = MathAbs(score) / maxPossible;
+   const double alignmentRatio = MathAbs(score) / scoreDenom;
    const double clampedRatio   = MathMax(0.1, MathMin(2.0, alignmentRatio));
    const double riskPercent    = InputBaseRiskPercent * clampedRatio;
    const double riskUsd        = AccountInfoDouble(ACCOUNT_EQUITY) * riskPercent / 100.0 * riskUsdFraction;
 
    LogHuntEvent("RISK_SIZE",
-                StringFormat("setupScore=%.2f clampedRatio=%.3f riskPercent=%.3f%% legFrac=%.3f riskUsd=%.2f",
-                             score, clampedRatio, riskPercent, riskUsdFraction, riskUsd));
+                StringFormat("setupScore=%.2f scoreDenom=%.2f clampedRatio=%.3f riskPercent=%.3f%% legFrac=%.3f riskUsd=%.2f",
+                             score, scoreDenom, clampedRatio, riskPercent, riskUsdFraction, riskUsd));
 
    return CalculateVolumeForFixedUsdRisk(isBuy, entryPrice, stopLoss, riskUsd);
 }
@@ -8409,7 +8528,7 @@ bool PlaceOneFvgTradeOrder(const bool isBullishFairValueGap, const bool useMarke
    else
       LogHuntEvent("TRADE_ORDER",
                    StringFormat("setupScore=%.2f %s %s",
-                                CalculateTotalTradeScore(isBullishFairValueGap),
+                                CalculateSetupTradeScoreFromStopLoss(isBullishFairValueGap, stopLossPrice),
                                 isBullishFairValueGap ? "buy" : "sell", comment));
    return ok;
 }
@@ -8574,7 +8693,7 @@ bool TryPlaceTouchVolumeBarTradeSetup(const int huntIndex, const bool isBuy,
    }
 
    double normalizedEntry = NormalizeDouble(entryPrice, _Digits);
-   const double setupScore = CalculateTotalTradeScore(isBuy);
+   const double setupScore = CalculateSetupTradeScoreFromStopLoss(isBuy, stopLossOverall);
    if(!SetupScoreAllowsTradeEntry(setupScore))
    {
       V2LogHuntEvent(huntIndex, "TRADE_SKIP",
@@ -8761,7 +8880,7 @@ bool TryPlaceOppositeFvgTradeSetup(const bool isBullishFairValueGap, const doubl
 
    double normalizedEntry = NormalizeDouble(entryPrice, _Digits);
    const bool isBuy       = isBullishFairValueGap;
-   const double setupScore = CalculateTotalTradeScore(isBuy);
+   const double setupScore = CalculateSetupTradeScoreFromStopLoss(isBuy, stopLossOverall);
    if(!SetupScoreAllowsTradeEntry(setupScore))
    {
       V2LogHuntEvent(huntIndex, "TRADE_SKIP",
@@ -10374,6 +10493,7 @@ void V3TryScanM2SwingSweepSetup(const bool isBuy, const double barClose, const d
                                            refLevel, countdown, exhaustDetail))
    {
       const double entryPrice = barClose;
+      const double setupScore = CalculateSetupTradeScoreFromStopLoss(isBuy, stopLoss);
 
       V2LogHuntEvent(-1, "SWEEP_SIGNAL",
                      StringFormat("%s entry=%.5f sl=%.5f ref=%.5f cd=%d %s bar=%s",
@@ -10422,11 +10542,11 @@ void V3TryScanM2SwingSweepSetup(const bool isBuy, const double barClose, const d
 //+------------------------------------------------------------------+
 void V3RunM2SwingSweepScansOnBarClose(const double barClose)
 {
-   const double bullScore = CalculateTotalTradeScore(true);
+   const double bullScore = CalculateSetupTradeScore(true);
    if(SetupScoreAllowsTradeEntry(bullScore))
       V3TryScanM2SwingSweepSetup(true, barClose, bullScore);
 
-   const double bearScore = CalculateTotalTradeScore(false);
+   const double bearScore = CalculateSetupTradeScore(false);
    if(SetupScoreAllowsTradeEntry(bearScore))
       V3TryScanM2SwingSweepSetup(false, barClose, bearScore);
 }
@@ -10448,7 +10568,7 @@ void V3TryScanEngulfAbsorptionOnM2Close(const int huntIndex, const double barClo
       return;
 
    const bool   isBuy  = V2HuntExpectsBullishFvg(huntIndex);
-   const double score  = CalculateTotalTradeScore(isBuy);
+   const double score  = CalculateSetupTradeScore(isBuy);
    if(!SetupScoreAllowsTradeEntry(score))
       return;
 
@@ -10730,9 +10850,56 @@ bool TryDetectH4WickLiquidityBreach(const double barHigh, const double barLow,
 #endif // H4_LQ_VOLUME_BREACH_ENABLED
 
 //+------------------------------------------------------------------+
-void V3LogSetupScoreForOptimization(const double score)
+bool V3ResolveSetupExtremesForZoneScoring(const bool isBuy, double &outSetupLow, double &outSetupHigh)
 {
-   LogAllSetupScores(score);
+   const ENUM_TIMEFRAMES timeframe = InputM2NarrativeTimeframe;
+   outSetupLow  = iLow(_Symbol, timeframe, 1);
+   outSetupHigh = iHigh(_Symbol, timeframe, 1);
+   if(outSetupLow <= 0.0 || outSetupHigh <= 0.0)
+      return false;
+
+   const int countdown = MathMax(1, InputEngulfSweepCountdownBars);
+   double refLevel = 0.0;
+   double windowSlExtreme = 0.0;
+   int    c1Shift = 0;
+   int    c2Shift = 0;
+   string sweepDetail = "";
+   if(V3DetectM2SwingSweepRejectInCountdown(isBuy, countdown, refLevel, windowSlExtreme,
+                                             c1Shift, c2Shift, sweepDetail)
+      && windowSlExtreme > 0.0)
+   {
+      if(isBuy)
+         outSetupLow = windowSlExtreme;
+      else
+         outSetupHigh = windowSlExtreme;
+   }
+
+   return true;
+}
+
+//+------------------------------------------------------------------+
+double CalculateSetupTradeScore(const bool isBullishTrade)
+{
+   double setupLow  = 0.0;
+   double setupHigh = 0.0;
+   V3ResolveSetupExtremesForZoneScoring(isBullishTrade, setupLow, setupHigh);
+   return CalculateTotalTradeScore(isBullishTrade, setupLow, setupHigh);
+}
+
+//+------------------------------------------------------------------+
+double CalculateSetupTradeScoreFromStopLoss(const bool isBuy, const double stopLossPrice)
+{
+   double setupLow  = 0.0;
+   double setupHigh = 0.0;
+   V3ResolveSetupExtremesForZoneScoring(isBuy, setupLow, setupHigh);
+   if(stopLossPrice > 0.0)
+   {
+      if(isBuy)
+         setupLow = stopLossPrice;
+      else
+         setupHigh = stopLossPrice;
+   }
+   return CalculateTotalTradeScore(isBuy, setupLow, setupHigh);
 }
 
 //+------------------------------------------------------------------+
@@ -10743,18 +10910,18 @@ void ProcessHuntEngulfingOnM2BarClose()
 
    const double barClose = iClose(_Symbol, InputM2NarrativeTimeframe, 1);
 
-   const double bullScore = CalculateTotalTradeScore(true);
-   if(bullScore > 0.0 && V3M2SwingSweepSetupPatternValid(true, barClose))
-      V3LogSetupScoreForOptimization(bullScore);
+   const double bullScore = CalculateSetupTradeScore(true);
+   if(bullScore > 0.0)
+      LogAllSetupScores(bullScore);
    if(SetupScoreAllowsTradeEntry(bullScore))
       V3TryScanM2SwingSweepSetup(true, barClose, bullScore);
    else if(H4LqLoggingEnabled())
       V2LogHuntEvent(-1, "SWEEP_SKIP",
                      StringFormat("bull setupScore=%.2f < min %.2f", bullScore, InputMinScore));
 
-   const double bearScore = CalculateTotalTradeScore(false);
-   if(bearScore > 0.0 && V3M2SwingSweepSetupPatternValid(false, barClose))
-      V3LogSetupScoreForOptimization(bearScore);
+   const double bearScore = CalculateSetupTradeScore(false);
+   if(bearScore > 0.0)
+      LogAllSetupScores(bearScore);
    if(SetupScoreAllowsTradeEntry(bearScore))
       V3TryScanM2SwingSweepSetup(false, barClose, bearScore);
    else if(H4LqLoggingEnabled())

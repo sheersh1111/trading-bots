@@ -65,8 +65,25 @@ double SMCAlignmentContribution(const int bosDirection, const int bosWeight,
 }
 
 //+------------------------------------------------------------------+
-double CalculateTotalTradeScore(const bool isBullishTrade)
+bool SMCSetupProbeInsideZone(const double probePrice, const double top, const double bottom)
 {
+   if(probePrice <= 0.0 || top <= bottom)
+      return false;
+
+   const double pointSize = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   const double eps       = (pointSize > 0.0 ? pointSize : 0.00001);
+   return (probePrice >= bottom - eps && probePrice <= top + eps);
+}
+
+//+------------------------------------------------------------------+
+// Bull: setupLow must be inside zone. Bear: setupHigh must be inside zone.
+double CalculateTotalTradeScore(const bool isBullishTrade,
+                                 const double setupLow,
+                                 const double setupHigh)
+{
+   const double probePrice = (isBullishTrade ? setupLow : setupHigh);
+   const bool hasValidProbe = (probePrice > 0.0);
+
    double locationScore = 0.0;
 
    for(int i = 0; i < SMC_ZONE_LEDGER_CAPACITY; i++)
@@ -79,11 +96,14 @@ double CalculateTotalTradeScore(const bool isBullishTrade)
          continue;
       if(SMCZoneTypeIsBullish(g_activeZones[i].type) != isBullishTrade)
          continue;
+      if(!hasValidProbe)
+         continue;
+      if(!SMCSetupProbeInsideZone(probePrice,
+                                 g_activeZones[i].topPrice,
+                                 g_activeZones[i].bottomPrice))
+         continue;
 
       const double weight = (double)GetOptimizedZoneWeight(g_activeZones[i].type);
-      // Cluster multiplier unused — isClustered is never set true in zone registration.
-      // if(g_activeZones[i].isClustered)
-      //    weight *= InputClusterMultiplier;
       locationScore += weight;
    }
 
@@ -96,6 +116,12 @@ double CalculateTotalTradeScore(const bool isBullishTrade)
       if(g_mtfFvgInstances[f].isExpired)
          continue;
       if(SMCZoneTypeIsBullish(g_mtfFvgInstances[f].type) != isBullishTrade)
+         continue;
+      if(!hasValidProbe)
+         continue;
+      if(!SMCSetupProbeInsideZone(probePrice,
+                                 g_mtfFvgInstances[f].topPrice,
+                                 g_mtfFvgInstances[f].bottomPrice))
          continue;
 
       locationScore += (double)GetOptimizedZoneWeight(g_mtfFvgInstances[f].type);
