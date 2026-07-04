@@ -1,6 +1,13 @@
 //+------------------------------------------------------------------+
 //| h4_lq_v3.mq5                                                      |
 //| H4 breach hunt + M2 Engulfing Volume Absorption entry model       |
+//| v3.88: setup score calculated only after sweep pattern confirmed |
+//| v3.87: single CalculateSetupTradeScore per M2 bar (removed FromStopLoss duplicate) |
+//| v3.86: zone score — each weight input counts at most once (ConfluenceScoring v1.2) |
+//| v3.85: fix GetMaxPossibleScore HighLow stack (ConfluenceScoring v1.1) — superseded |
+//| v3.84: remove dead v2 FVG/touch-vol/hunt-session code (engulf-only live path) |
+//| v3.83: entry order type input (limit/market/stop) + pending order expiry timer |
+//| v3.82: score CSV write mode skips swing TP calc + order placement (score log only) |
 //| v3.81: score log — running int P100 only (no g_allScores array); flush on deinit |
 //| v3.80: solo TP fallback respects 10% proximity vs cluster TPs + other chosen levels |
 //| v3.79: swing TP fallback — individual swing levels when cluster TPs < 3 (same R:R + front-run) |
@@ -81,7 +88,7 @@
 //| v3.01: exhaustion leg filter — min leg range % of M2 chart height (replaces min bar count) |
 //| v3.00: replace M2 touch/FVG with engulfing vol absorption + exhaustion gate |
 //+------------------------------------------------------------------+
-#define H4_LQ_V3_VERSION "3.81"
+#define H4_LQ_V3_VERSION "3.88"
 // Breach record array + hunt arming: uncomment next line to re-enable.
 // #define H4_LQ_VOLUME_BREACH_ENABLED
 #property copyright ""
@@ -120,13 +127,22 @@ input bool   InputEnableH4BosTradeDirectionBias = true;  // block trades against
 const double H4_BREACH_ANCHOR_MULTIPLIER = 0.2; // wick+body vs prior 5-bar avg â€” breaches / hunt / liquidity pivots
 const double M2_SWING_ANCHOR_MULTIPLIER  = 1.0; // M2 body vs prior 5-bar avg (plot_swing_h1_m5_copy)
 const double M2_TOUCH_VOLUME_MIN_EXPAND_RATIO = 3.0; // touch window: max & touch bar vs window min tick vol
-const int    M2_TOUCH_VOLUME_MIN_INCREASE_EVENTS = 2; // bar-over-bar vol increases required when window >= 4 bars
 const double H4_BOS_ANCHOR_MULTIPLIER    = 1.0; // full bar range vs prior 5-bar avg â€” BOS only (plot_swing_h4)
 const double H4_BREACH_BUFFER_PERCENT_NEAR = 0.0;  // below high / above low
 const double H4_BREACH_BUFFER_PERCENT_FAR  = 10.0; // above high / below low
 
+enum ENUM_TRADE_ENTRY_ORDER_TYPE
+{
+   TRADE_ENTRY_ORDER_LIMIT  = 0,  // BuyLimit / SellLimit @ reference entry
+   TRADE_ENTRY_ORDER_MARKET = 1,  // Buy / Sell at market
+   TRADE_ENTRY_ORDER_STOP   = 2   // BuyStop / SellStop (reference + offset points)
+};
+
 input group "Engulfing absorption trade"
 input bool   InputEnableAutomatedTrading = true;   // false = log trade plan only (no orders)
+input ENUM_TRADE_ENTRY_ORDER_TYPE InputTradeEntryOrderType = TRADE_ENTRY_ORDER_LIMIT;
+input int    InputPendingStopEntryOffsetPoints = 2;    // stop entry: buy above / sell below reference (1..2 pts)
+input int    InputPendingOrderExpirySeconds    = 60;   // limit/stop: cancel pendings after T sec if unfilled; 0=off
 input bool   InputDrawTradeSwingGroupTpZones   = true; // chart only: swing high/low group rects + TP lines on order
 input int    InputTradeSwingLookbackM2Bars     = 292;  // M2 bars scanned for swing highs (bull) / lows (bear)
 input double InputTradeSwingProximityPercentOfChartRange = 10.0; // cluster + buffer band = N% of M2 chart height
@@ -179,7 +195,7 @@ input double InputMinScore                     = 0.0;  // min signed setupScore 
 input double InputBaseRiskPercent            = 1.0;  // equity % at ScoreP100 (tester) or theoretical max; scaled by |score|/denom
 
 input group "Optimization score logging"
-input bool   InputScoreLogWriteCsv             = false; // true=write ScoreP100 CSV on deinit; false=read CSV for tester risk sizing
+input bool   InputScoreLogWriteCsv             = false; // true=score P100 CSV only (no TP calc/orders); false=read CSV for risk sizing
 
 input group "Timeframe Alignment Weights"
 input int    InputWeight_W1_BOS                = 16;
@@ -189,16 +205,6 @@ input int    InputWeight_M15_BOS               = 2;
 
 #define InputTouchVolSlBufferPercentChart    InputEngulfSlBufferPercentChart
 #define InputTouchVolMinSlPoints             InputEngulfMinSlPoints
-#define InputTouchVolEntryOffsetPercentChart 0.0
-#define InputTouchVolRequireAscendingVolume  false
-#define InputEnableOppositeFvgHuntAfterH4Breach InputEnableEngulfHuntAfterH4Breach
-#define InputFairValueGapMinimumPercentOfChartRange 1.0
-#define InputDrawBosOppositeFairValueGapZones     false
-#define InputMaximumFairValueGapRectangles        0
-#define InputHuntTouchRecalcPercentBeforeSameDirExtreme 0.0
-#define InputDrawHuntTouchRecalcBufferZone        false
-#define InputFvgTradeMinTickVolumePercentOfM2Avg  0.0
-#define InputFvgTradeTickVolumeAvgM2BarCount      30
 
 input group "BOS SL/TP management"
 input bool   InputEnableBosMoveSlAndTp = false; // disable trailing/moving SL & TP on BOS for now
@@ -217,11 +223,15 @@ bool H4LqChartDrawEnabled(const bool featureFlag = true)
    return (!InputFastTesterMode && featureFlag);
 }
 
+//+------------------------------------------------------------------+
+bool ScoreLogWriteModeSkipsTrading()
+{
+   return InputScoreLogWriteCsv;
+}
+
 // --- trade sizing (3 swing-TP orders + 1 fixed 2R order; USD risk from score normalization) ---
 const ulong    LQ_EXPERT_MAGIC                    = 940029;
 const double   LQ_STOP_BUFFER_PERCENT_CHART       = 1.0;
-const long     LQ_TOUCH_VOL_MASSIVE_LEAP_MIN          = 45;
-const int      LQ_TOUCH_VOL_SL_OLDER_BAR_LOOKBACK     = 2;
 const int      LQ_FVG_TRADE_MAX_M2_BAR_SHIFT      = 24;
 const int      LQ_TP_COUNT                        = 3;
 
@@ -390,16 +400,6 @@ const string LQ_OBJ_TRADE_SWGRP_RECT_PREFIX = "LQ2_TRD_SWG_R_";
 const string LQ_OBJ_TRADE_SWGRP_LINE_PREFIX = "LQ2_TRD_SWG_L_";
 
 #define V2_MAX_HUNT_SESSIONS              2   // at most one high-breach + one low-breach hunt
-#define V2_HUNT_FVG_MEM_CAPACITY          16
-
-struct V2HuntFvgMemory
-{
-   bool     isBullishFairValueGap;
-   double   fairValueGapZoneLowPrice;
-   double   fairValueGapZoneHighPrice;
-   datetime fairValueGapBarOpenTime;
-};
-
 struct V2HuntSession
 {
    bool     active;
@@ -420,8 +420,6 @@ struct V2HuntSession
    double   preEntryCancelTpLevel;
    bool     firstOppBosMgmtDone;
 };
-
-#define BosOppositeFairValueGapMemoryCapacity 32
 
 #define H4_LIQUIDITY_PIVOT_CAPACITY 600
 #define H4_REPLAY_LEG_CAPACITY      512
@@ -509,6 +507,9 @@ double   g_huntPreEntryCancelTpLevel      = 0.0;
 string   g_huntTradeSessionCommentPrefix = "";
 bool     g_huntFirstOppBosMgmtDone       = false;
 datetime g_lastHuntPosMgmtM2BarTime      = 0;
+datetime g_pendingEntryOrderExpiryDeadline = 0;
+datetime g_pendingEntryOrderExpirySessionId  = 0;
+bool     g_pendingEntryOrderExpiryTimerOn    = false;
 
 void   PushLiquidityPoolFromClosedSwing(const double poolLowPrice, const double poolHighPrice,
                                         const bool isSupplyPool);
@@ -589,7 +590,6 @@ void   SMCExpireZonesPastBarLimit();
 double CalculateTotalTradeScore(const bool isBullishTrade, const double setupLow, const double setupHigh);
 bool   V3ResolveSetupExtremesForZoneScoring(const bool isBuy, double &outSetupLow, double &outSetupHigh);
 double CalculateSetupTradeScore(const bool isBullishTrade);
-double CalculateSetupTradeScoreFromStopLoss(const bool isBuy, const double stopLossPrice);
 double GetRiskNormalizationScore();
 bool   SetupScoreAllowsTradeEntry(const double setupScore);
 double GetOptimizedLotSize(const double entryPrice, const double stopLoss, const double score,
@@ -620,456 +620,6 @@ bool   WasH4VolumeBreachLevelViolatedSinceFormation(const int swingDirection,
 
 void   RefreshLiquidityHuntHud();
 double ReferenceChartHeightForFairValueGapFilterM2();
-bool   FairValueGapGapMeetsMinimumPercentOfRangeM2(const double zoneLowPrice, const double zoneHighPrice,
-                                                   double &outGapSize, double &outChartHeight,
-                                                   double &outMinGapRequired);
-bool   TryDetectFairValueGapPatternOnLastClosedBarM2(bool &isBullishFairValueGap,
-                                                      double &fairValueGapZoneLowPrice,
-                                                      double &fairValueGapZoneHighPrice);
-bool   DetectFairValueGapOnLastClosedBarM2(bool &isBullishFairValueGap, double &fairValueGapZoneLowPrice,
-                                         double &fairValueGapZoneHighPrice);
-bool   MtfIsSwingTimeframe(const ENUM_TIMEFRAMES timeframe);
-bool   MtfCopySwingState(const ENUM_TIMEFRAMES timeframe, SwingState &outSwingState);
-bool   MtfTryNthCompletedSwingLeg(const ENUM_TIMEFRAMES timeframe, const int swingDirection,
-                                   const int nFromLatest,
-                                   double &outLegHigh, double &outLegLow,
-                                   datetime &outLegStartTime, datetime &outLegEndTime);
-bool   MtfTryLatestCompletedUpLegHigh(const ENUM_TIMEFRAMES timeframe, double &outHigh,
-                                       datetime &outLegEndTime);
-bool   MtfTryLatestCompletedDownLegLow(const ENUM_TIMEFRAMES timeframe, double &outLow,
-                                        datetime &outLegEndTime);
-bool   MtfTryLatestUnbrokenSwingHigh(const ENUM_TIMEFRAMES timeframe, double &outLevel);
-bool   MtfTryLatestUnbrokenSwingLow(const ENUM_TIMEFRAMES timeframe, double &outLevel);
-bool   MtfTryDetectBosCrossOnBar(const ENUM_TIMEFRAMES timeframe, const int barShift,
-                                  int &outDirection, double &outBrokenLevel,
-                                  datetime &outBarOpenTime, datetime &outLegEndTime);
-bool   TryGetH4LegBarOpenTimeFromEnd(const datetime legStartTime, const datetime legEndTime,
-                                      const int nFromEnd, datetime &outBarOpenTime);
-bool   FindMaxVolumeH4BarBetweenOpenTimes(const datetime rangeStartOpen, const datetime rangeEndOpen,
-                                             datetime &outBarOpenTime, long &outMaxVolume);
-double H4BreachLevelPriceFromVolumeBar(const int swingDirection, const int h4BarShift);
-bool   H4BarHasDecentMovementForLegDirection(const int barShift, const int legSwingDirection);
-bool   H4TryGetLegLastDecentMovementBarOpen(const datetime legStartTime, const datetime legProgressEnd,
-                                              const int swingDirection, datetime &outBarOpenTime);
-datetime H4ProgressEndOpenForDecentLookup(const datetime legProgressEndOpen);
-bool   H4TryGetVolumeBreachWindowBoundFromLastDecent(const datetime legStartTime,
-                                                      const datetime legProgressEnd,
-                                                      const int swingDirection,
-                                                      datetime &outBoundInclusiveOpen);
-bool   H4TryGetLegVolumeBreachWindowStartForScan(const datetime legStartTime,
-                                                  const datetime legProgressEnd,
-                                                  const int swingDirection,
-                                                  datetime &outWindowStartInclusiveOpen);
-bool   H4TryGetLegVolumeBreachWindowEndForScan(const datetime legStartTime,
-                                                const datetime legProgressEnd,
-                                                const int swingDirection,
-                                                datetime &outWindowEndInclusiveOpen);
-bool   H4VolumeBreachWindowShiftRangeValid(const datetime windowStartInclusive,
-                                            const datetime windowEndInclusive);
-bool   H4TryResolveLegVolumeBreachWindowEnd(const datetime legStartTime,
-                                             const datetime legProgressEnd,
-                                             const int swingDirection,
-                                             const datetime windowStartInclusive,
-                                             const int lastClosedBarShift,
-                                             datetime &outWindowEndInclusiveOpen);
-void   H4ScanVolumeWindowMonotonic(const int swingDirection, const datetime windowStartInclusive,
-                                    const datetime windowEndInclusive, long &inOutMaxVolume,
-                                    datetime &inOutMaxBarOpenTime, double &inOutBreachLevel);
-bool   ComputeH4LegVolumeBreachLevel(const Swing &lastLeg, const Swing &prevLeg, const bool hasPrevLeg,
-                                       double &outBreachLevel, datetime &outVolumeBarOpenTime);
-#ifdef H4_LQ_VOLUME_BREACH_ENABLED
-void   H4ResetActiveLegVolumeBreachTrack();
-bool   TryGetH4VolumeBreachWindowStartFromLastCompletedLeg(const SwingState &swingState,
-                                                              datetime &outWindowStartOpen);
-void   H4OnH4ActiveLegStarted(SwingState &swingState, const int lastClosedBarShift = 1);
-void   H4OnH4ActiveLegBarClosed(SwingState &swingState, const int lastClosedBarShift = 1);
-void   H4FinalizeActiveLegVolumeBreach(const Swing &closedLeg);
-void   H4PurgeStaleActiveLegVolumeBreachRecords(const datetime keepLegStartTime);
-void   H4RestoreActiveLegVolumeBreachTrackFromSwing();
-void   RememberH4LegVolumeBreachRecord(const datetime legStartTime, const datetime legEndTime,
-                                        const int swingDirection, const double breachLevel,
-                                        const datetime volumeBarOpenTime);
-bool   TryGetH4LegVolumeBreachLevel(const datetime legEndTime, const int swingDirection,
-                                     double &outBreachLevel, datetime &outVolumeBarOpenTime);
-bool   TryResolveH4LegVolumeBreachLevel(const datetime legStartTime, const datetime legEndTime,
-                                          const int swingDirection, double &outBreachLevel,
-                                          datetime &outVolumeBarOpenTime);
-bool   IsH4BarWithinBreachBufferChartWindow(const datetime barOpenTime);
-bool   IsH4LegVolumeBreachActiveInBufferWindow(const datetime legEndTime, const int swingDirection);
-void   RebuildH4LegVolumeBreachLevelsFromSwingHistory();
-void   H4ClearVolumeBreachMemoryAndChart();
-void   DeleteH4VolumeBreachLevelRay(const datetime legStartTime);
-void   DrawH4VolumeBreachLevelRay(const datetime legStartTime, const datetime legEndTime,
-                                   const int swingDirection, const datetime volumeBarOpenTime,
-                                   const double breachLevel);
-void   RebuildAllH4VolumeBreachMarkers();
-#endif // H4_LQ_VOLUME_BREACH_ENABLED
-void   RebuildH4LiquidityPivotLevels();
-double ReferenceChartHeightForTimeframeBarCount(const ENUM_TIMEFRAMES timeframe, const int barCount);
-double ReferenceChartHeightForM2BarCountFromShift(const int newestBarShift, const int barCount);
-double ReferenceChartHeightForH4BarCount(const int barCount);
-double ReferenceChartHeightForH4BreachBuffer();
-void   H4BreachBufferBandForUpLegHigh(const double legHigh, double &outBandLow, double &outBandHigh);
-void   H4BreachBufferBandForDownLegLow(const double legLow, double &outBandLow, double &outBandHigh);
-bool   H4BreachImpulseCancelZonePrices(const bool expectBullishFvgHunt, const double breachLevel,
-                                        double &outZoneLow, double &outZoneHigh,
-                                        double &outCancelLimitPrice);
-#ifdef H4_LQ_VOLUME_BREACH_ENABLED
-bool   M2WickCrossesIntoH4UpBreachBuffer(const double bandLow, const double bandHigh,
-                                           const double barHigh, const double prevHigh,
-                                           const double pointSize);
-bool   M2WickCrossesIntoH4DownBreachBuffer(const double bandLow, const double bandHigh,
-                                              const double barLow, const double prevLow,
-                                              const double pointSize);
-#endif // H4_LQ_VOLUME_BREACH_ENABLED
-int    GetH4TradeDirectionBias(); // 1 bull, -1 bear, 0 undefined/mixed/disabled-filter
-void   LogH4TradeDirectionBiasIfChanged();
-bool   FvgTradeAllowedByH4BosBias(const bool isBullishFairValueGap, string &outBlockReason);
-void   DeleteMtfDirectionHudObjects();
-void   RefreshMtfDirectionHud();
-#ifdef H4_LQ_VOLUME_BREACH_ENABLED
-bool   M2WickCrossesAboveLevel(const double level, const double barHigh, const double prevHigh,
-                               const double pointSize);
-bool   M2WickCrossesBelowLevel(const double level, const double barLow, const double prevLow,
-                               const double pointSize);
-bool   TryAcceptH4BreachForHunt(const bool h4HighBreached, const double breachLevel,
-                                const datetime legEnd, double &outLevel, bool &outHighBreached,
-                                datetime &outLegEndTime);
-#endif // H4_LQ_VOLUME_BREACH_ENABLED
-bool   TryDetectM2BreakOfStructureOnLastClosedBar(bool &outExpectsBullishFairValueGap, double &outBosLegLevelPrice);
-void   V2InitHuntSlot(const int huntIndex);
-void   V2InitAllHuntSlots();
-int    V2CountActiveHunts();
-int    V2AllocHuntSlot();
-int    V2FindActiveHuntByH4Leg(const datetime legEndTime, const bool h4HighBreached);
-int    V2FindActiveHuntByBreachPolarity(const bool h4HighBreached);
-void   V2AbortHuntSessionForRestart(const int huntIndex);
-int    V2FindHuntSlotBySessionId(const datetime sessionId);
-string V2HuntObjectSuffix(const datetime sessionId);
-string V2HuntTradeCommentPrefix(const datetime sessionId);
-void   V2LogHuntEvent(const int huntIndex, const string eventName, const string detail = "");
-bool   V2PushHuntFvgMemory(const int huntIndex, const bool isBullishFairValueGap,
-                           const double zoneLowPrice, const double zoneHighPrice,
-                           const datetime fairValueGapBarOpenTime);
-void   V2DrawHuntFairValueGapZone(const int huntIndex, const bool isBullishFairValueGap,
-                                  const double zoneLowPrice, const double zoneHighPrice,
-                                  const datetime leftBarTime, const datetime rightBarTime);
-void   ProcessHuntEngulfingOnM2BarClose();
-void   V3ProcessM2SwingSweepSetupsOnBarClose();
-void   V3RunM2SwingSweepScansOnBarClose(const double barClose);
-bool   V3M2SwingSweepSetupPatternValid(const bool isBuy, const double barClose);
-bool   V3M2SwingSweepSetupPatternValidCore(const bool isBuy, const double barClose,
-                                             double &outStopLoss, datetime &outSignalBarOpen,
-                                             double &outRefLevel, int &outCountdown,
-                                             string &outExhaustDetail);
-void   V3TryScanM2SwingSweepSetup(const bool isBuy, const double barClose, const double setupScore);
-void   V2ProcessOneActiveHuntOnM2Bar(const int huntIndex, const double pointSize,
-                                     const double barClose, const double barHigh, const double barLow,
-                                     const double prevHigh, const double prevLow);
-int    V2OppositeM2LegDirectionForHunt(const int huntIndex);
-bool   V2HuntExpectsBullishFvg(const int huntIndex);
-bool   V2FvgPolarityMatchesHunt(const int huntIndex, const bool isBullishFairValueGap);
-void   V2ResetHuntSlotSessionCounters(const int huntIndex);
-double V2TouchLevelFromLegExtreme(const int oppositeM2LegDirection, const double legLowPrice,
-                                   const double legHighPrice);
-bool   V2TryGetLastCompletedM2Leg(const int legDirection, double &outLegLow, double &outLegHigh,
-                                   datetime &outLegStartTime, datetime &outLegEndTime);
-bool   M2FindImpulseBaseBar(const datetime legStartTime, const datetime legEndTime, const int legDirection,
-                             int &outBarShift);
-bool   V2TryGetOppositeM2LegExtentsForTouch(const int huntIndex, double &outLegLow, double &outLegHigh,
-                                               datetime &outLegStartTime, datetime &outLegEndTime);
-bool   V2TryGetOppositeM2LegExtentsForTouchRecalc(const int huntIndex, double &outLegLow, double &outLegHigh,
-                                                     datetime &outLegStartTime, datetime &outLegEndTime);
-bool   V2GetSameDirExtremeWhileHuntOn(const int huntIndex, double &outExtreme);
-void   V2ApplyTouchLevelFromM2Leg(const int huntIndex, const double legLow, const double legHigh,
-                                   const string logContext, const bool allowRecalc);
-void   V2ApplyTouchLevelFromOppositeLegWindow(const int huntIndex, const datetime legStartTime,
-                                               const datetime legEndTime, const double legLow,
-                                               const double legHigh, const string logContext,
-                                               const bool allowRecalc);
-void   V2TryLockTouchLevelFromM2Leg(const int huntIndex, const double legLow, const double legHigh,
-                                     const string logContext);
-void   V2TryRecalcTouchOnHuntSameDirProgress(const int huntIndex, const double barHigh,
-                                              const double barLow, const double barClose,
-                                              const bool forceBufferRecalc = false,
-                                              const string forcedTriggerTag = "",
-                                              const double huntExtremeAtBarStart = 0.0);
-bool   V2DetectTouchRecalcBufferHit(const int huntIndex, const double barHigh, const double barLow,
-                                     const double barClose, bool &outNearHuntExtreme,
-                                     bool &outNearOppositeBuffer,
-                                     const double huntExtremeAtBarStart = 0.0);
-bool   V2TouchSideBlocksBufferRecalc(const int huntIndex, const double barHigh, const double barLow,
-                                       const double pointSize);
-void   V2TryTouchRecalcAfterBufferEvent(const int huntIndex, const double barHigh,
-                                         const double barLow, const double barClose,
-                                         const string bufferTriggerTag);
-void   V2UpdateTouchLevelFromM2Swing(const int huntIndex);
-void   V2DrawTouchPointLine(const int huntIndex);
-void   V2ClearTouchPointLine(const int huntIndex);
-void   V2RemoveHuntSessionFvgPlots(const int huntIndex);
-void   V2TryClearHuntFvgsOnSameDirectionBosWhileHuntOn(const int huntIndex);
-bool   V2TryDetectOppositeDirBosForHunt(const int huntIndex, string &outBosDetail);
-bool   V2TryDetectTouchOfStoredLevel(const int huntIndex, const double barHigh, const double barLow,
-                                      const double pointSize);
-bool   V2ValidateTouchHitOppositeM2LegVolume(const int huntIndex, const int lastClosedBarShift,
-                                              long &outVolumes[], int &outVolumeCount,
-                                              datetime &outWindowStartOpen, datetime &outWindowEndOpen);
-void   V2InvalidateTouchHitVolumeFailed(const int huntIndex, const double barClose,
-                                         const long &volumes[], const int volumeCount,
-                                         const datetime windowStartOpen, const datetime windowEndOpen);
-void   V2HandleTouchHitConfirmed(const int huntIndex, const double barHigh, const double barLow,
-                                  const double barClose, const long &volumes[], const int volumeCount,
-                                  const datetime windowStartOpen, const datetime windowEndOpen);
-void   V2StorePendingTradeFvg(const int huntIndex, const bool isBullishFairValueGap,
-                              const double zoneLowPrice, const double zoneHighPrice,
-                              const datetime formationTime);
-int    V2SelectTradeFvgMemIndexForHunt(const int huntIndex);
-bool   V2TryGetEarliestHuntFvgFormationBarOpenTime(const int huntIndex, datetime &outFormationBarOpen);
-bool   V2TryGetEarliestHuntFvgFirstPatternBarOpen(const int huntIndex, datetime &outFirstBarOpen,
-                                                   datetime &outFormationBarOpen);
-bool   V2ResolveTradeFvgForHunt(const int huntIndex, bool &outIsBullishFvg, double &outZoneLow,
-                                double &outZoneHigh, datetime &outFormationTime);
-void   V2TryPlacePendingFvgTradesAfterHuntOff(const int huntIndex);
-void   V2TryPlaceFvgAndEndHuntAfterRecalcSkip(const int huntIndex, const bool isBullishFairValueGap,
-                                                const double zoneLowPrice, const double zoneHighPrice,
-                                                const datetime formationTime);
-void   OnM2SwingLegDirectionChange(const int closingLegDirection, const int nextLegDirection);
-void   V2OnM2LegChangeForHunt(const int huntIndex, const int closingLegDirection,
-                              const int nextLegDirection);
-void   V2ClearImpulseBufferZone(const int huntIndex);
-void   V2UpdateImpulseBufferZone(const int huntIndex);
-void   V2UpdateAllImpulseBufferZones();
-void   V2ClearTouchRecalcBufferZone(const int huntIndex);
-bool   V2TryGetTouchRecalcBufferAnchorExtreme(const int huntIndex, double &outAnchor);
-void   V2InitTouchRecalcBufferAnchor(const int huntIndex);
-void   V2BeginTouchRecalcBufferActiveLegTrack(const int huntIndex);
-void   V2SyncTouchRecalcBufferAnchorFromActiveLeg(const int huntIndex);
-void   V2StopTouchRecalcBufferActiveLegTrack(const int huntIndex);
-double V2TouchRecalcBufferBandHalfWidth();
-bool   V2DetectTouchRecalcBufferCrossOrTouch(const int huntIndex, const double barHigh,
-                                               const double barLow, const double barClose);
-void   V2TryArmTouchRecalcBufferResumeOnCross(const int huntIndex, const double barHigh,
-                                                 const double barLow, const double barClose);
-void   V2OnTouchRecalcBufferLegChange(const int huntIndex, const int closingLegDirection,
-                                       const int nextLegDirection);
-void   V2UpdateTouchRecalcBufferZone(const int huntIndex);
-void   V2UpdateAllTouchRecalcBufferZones();
-#ifdef H4_LQ_VOLUME_BREACH_ENABLED
-bool   TryDetectH4WickLiquidityBreachForLeg(const int swingDirection, const double breachLevel,
-                                              const datetime huntLegKey, const double barHigh,
-                                              const double barLow, const double prevHigh,
-                                              const double prevLow, const double pointSize,
-                                              double &outLevel, bool &outHighBreached,
-                                              datetime &outLegEndTime);
-bool   TryDetectH4WickLiquidityBreach(const double barHigh, const double barLow,
-                                       const double prevHigh, const double prevLow,
-                                       const double pointSize, double &outLevel,
-                                       bool &outHighBreached, datetime &outLegEndTime);
-int    V2ArmOppositeFvgHuntAfterH4Breach(const double h4Level, const bool h4HighBreached,
-                                            const datetime breachedLegEndTime,
-                                            const double barClose, const double barLow,
-                                            const double barHigh);
-#endif // H4_LQ_VOLUME_BREACH_ENABLED
-void   V2EndOppositeFvgHuntSession(const int huntIndex, const string offReason,
-                                    const bool tryPlaceTradeAfterOff = false);
-void   V2OnH4LegClosedForHunts(const int closedLegDirection, const datetime closedLegEndTime);
-int    V2OppositeH4LegDirectionForHunt(const int huntIndex);
-
-void   ApplyTradeFillingModeFromSymbol();
-double M2TouchVolSlBufferPrice(const int barShift);
-double M2TouchVolEntryOffsetPrice(const int barShift);
-double M2TouchVolLimitEntryPrice(const bool isBuy, const int barShift,
-                                  const double barLow, const double barHigh);
-int    TouchVolEffectiveMinSlPoints();
-bool   ApplyTouchVolMinimumSlDistance(const bool isBuy, const double entryPrice,
-                                       double &inOutStopLossPrice);
-bool   M2TouchVolSlReferenceExtreme(const bool isBuy, const int entryBarShift,
-                                     const datetime windowStartInclusive,
-                                     const double legExtremeFloor,
-                                     double &outRefExtreme, int &outRefBarShift);
-double LossPerLotFromTickSpec(const double entryPrice, const double stopLossPrice);
-double CalculateVolumeForFixedUsdRisk(const bool isBuy, const double entryPrice,
-                                        const double stopLossPrice, const double riskAccountCurrency);
-bool   StopsDistanceAllowed(const bool isBuy, const double entryPrice, const double stopLossPrice,
-                            const double takeProfitPrice);
-bool   HasOurTradeForFormation(const datetime formationTime);
-string HuntTradeOrderCommentPrefix(const datetime huntSessionId = 0);
-bool   OrderCommentBelongsToActiveHunt(const string orderComment);
-bool   V2IsHuntSessionStillActive(const datetime huntSessionId);
-bool   HasOurHuntOpenPosition();
-bool   HasOurHuntPendingOrders();
-void   ResetHuntTradeState();
-void   ResetHuntTradePlacementGateOnly();
-bool   HasOurHuntTradePendingOrders();
-void   CancelOurHuntPendingOrders(const datetime huntSessionId = 0);
-bool   IsConsecutiveM2FvgBarAfter(const datetime priorFvgFormationTime, const datetime newFvgFormationTime);
-bool   ResolveHuntFvgOrderPlacementGate(const datetime formationTime, const datetime huntSessionId,
-                                        bool &outReplacePendingOnly);
-void   RegisterHuntTradeAfterSuccessfulPlace(const bool isBuy, const double entryPrice,
-                                               const double takeProfitTp1Price,
-                                               const double preEntryCancelTpLevel,
-                                               const datetime fvgFormationTime,
-                                               const datetime huntSessionId);
-void   CheckHuntFvgBeyondChartRangeCancelOnTick();
-bool   IsOurHuntPendingOrderTicket(const ulong orderTicket);
-bool   TryParseFormationTimeFromHuntOrderComment(const string orderComment, datetime &outFormationTime);
-bool   FvgFormationBarBeyondChartRange(const datetime formationTime, int &outBarShift);
-void   V2ClearHuntTradeOrdersActiveForSession(const datetime huntSessionId);
-void   V2ClearHuntPreEntryWatchForHunt(const int huntIndex);
-bool   ParseHuntSessionIdFromTradeComment(const string orderComment, datetime &outSessionId);
-bool   V2CollectUniquePendingHuntSessionIds(datetime &outSessionIds[], const int maxSessions);
-bool   V2TrySyncPreEntryWatchForSession(const datetime sessionId, const int huntIndex,
-                                       int &outPendingCount, bool &outIsBuy,
-                                       double &outTp3Level, double &outEntryPrice);
-bool   V2TrySyncPreEntryWatchForHunt(const int huntIndex, int &outPendingCount);
-void   V2RefreshGlobalHuntTradeWatchFromSessions();
-bool   ComputeAbsorptionLegTakeProfits(const bool isBullishFairValueGap, const double entryPrice,
-                                       const double legRange, double &outTakeProfitPrices[]);
-int    V4TradeLegDirectionForFvg(const bool isBullishFairValueGap);
-bool   V4ResolveH4SameDirLegRangeForTp(const bool isBullishFairValueGap, double &outLegRange,
-                                        datetime &outLegEndTime);
-bool   M2FindMaxVolumeBarOpenTimeExcludingOldest(const long &volumes[], const int count,
-                                                  const datetime windowStartOpen,
-                                                  const datetime windowEndOpen,
-                                                  datetime &outBarOpenTime, long &outMaxVolume);
-bool   ResolveTouchLegVolumeBarEntryAndSl(const bool isBuy, const int barShift,
-                                           const datetime slWindowStartOpen, const int huntIndex,
-                                           bool &outUseMarketOrder, double &outEntryPrice,
-                                           double &outStopLossPrice, string &outFailReason);
-bool   TryPlaceTouchVolumeBarTradeSetup(const int huntIndex, const bool isBuy,
-                                         const datetime maxVolBarOpenTime, const long maxVolume,
-                                         const datetime slWindowStartOpen,
-                                         const datetime huntSessionId);
-bool   TryPlaceOppositeFvgTradeSetup(const bool isBullishFairValueGap, const double zoneLowPrice,
-                                       const double zoneHighPrice, const datetime formationTime,
-                                       const datetime huntSessionId, const double h4LegRange);
-bool   IsFvgAutomatedTradingAllowed(string &outBlockReason);
-bool   FvgFormationBarMeetsMinTickVolume(const int formationBarShift);
-bool   TryNthM2CompletedSwingLeg(const int swingDirection, const int nFromLatest,
-                                 double &outLegHigh, double &outLegLow, datetime &outLegEndTime);
-bool   TryDetectM2PriceBreakAboveLatestUpLegHigh(double &outBrokenLevel);
-bool   TryDetectM2PriceBreakBelowLatestDownLegLow(double &outBrokenLevel);
-bool   StopLossModifyAllowed(const bool isBuy, const double newStopLoss, const double takeProfitPrice);
-bool   HuntTradeCommentIsOurs(const string orderComment);
-bool   HuntTradeCommentMatchesSession(const string orderComment);
-void   EnsureHuntTradeSessionCommentPrefixFromOrdersOrPositions();
-bool   HasOurHuntTradeOpenPosition();
-void   ManageHuntOpenPositionsOnM2BarClose();
-void   ManageHuntTradeTieredStopLoss(const bool isBuy);
-bool   HuntTradeCommentIsOvTpIndex(const string orderComment, const int tpIndex);
-
-//+------------------------------------------------------------------+
-int OnInit()
-{
-   if(InputSwitchChartToH4 && !InputFastTesterMode)
-   {
-      ChartSetSymbolPeriod(0, _Symbol, PERIOD_H4);
-      ChartRedraw(0);
-   }
-
-   DeleteMtfSwingLegChartObjects();
-   ObjectsDeleteAll(0, ChartObjectNamePrefixH4VolumeBreachRay, -1, -1);
-   ObjectsDeleteAll(0, PFX_M2_TREND, -1, -1);
-   ObjectsDeleteAll(0, PFX_M2_LBL, -1, -1);
-   ObjectsDeleteAll(0, PFX_M2_ANCHOR, -1, -1);
-   ObjectsDeleteAll(0, LQ_OBJ_PREFIX_FVG_RECT, -1, -1);
-   ObjectsDeleteAll(0, LQ_OBJ_PREFIX_FVG_LBL, -1, -1);
-   ObjectDelete(0, LQ_OBJ_HUNT_HUD);
-   ObjectsDeleteAll(0, LQ_OBJ_IMPULSE_PREFIX, -1, -1);
-   ObjectsDeleteAll(0, LQ_OBJ_TOUCH_RECALC_PREFIX, -1, -1);
-   ObjectsDeleteAll(0, LQ_OBJ_TOUCH_POINT, -1, -1);
-   ObjectsDeleteAll(0, LQ_OBJ_TRADE_SWGRP_RECT_PREFIX, -1, -1);
-   ObjectsDeleteAll(0, LQ_OBJ_TRADE_SWGRP_LINE_PREFIX, -1, -1);
-
-   ZeroMemory(g_m2Swing);
-   g_liquidityPoolCount = 0;
-
-   V2InitAllHuntSlots();
-#ifdef H4_LQ_VOLUME_BREACH_ENABLED
-   g_h4LegVolumeBreachCount          = 0;
-   H4ResetActiveLegVolumeBreachTrack();
-#endif
-   ResetProfessionalBiasOverrideState();
-   ResetHuntTradeState();
-
-   WarmupM2SwingFromHistory();
-   WarmupMTFSwingsFromHistory();
-   SMCResetActiveZones();
-   UpdateSMCZoneMatrix();
-#ifdef H4_LQ_VOLUME_BREACH_ENABLED
-   H4ClearVolumeBreachMemoryAndChart();
-   UpdateH4LegLiquidityBreachMemoryOnM2Bar();
-#endif
-   RebuildH4LiquidityPivotLevels();
-   g_h4LastLoggedEffectiveBias = GetH4TradeDirectionBias();
-   g_h4EffectiveBiasLogReady   = true;
-
-   g_lastM2BarOpen  = iTime(_Symbol, InputM2NarrativeTimeframe, 0);
-   if(InputEnableMtfSmcEngine)
-   {
-      g_lastMtfBarOpenW1  = iTime(_Symbol, PERIOD_W1,  0);
-      g_lastMtfBarOpenD1  = iTime(_Symbol, PERIOD_D1,  0);
-      g_lastMtfBarOpenH4  = iTime(_Symbol, PERIOD_H4,  0);
-      g_lastMtfBarOpenM15 = iTime(_Symbol, PERIOD_M15, 0);
-   }
-
-   g_trade.SetExpertMagicNumber(LQ_EXPERT_MAGIC);
-   ApplyTradeFillingModeFromSymbol();
-
-   if(InputEnableEngulfHuntAfterH4Breach)
-   {
-      InitScoreLogPermutationFile(InputWeight_WeeklyFVG,
-                                  InputWeight_DailyFVG,
-                                  InputWeight_H4FVG,
-                                  InputWeight_M15FVG,
-                                  InputWeight_W1_HighLowZones,
-                                  InputWeight_D1_HighLowZones,
-                                  InputWeight_H4_HighLowZones,
-                                  InputWeight_M15_HighLowZones,
-                                  InputMinScore,
-                                  InputWeight_W1_BOS,
-                                  InputWeight_D1_BOS,
-                                  InputWeight_H4_BOS,
-                                  InputWeight_M15_BOS,
-                                  InputScoreLogWriteCsv);
-
-      if(!InputScoreLogWriteCsv && MQLInfoInteger(MQL_TESTER))
-      {
-         if(InitRiskScoreP100FromPermutationSummary())
-         {
-            PrintFormat("%s v%s | score CSV read mode ScoreP100=%d",
-                        H4_LQ_LOG_PREFIX, H4_LQ_V3_VERSION, (int)MathRound(g_riskScoreP100));
-         }
-         else if(H4LqLoggingEnabled())
-         {
-            PrintFormat("%s v%s | score CSV read mode fallback theoretical max=%.2f",
-                        H4_LQ_LOG_PREFIX, H4_LQ_V3_VERSION, GetMaxPossibleScore());
-         }
-      }
-      else if(InputScoreLogWriteCsv && H4LqLoggingEnabled())
-      {
-         PrintFormat("%s v%s | score CSV write mode (flush on deinit)",
-                     H4_LQ_LOG_PREFIX, H4_LQ_V3_VERSION);
-      }
-   }
-
-   if(H4LqLoggingEnabled())
-   {
-      PrintFormat("%s v%s | H4=MTF_SMC M2=%s fastTester=%s",
-                  H4_LQ_LOG_PREFIX, H4_LQ_V3_VERSION,
-                  EnumToString(InputM2NarrativeTimeframe),
-                  InputFastTesterMode ? "Y" : "N");
-   }
-
-   if(H4LqChartDrawEnabled())
-   {
-      RefreshLiquidityHuntHud();
-      RefreshMtfDirectionHud();
-      ChartRedraw(0);
-   }
-   return(INIT_SUCCEEDED);
-}
-
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
@@ -1091,6 +641,19 @@ void OnDeinit(const int reason)
    ObjectsDeleteAll(0, LQ_OBJ_TOUCH_POINT, -1, -1);
    ObjectsDeleteAll(0, LQ_OBJ_TRADE_SWGRP_RECT_PREFIX, -1, -1);
    ObjectsDeleteAll(0, LQ_OBJ_TRADE_SWGRP_LINE_PREFIX, -1, -1);
+
+   if(g_pendingEntryOrderExpiryTimerOn)
+   {
+      EventKillTimer();
+      g_pendingEntryOrderExpiryTimerOn = false;
+   }
+   ClearPendingEntryOrderExpiry();
+}
+
+//+------------------------------------------------------------------+
+void OnTimer()
+{
+   ProcessPendingEntryOrderExpiry();
 }
 
 //+------------------------------------------------------------------+
@@ -1607,9 +1170,6 @@ void ProcessSwingStepAtShift(SwingState &swingState, const ENUM_TIMEFRAMES timef
 
       SwingExtend(swingState, lastClosedBarHigh, lastClosedBarLow);
 
-      if(timeframe == InputM2NarrativeTimeframe && !replayOnly)
-         OnM2SwingLegDirectionChange(closingLegDirection, nextSwingDirection);
-
       SwingCloseM2Leg(swingState, timeframe, swingLineColor, trendPrefix, labelPrefix, sh);
 
       Swing closedSwingLeg = swingState.swingHistory[swingState.swingHistoryCount - 1];
@@ -1705,23 +1265,10 @@ void RefreshLiquidityHuntHud()
       ObjectSetInteger(0, LQ_OBJ_HUNT_HUD, OBJPROP_SELECTABLE, false);
       ObjectSetInteger(0, LQ_OBJ_HUNT_HUD, OBJPROP_HIDDEN, false);
    }
-   const int activeCount = V2CountActiveHunts();
-   const bool highOn = (V2FindActiveHuntByBreachPolarity(true) >= 0);
-   const bool lowOn  = (V2FindActiveHuntByBreachPolarity(false) >= 0);
-   string txt = "v3 hunts: none";
-   if(activeCount > 0)
-   {
-      if(highOn && lowOn)
-         txt = "v3 hunts: high+low";
-      else if(highOn)
-         txt = "v3 hunts: high";
-      else if(lowOn)
-         txt = "v3 hunts: low";
-      else
-         txt = StringFormat("v3 hunts: %d active", activeCount);
-   }
+   const string txt = InputEnableEngulfHuntAfterH4Breach ? "v3: engulf scan ON" : "v3: engulf scan OFF";
    ObjectSetString(0, LQ_OBJ_HUNT_HUD, OBJPROP_TEXT, txt);
-   ObjectSetInteger(0, LQ_OBJ_HUNT_HUD, OBJPROP_COLOR, activeCount > 0 ? clrLime : clrSilver);
+   ObjectSetInteger(0, LQ_OBJ_HUNT_HUD, OBJPROP_COLOR,
+                    InputEnableEngulfHuntAfterH4Breach ? clrLime : clrSilver);
    ObjectSetInteger(0, LQ_OBJ_HUNT_HUD, OBJPROP_FONTSIZE, 9);
 }
 
@@ -2169,6 +1716,9 @@ bool BuildTradeSwingGroupTakeProfits(const bool isBullishTrade, const datetime f
    outTakeProfitCount = 0;
    ArrayResize(outTakeProfitPrices, 0);
 
+   if(ScoreLogWriteModeSkipsTrading())
+      return false;
+
    if(InputTradeSwingProximityPercentOfChartRange <= 0.0 || formationTime == 0)
       return false;
 
@@ -2496,82 +2046,6 @@ double ReferenceChartHeightForFairValueGapFilterM2()
    return ReferenceChartHeightForM2BarCount(InputChartRangeBarCount);
 }
 
-//+------------------------------------------------------------------+
-bool FairValueGapGapMeetsMinimumPercentOfRangeM2(const double zoneLowPrice, const double zoneHighPrice,
-                                                double &outGapSize, double &outChartHeight,
-                                                double &outMinGapRequired)
-{
-   outGapSize        = 0.0;
-   outChartHeight    = 0.0;
-   outMinGapRequired = 0.0;
-
-   outGapSize = MathAbs(zoneHighPrice - zoneLowPrice);
-   if(outGapSize <= 0.0)
-      return false;
-
-   if(InputFairValueGapMinimumPercentOfChartRange <= 0.0)
-      return true;
-
-   outChartHeight = ReferenceChartHeightForFairValueGapFilterM2();
-   if(outChartHeight <= 0.0)
-      return true;
-
-   outMinGapRequired = outChartHeight * (InputFairValueGapMinimumPercentOfChartRange / 100.0);
-   return (outGapSize >= outMinGapRequired);
-}
-
-//+------------------------------------------------------------------+
-bool TryDetectFairValueGapPatternOnLastClosedBarM2(bool &isBullishFairValueGap,
-                                                   double &fairValueGapZoneLowPrice,
-                                                   double &fairValueGapZoneHighPrice)
-{
-   isBullishFairValueGap     = false;
-   fairValueGapZoneLowPrice  = 0.0;
-   fairValueGapZoneHighPrice = 0.0;
-
-   if(iBars(_Symbol, InputM2NarrativeTimeframe) < 4)
-      return false;
-
-   const double newestBarHigh = iHigh(_Symbol, InputM2NarrativeTimeframe, 1);
-   const double newestBarLow  = iLow(_Symbol, InputM2NarrativeTimeframe, 1);
-   const double oldestBarHigh = iHigh(_Symbol, InputM2NarrativeTimeframe, 3);
-   const double oldestBarLow  = iLow(_Symbol, InputM2NarrativeTimeframe, 3);
-
-   if(newestBarLow > oldestBarHigh)
-   {
-      isBullishFairValueGap     = true;
-      fairValueGapZoneLowPrice  = oldestBarHigh;
-      fairValueGapZoneHighPrice = newestBarLow;
-      return true;
-   }
-
-   if(newestBarHigh < oldestBarLow)
-   {
-      isBullishFairValueGap     = false;
-      fairValueGapZoneLowPrice  = newestBarHigh;
-      fairValueGapZoneHighPrice = oldestBarLow;
-      return true;
-   }
-
-   return false;
-}
-
-//+------------------------------------------------------------------+
-bool DetectFairValueGapOnLastClosedBarM2(bool &isBullishFairValueGap, double &fairValueGapZoneLowPrice,
-                                        double &fairValueGapZoneHighPrice)
-{
-   if(!TryDetectFairValueGapPatternOnLastClosedBarM2(isBullishFairValueGap, fairValueGapZoneLowPrice,
-                                                     fairValueGapZoneHighPrice))
-      return false;
-
-   double gapSize = 0.0;
-   double chartHeight = 0.0;
-   double minGap = 0.0;
-   return FairValueGapGapMeetsMinimumPercentOfRangeM2(fairValueGapZoneLowPrice, fairValueGapZoneHighPrice,
-                                                    gapSize, chartHeight, minGap);
-}
-
-//+------------------------------------------------------------------+
 bool TryGetH4LegBarOpenTimeFromEnd(const datetime legStartTime, const datetime legEndTime,
                                     const int nFromEnd, datetime &outBarOpenTime)
 {
@@ -2935,255 +2409,6 @@ string M2FormatTickVolumeArrayLog(const long &volumes[], const int count,
    return text;
 }
 
-//+------------------------------------------------------------------+
-bool M2FindMaxVolumeBarOpenTimeExcludingOldest(const long &volumes[], const int count,
-                                                const datetime windowStartOpen,
-                                                const datetime windowEndOpen,
-                                                datetime &outBarOpenTime, long &outMaxVolume)
-{
-   outBarOpenTime = 0;
-   outMaxVolume   = -1;
-   if(count < 2 || windowStartOpen == 0 || windowEndOpen == 0)
-      return false;
-
-   int  maxVolIndex = -1;
-   long maxVol      = -1;
-   for(int i = 1; i < count; i++)
-   {
-      if(volumes[i] > maxVol)
-      {
-         maxVol      = volumes[i];
-         maxVolIndex = i;
-      }
-      else if(volumes[i] == maxVol)
-         maxVolIndex = i;
-   }
-
-   int  leapIndex = -1;
-   long bestLeap  = 0;
-   for(int i = 1; i < count; i++)
-   {
-      const long leap = volumes[i] - volumes[i - 1];
-      if(leap < LQ_TOUCH_VOL_MASSIVE_LEAP_MIN)
-         continue;
-      if(leap > bestLeap || (leap == bestLeap && i > leapIndex))
-      {
-         bestLeap  = leap;
-         leapIndex = i;
-      }
-   }
-
-   const int bestIndex = (leapIndex >= 0) ? leapIndex : maxVolIndex;
-   if(bestIndex < 0)
-      return false;
-
-   const ENUM_TIMEFRAMES timeframe = InputM2NarrativeTimeframe;
-   const int shiftStartOlder = iBarShift(_Symbol, timeframe, windowStartOpen, true);
-   if(shiftStartOlder < 0)
-      return false;
-
-   const int barShift = shiftStartOlder - bestIndex;
-   if(barShift < 0)
-      return false;
-
-   outBarOpenTime = iTime(_Symbol, timeframe, barShift);
-   outMaxVolume   = volumes[bestIndex];
-   return outBarOpenTime > 0;
-}
-
-//+------------------------------------------------------------------+
-bool M2TouchVolSlReferenceExtreme(const bool isBuy, const int entryBarShift,
-                                   const datetime windowStartInclusive,
-                                   const double legExtremeFloor,
-                                   double &outRefExtreme, int &outRefBarShift)
-{
-   outRefExtreme  = 0.0;
-   outRefBarShift = entryBarShift;
-   if(entryBarShift < 0)
-      return false;
-
-   const ENUM_TIMEFRAMES timeframe = InputM2NarrativeTimeframe;
-   const int totalBars = iBars(_Symbol, timeframe);
-   if(entryBarShift >= totalBars)
-      return false;
-
-   const datetime entryBarOpen = iTime(_Symbol, timeframe, entryBarShift);
-   if(entryBarOpen == 0)
-      return false;
-
-   int shiftStartOlder = -1;
-   int shiftEndNewer   = entryBarShift;
-   if(windowStartInclusive > 0 &&
-      M2VolumeWindowShiftRangeValid(windowStartInclusive, entryBarOpen))
-   {
-      shiftStartOlder = iBarShift(_Symbol, timeframe, windowStartInclusive, true);
-      shiftEndNewer   = entryBarShift;
-   }
-
-   if(shiftStartOlder < 0 || shiftStartOlder < shiftEndNewer)
-   {
-      shiftStartOlder = entryBarShift + LQ_TOUCH_VOL_SL_OLDER_BAR_LOOKBACK;
-      shiftEndNewer   = entryBarShift;
-   }
-
-   if(shiftStartOlder >= totalBars)
-      shiftStartOlder = totalBars - 1;
-
-   for(int barShift = shiftStartOlder; barShift >= shiftEndNewer; barShift--)
-   {
-      if(barShift < 0 || barShift >= totalBars)
-         continue;
-
-      if(isBuy)
-      {
-         const double barLow = iLow(_Symbol, timeframe, barShift);
-         if(outRefExtreme <= 0.0 || barLow < outRefExtreme)
-         {
-            outRefExtreme  = barLow;
-            outRefBarShift = barShift;
-         }
-      }
-      else
-      {
-         const double barHigh = iHigh(_Symbol, timeframe, barShift);
-         if(outRefExtreme <= 0.0 || barHigh > outRefExtreme)
-         {
-            outRefExtreme  = barHigh;
-            outRefBarShift = barShift;
-         }
-      }
-   }
-
-   if(legExtremeFloor > 0.0)
-   {
-      if(isBuy)
-      {
-         if(outRefExtreme <= 0.0 || legExtremeFloor < outRefExtreme)
-         {
-            outRefExtreme  = legExtremeFloor;
-            outRefBarShift = entryBarShift;
-         }
-      }
-      else
-      {
-         if(outRefExtreme <= 0.0 || legExtremeFloor > outRefExtreme)
-         {
-            outRefExtreme  = legExtremeFloor;
-            outRefBarShift = entryBarShift;
-         }
-      }
-   }
-
-   return outRefExtreme > 0.0;
-}
-
-//+------------------------------------------------------------------+
-bool ResolveTouchLegVolumeBarEntryAndSl(const bool isBuy, const int barShift,
-                                         const datetime slWindowStartOpen, const int huntIndex,
-                                         bool &outUseMarketOrder, double &outEntryPrice,
-                                         double &outStopLossPrice, string &outFailReason)
-{
-   outUseMarketOrder  = false;
-   outEntryPrice      = 0.0;
-   outStopLossPrice   = 0.0;
-   outFailReason      = "";
-
-   if(barShift < 0)
-   {
-      outFailReason = "barShift invalid";
-      return false;
-   }
-
-   const ENUM_TIMEFRAMES timeframe = InputM2NarrativeTimeframe;
-   const double barLow     = iLow(_Symbol, timeframe, barShift);
-   const double barHigh    = iHigh(_Symbol, timeframe, barShift);
-   if(barHigh <= barLow)
-   {
-      outFailReason = "vol bar range invalid";
-      return false;
-   }
-
-   if(InputTouchVolEntryOffsetPercentChart < 0.0)
-   {
-      outFailReason = "InputTouchVolEntryOffsetPercentChart invalid";
-      return false;
-   }
-
-   if(InputTouchVolSlBufferPercentChart < 0.0)
-   {
-      outFailReason = "InputTouchVolSlBufferPercentChart invalid";
-      return false;
-   }
-
-   const double bufferPrice = M2TouchVolSlBufferPrice(barShift);
-   if(InputTouchVolSlBufferPercentChart > 0.0 && bufferPrice <= 0.0)
-   {
-      outFailReason = "SL chart height invalid for positive buffer %";
-      return false;
-   }
-
-   datetime slScanStartOpen = slWindowStartOpen;
-   double   legExtremeFloor = 0.0;
-   if(huntIndex >= 0 && huntIndex < V2_MAX_HUNT_SESSIONS)
-   {
-      double   legLow  = 0.0;
-      double   legHigh = 0.0;
-      datetime legStartTime = 0;
-      datetime legEndTime   = 0;
-      if(V2TryGetOppositeM2LegExtentsForTouch(huntIndex, legLow, legHigh, legStartTime, legEndTime))
-      {
-         legExtremeFloor = isBuy ? legLow : legHigh;
-         if(legStartTime > 0 && (slScanStartOpen == 0 || legStartTime < slScanStartOpen))
-            slScanStartOpen = legStartTime;
-      }
-   }
-
-   double slRefExtreme = 0.0;
-   int    slRefBarShift = barShift;
-   if(!M2TouchVolSlReferenceExtreme(isBuy, barShift, slScanStartOpen, legExtremeFloor,
-                                    slRefExtreme, slRefBarShift))
-   {
-      outFailReason = "SL reference extreme invalid";
-      return false;
-   }
-
-   const double limitLevel = M2TouchVolLimitEntryPrice(isBuy, barShift, barLow, barHigh);
-   if(limitLevel <= 0.0)
-   {
-      outFailReason = "limit entry invalid (check entry offset % and chart range)";
-      return false;
-   }
-
-   if(isBuy)
-      outStopLossPrice = NormalizeDouble(slRefExtreme - bufferPrice, _Digits);
-   else
-      outStopLossPrice = NormalizeDouble(slRefExtreme + bufferPrice, _Digits);
-
-   outUseMarketOrder = false;
-   outEntryPrice     = limitLevel;
-
-   if(!ApplyTouchVolMinimumSlDistance(isBuy, outEntryPrice, outStopLossPrice))
-   {
-      outFailReason = StringFormat("entry/SL side invalid after minPts=%d entry=%.5f sl=%.5f",
-                                   TouchVolEffectiveMinSlPoints(), outEntryPrice, outStopLossPrice);
-      return false;
-   }
-
-   if(isBuy && outEntryPrice <= outStopLossPrice)
-   {
-      outFailReason = StringFormat("buy entry<=SL entry=%.5f sl=%.5f", outEntryPrice, outStopLossPrice);
-      return false;
-   }
-   if(!isBuy && outEntryPrice >= outStopLossPrice)
-   {
-      outFailReason = StringFormat("sell entry>=SL entry=%.5f sl=%.5f", outEntryPrice, outStopLossPrice);
-      return false;
-   }
-
-   return true;
-}
-
-//+------------------------------------------------------------------+
 bool H4TryGetLegLastDecentMovementBarOpen(const datetime legStartTime, const datetime legProgressEnd,
                                            const int swingDirection, datetime &outBarOpenTime)
 {
@@ -6721,37 +5946,6 @@ void H4BreachBufferBandForDownLegLow(const double breachLevel, double &outBandLo
 }
 
 //+------------------------------------------------------------------+
-bool H4BreachImpulseCancelZonePrices(const bool expectBullishFvgHunt, const double breachLevel,
-                                       double &outZoneLow, double &outZoneHigh,
-                                       double &outCancelLimitPrice)
-{
-   outZoneLow = 0.0;
-   outZoneHigh = 0.0;
-   outCancelLimitPrice = 0.0;
-
-   if(H4_BREACH_BUFFER_PERCENT_FAR <= 0.0 || breachLevel <= 0.0)
-      return false;
-
-   const double referenceHeight = ReferenceChartHeightForH4BreachBuffer();
-   if(referenceHeight <= 0.0)
-      return false;
-
-   const double farOffset = referenceHeight * (H4_BREACH_BUFFER_PERCENT_FAR / 100.0);
-   if(expectBullishFvgHunt)
-   {
-      outZoneHigh         = breachLevel;
-      outZoneLow          = breachLevel - farOffset;
-      outCancelLimitPrice = outZoneLow;
-   }
-   else
-   {
-      outZoneLow          = breachLevel;
-      outZoneHigh         = breachLevel + farOffset;
-      outCancelLimitPrice = outZoneHigh;
-   }
-   return true;
-}
-
 #ifdef H4_LQ_VOLUME_BREACH_ENABLED
 
 //+------------------------------------------------------------------+
@@ -6791,50 +5985,6 @@ bool TryAcceptH4BreachForHunt(const bool h4HighBreached, const double breachLeve
 #endif // H4_LQ_VOLUME_BREACH_ENABLED
 
 //+------------------------------------------------------------------+
-bool TryDetectM2BreakOfStructureOnLastClosedBar(bool &outExpectsBullishFairValueGap,
-                                                 double &outBosLegLevelPrice)
-{
-   outExpectsBullishFairValueGap = false;
-   outBosLegLevelPrice = 0.0;
-   if(g_m2Swing.swingHistoryCount < 1)
-      return false;
-
-   const double closePrice = iClose(_Symbol, InputM2NarrativeTimeframe, 1);
-   const double prevClose  = iClose(_Symbol, InputM2NarrativeTimeframe, 2);
-   const double pointSize  = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-
-   for(int historyIndex = g_m2Swing.swingHistoryCount - 1; historyIndex >= 0; historyIndex--)
-   {
-      if(g_m2Swing.swingHistory[historyIndex].swingDirection != 1)
-         continue;
-
-      const double swingLegHighPrice = g_m2Swing.swingHistory[historyIndex].legHighPrice;
-      if(closePrice > swingLegHighPrice + pointSize && prevClose <= swingLegHighPrice + pointSize)
-      {
-         outExpectsBullishFairValueGap = false;
-         outBosLegLevelPrice           = swingLegHighPrice;
-         return true;
-      }
-      break;
-   }
-
-   for(int historyIndex = g_m2Swing.swingHistoryCount - 1; historyIndex >= 0; historyIndex--)
-   {
-      if(g_m2Swing.swingHistory[historyIndex].swingDirection != -1)
-         continue;
-
-      const double swingLegLowPrice = g_m2Swing.swingHistory[historyIndex].legLowPrice;
-      if(closePrice < swingLegLowPrice - pointSize && prevClose >= swingLegLowPrice - pointSize)
-      {
-         outExpectsBullishFairValueGap = true;
-         outBosLegLevelPrice           = swingLegLowPrice;
-         return true;
-      }
-      break;
-   }
-   return false;
-}
-
 //+------------------------------------------------------------------+
 void LogHuntEvent(const string eventName, const string detail = "")
 {
@@ -6864,31 +6014,7 @@ void ApplyTradeFillingModeFromSymbol()
       g_trade.SetTypeFilling(ORDER_FILLING_RETURN);
 }
 
-double M2TouchVolSlBufferPrice(const int barShift)
-{
-   if(InputTouchVolSlBufferPercentChart <= 0.0)
-      return 0.0;
-
-   const double chartHeight =
-      ReferenceChartHeightForM2BarCountFromShift(barShift, InputChartRangeBarCount);
-   if(chartHeight <= 0.0)
-      return 0.0;
-   return chartHeight * (InputTouchVolSlBufferPercentChart / 100.0);
-}
-
 //+------------------------------------------------------------------+
-double M2TouchVolEntryOffsetPrice(const int barShift)
-{
-   if(InputTouchVolEntryOffsetPercentChart <= 0.0)
-      return 0.0;
-
-   const double chartHeight =
-      ReferenceChartHeightForM2BarCountFromShift(barShift, InputChartRangeBarCount);
-   if(chartHeight <= 0.0)
-      return 0.0;
-   return chartHeight * (InputTouchVolEntryOffsetPercentChart / 100.0);
-}
-
 //+------------------------------------------------------------------+
 int TouchVolEffectiveMinSlPoints()
 {
@@ -6936,101 +6062,12 @@ bool ApplyTouchVolMinimumSlDistance(const bool isBuy, const double entryPrice,
 //+------------------------------------------------------------------+
 //| Buy hunt: vol bar low + N% chart height. Sell hunt: vol bar high âˆ’ N%. |
 //+------------------------------------------------------------------+
-double M2TouchVolLimitEntryPrice(const bool isBuy, const int barShift,
-                                  const double barLow, const double barHigh)
-{
-   if(barShift < 0 || barHigh <= barLow)
-      return 0.0;
-
-   const double entryOffset = M2TouchVolEntryOffsetPrice(barShift);
-   const double limitRaw = isBuy ? barLow + entryOffset : barHigh - entryOffset;
-   return NormalizeDouble(limitRaw, _Digits);
-}
-
 //+------------------------------------------------------------------+
 //| Scan opposite M2 leg backward for most recent decent impulse; return origin bar shift. |
 //+------------------------------------------------------------------+
-bool M2FindImpulseBaseBar(const datetime legStartTime, const datetime legEndTime, const int legDirection,
-                           int &outBarShift)
-{
-   outBarShift = -1;
-   if(legStartTime == 0 || legDirection == 0)
-      return false;
-
-   const ENUM_TIMEFRAMES timeframe = InputM2NarrativeTimeframe;
-   int shiftStart = iBarShift(_Symbol, timeframe, legStartTime, true);
-   int shiftEnd   = (legEndTime == 0) ? 1 : iBarShift(_Symbol, timeframe, legEndTime, true);
-
-   if(shiftEnd < 1)
-      shiftEnd = 1;
-   if(shiftStart < 0)
-      return false;
-
-   if(shiftStart < shiftEnd)
-   {
-      int tmp = shiftStart;
-      shiftStart = shiftEnd;
-      shiftEnd = tmp;
-   }
-
-   int decentShift = -1;
-   for(int i = shiftEnd; i <= shiftStart; i++)
-   {
-      if(M2BarHasDecentMovementForLegDirection(i, legDirection))
-      {
-         decentShift = i;
-         break;
-      }
-   }
-
-   if(decentShift == -1)
-      return false;
-
-   int originShift = decentShift;
-   for(int i = decentShift + 1; i <= shiftStart; i++)
-   {
-      const double open  = iOpen(_Symbol, timeframe, i);
-      const double close = iClose(_Symbol, timeframe, i);
-      const int candleDir = (close > open) ? 1 : ((close < open) ? -1 : 0);
-
-      if(candleDir == -legDirection)
-         break;
-
-      originShift = i;
-   }
-
-   outBarShift = originShift;
-   return true;
-}
-
 //+------------------------------------------------------------------+
 //| 61.8% OTE on full opposite M2 leg range (down leg: from low; up leg: from high). |
 //+------------------------------------------------------------------+
-double V2TouchLevelFromLegExtreme(const int oppositeM2LegDirection, const double legLowPrice,
-                                   const double legHighPrice)
-{
-   if(legLowPrice <= 0.0 || legHighPrice <= 0.0 || legHighPrice <= legLowPrice)
-      return 0.0;
-
-   const double legRange = legHighPrice - legLowPrice;
-   double fibLevel = 0.0;
-
-   if(oppositeM2LegDirection == -1)
-   {
-      // Opposite down leg: 61.8% up from structural leg low â†’ touch near leg high
-      fibLevel = legLowPrice + (legRange * 0.9);
-   }
-   else if(oppositeM2LegDirection == 1)
-   {
-      // Opposite up leg: 61.8% down from structural leg high â†’ touch near leg low
-      fibLevel = legHighPrice - (legRange * 0.9);
-   }
-   else
-      return 0.0;
-
-   return NormalizeDouble(fibLevel, _Digits);
-}
-
 //+------------------------------------------------------------------+
 bool V2TryGetLastCompletedM2Leg(const int legDirection, double &outLegLow, double &outLegHigh,
                                    datetime &outLegStartTime, datetime &outLegEndTime)
@@ -7055,30 +6092,6 @@ bool V2TryGetLastCompletedM2Leg(const int legDirection, double &outLegLow, doubl
    return false;
 }
 
-//+------------------------------------------------------------------+
-void V2ApplyTouchLevelFromM2Leg(const int huntIndex, const double legLow, const double legHigh,
-                                 const string logContext, const bool allowRecalc)
-{
-   // v3: removed â€” engulfing model replaces touch level
-}
-
-//+------------------------------------------------------------------+
-void V2ApplyTouchLevelFromOppositeLegWindow(const int huntIndex, const datetime legStartTime,
-                                             const datetime legEndTime, const double legLow,
-                                             const double legHigh, const string logContext,
-                                             const bool allowRecalc)
-{
-   V2ApplyTouchLevelFromM2Leg(huntIndex, legLow, legHigh, logContext, allowRecalc);
-}
-
-//+------------------------------------------------------------------+
-void V2TryLockTouchLevelFromM2Leg(const int huntIndex, const double legLow, const double legHigh,
-                                    const string logContext)
-{
-   V2ApplyTouchLevelFromM2Leg(huntIndex, legLow, legHigh, logContext, false);
-}
-
-//+------------------------------------------------------------------+
 double LossPerLotFromTickSpec(const double entryPrice, const double stopLossPrice)
 {
    const double slDistance = MathAbs(entryPrice - stopLossPrice);
@@ -7127,7 +6140,7 @@ double CalculateVolumeForFixedUsdRisk(const bool isBuy, const double entryPrice,
 //+------------------------------------------------------------------+
 bool SetupScoreAllowsTradeEntry(const double setupScore)
 {
-   return (setupScore >= InputMinScore)|| true;
+   return (setupScore >= InputMinScore);
 }
 
 //+------------------------------------------------------------------+
@@ -7178,42 +6191,6 @@ bool StopsDistanceAllowed(const bool isBuy, const double entryPrice, const doubl
 }
 
 //+------------------------------------------------------------------+
-bool HasOurTradeForFormation(const datetime formationTime)
-{
-   const string tag = IntegerToString((long)formationTime);
-
-   for(int positionIndex = PositionsTotal() - 1; positionIndex >= 0; positionIndex--)
-   {
-      const ulong ticket = PositionGetTicket(positionIndex);
-      if(ticket == 0)
-         continue;
-      if(!PositionSelectByTicket(ticket))
-         continue;
-      if(PositionGetString(POSITION_SYMBOL) != _Symbol)
-         continue;
-      if((ulong)PositionGetInteger(POSITION_MAGIC) != LQ_EXPERT_MAGIC)
-         continue;
-      if(StringFind(PositionGetString(POSITION_COMMENT), tag) >= 0)
-         return true;
-   }
-
-   for(int orderIndex = OrdersTotal() - 1; orderIndex >= 0; orderIndex--)
-   {
-      const ulong ticket = OrderGetTicket(orderIndex);
-      if(ticket == 0)
-         continue;
-      if(!OrderSelect(ticket))
-         continue;
-      if(OrderGetString(ORDER_SYMBOL) != _Symbol)
-         continue;
-      if((ulong)OrderGetInteger(ORDER_MAGIC) != LQ_EXPERT_MAGIC)
-         continue;
-      if(StringFind(OrderGetString(ORDER_COMMENT), tag) >= 0)
-         return true;
-   }
-   return false;
-}
-
 //+------------------------------------------------------------------+
 bool TryNthM2CompletedSwingLeg(const int swingDirection, const int nFromLatest,
                                double &outLegHigh, double &outLegLow, datetime &outLegEndTime)
@@ -7313,27 +6290,6 @@ string HuntTradeOrderCommentPrefix(const datetime huntSessionId = 0)
    return "LQ2_HS0_";
 }
 
-//+------------------------------------------------------------------+
-bool V2IsHuntSessionStillActive(const datetime huntSessionId)
-{
-   const int huntIndex = V2FindHuntSlotBySessionId(huntSessionId);
-   return (huntIndex >= 0 && g_v2Hunts[huntIndex].active);
-}
-
-//+------------------------------------------------------------------+
-bool OrderCommentBelongsToActiveHunt(const string orderComment)
-{
-   for(int huntIndex = 0; huntIndex < V2_MAX_HUNT_SESSIONS; huntIndex++)
-   {
-      if(!g_v2Hunts[huntIndex].active)
-         continue;
-      if(StringFind(orderComment, V2HuntTradeCommentPrefix(g_v2Hunts[huntIndex].sessionId)) == 0)
-         return true;
-   }
-   return false;
-}
-
-//+------------------------------------------------------------------+
 bool HuntTradeCommentMatchesSession(const string orderComment)
 {
    if(g_huntTradeSessionCommentPrefix == "")
@@ -7423,218 +6379,6 @@ bool TryParseFormationTimeFromHuntOrderComment(const string orderComment, dateti
    return true;
 }
 
-//+------------------------------------------------------------------+
-bool FvgFormationBarBeyondChartRange(const datetime formationTime, int &outBarShift)
-{
-   outBarShift = -1;
-   if(formationTime == 0)
-      return false;
-
-   outBarShift = iBarShift(_Symbol, InputM2NarrativeTimeframe, formationTime, true);
-   if(outBarShift < 0)
-      return true;
-
-   const int maxShift = InputChartRangeBarCount;
-   if(maxShift <= 0)
-      return false;
-
-   return (outBarShift > maxShift);
-}
-
-//+------------------------------------------------------------------+
-void V2ClearHuntPreEntryWatchForHunt(const int huntIndex)
-{
-   if(huntIndex < 0 || huntIndex >= V2_MAX_HUNT_SESSIONS)
-      return;
-
-   g_v2Hunts[huntIndex].tradeOrdersActive      = false;
-   g_v2Hunts[huntIndex].ordersFvgFormationTime = 0;
-   g_v2Hunts[huntIndex].tradeIsBuy             = false;
-   g_v2Hunts[huntIndex].tradeEntryPrice        = 0.0;
-   g_v2Hunts[huntIndex].tradeTp1Price          = 0.0;
-   g_v2Hunts[huntIndex].preEntryCancelTpLevel  = 0.0;
-   g_v2Hunts[huntIndex].firstOppBosMgmtDone    = false;
-}
-
-//+------------------------------------------------------------------+
-void V2ClearHuntTradeOrdersActiveForSession(const datetime huntSessionId)
-{
-   const int huntIndex = V2FindHuntSlotBySessionId(huntSessionId);
-   if(huntIndex < 0)
-      return;
-
-   V2ClearHuntPreEntryWatchForHunt(huntIndex);
-}
-
-//+------------------------------------------------------------------+
-bool V2CollectUniquePendingHuntSessionIds(datetime &outSessionIds[], const int maxSessions)
-{
-   ArrayResize(outSessionIds, 0);
-   if(maxSessions <= 0)
-      return false;
-
-   int count = 0;
-   for(int orderIndex = OrdersTotal() - 1; orderIndex >= 0; orderIndex--)
-   {
-      const ulong ticket = OrderGetTicket(orderIndex);
-      if(!IsOurHuntPendingOrderTicket(ticket))
-         continue;
-
-      datetime sessionId = 0;
-      if(!ParseHuntSessionIdFromTradeComment(OrderGetString(ORDER_COMMENT), sessionId))
-         continue;
-
-      bool alreadyListed = false;
-      for(int i = 0; i < count; i++)
-      {
-         if(outSessionIds[i] == sessionId)
-         {
-            alreadyListed = true;
-            break;
-         }
-      }
-      if(alreadyListed)
-         continue;
-
-      if(count >= maxSessions)
-         break;
-
-      ArrayResize(outSessionIds, count + 1);
-      outSessionIds[count++] = sessionId;
-   }
-
-   return (count > 0);
-}
-
-//+------------------------------------------------------------------+
-bool V2TrySyncPreEntryWatchForSession(const datetime sessionId, const int huntIndex,
-                                      int &outPendingCount, bool &outIsBuy,
-                                      double &outTp3Level, double &outEntryPrice)
-{
-   outPendingCount = 0;
-   outIsBuy        = false;
-   outTp3Level     = 0.0;
-   outEntryPrice   = 0.0;
-   if(sessionId == 0)
-      return false;
-
-   const string prefix = V2HuntTradeCommentPrefix(sessionId);
-   double storedTp3    = 0.0;
-   if(huntIndex >= 0 && huntIndex < V2_MAX_HUNT_SESSIONS)
-      storedTp3 = g_v2Hunts[huntIndex].preEntryCancelTpLevel;
-   bool   isBuy      = (huntIndex >= 0 ? g_v2Hunts[huntIndex].tradeIsBuy : false);
-   double entryPrice = (huntIndex >= 0 ? g_v2Hunts[huntIndex].tradeEntryPrice : 0.0);
-   bool   haveSide   = false;
-
-   for(int orderIndex = OrdersTotal() - 1; orderIndex >= 0; orderIndex--)
-   {
-      const ulong ticket = OrderGetTicket(orderIndex);
-      if(ticket == 0 || !OrderSelect(ticket))
-         continue;
-      if(OrderGetString(ORDER_SYMBOL) != _Symbol)
-         continue;
-      if((ulong)OrderGetInteger(ORDER_MAGIC) != LQ_EXPERT_MAGIC)
-         continue;
-
-      const ENUM_ORDER_STATE orderState = (ENUM_ORDER_STATE)OrderGetInteger(ORDER_STATE);
-      if(orderState != ORDER_STATE_PLACED && orderState != ORDER_STATE_PARTIAL)
-         continue;
-
-      const ENUM_ORDER_TYPE orderType = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
-      if(orderType != ORDER_TYPE_BUY_LIMIT && orderType != ORDER_TYPE_SELL_LIMIT &&
-         orderType != ORDER_TYPE_BUY_STOP && orderType != ORDER_TYPE_SELL_STOP &&
-         orderType != ORDER_TYPE_BUY_STOP_LIMIT && orderType != ORDER_TYPE_SELL_STOP_LIMIT)
-         continue;
-
-      const string comment = OrderGetString(ORDER_COMMENT);
-      if(StringFind(comment, prefix) != 0)
-         continue;
-
-      outPendingCount++;
-      const double orderTp    = OrderGetDouble(ORDER_TP);
-      const double orderPrice = OrderGetDouble(ORDER_PRICE_OPEN);
-      const bool orderIsBuy   = (orderType == ORDER_TYPE_BUY_LIMIT || orderType == ORDER_TYPE_BUY_STOP ||
-                                 orderType == ORDER_TYPE_BUY_STOP_LIMIT);
-
-      if(!haveSide)
-      {
-         isBuy       = orderIsBuy;
-         entryPrice  = orderPrice;
-         haveSide    = true;
-      }
-
-      if(StringFind(comment, "_TP3_") >= 0 && orderTp > 0.0)
-         storedTp3 = orderTp;
-      else if(orderTp > 0.0)
-      {
-         if(orderIsBuy)
-            storedTp3 = (storedTp3 <= 0.0 ? orderTp : MathMax(storedTp3, orderTp));
-         else
-            storedTp3 = (storedTp3 <= 0.0 ? orderTp : MathMin(storedTp3, orderTp));
-      }
-   }
-
-   if(outPendingCount <= 0)
-      return false;
-
-   outIsBuy      = isBuy;
-   outEntryPrice = entryPrice;
-   outTp3Level   = storedTp3;
-
-   if(huntIndex >= 0 && huntIndex < V2_MAX_HUNT_SESSIONS)
-   {
-      g_v2Hunts[huntIndex].tradeIsBuy      = isBuy;
-      g_v2Hunts[huntIndex].tradeEntryPrice = entryPrice;
-      if(storedTp3 > 0.0)
-         g_v2Hunts[huntIndex].preEntryCancelTpLevel = storedTp3;
-   }
-
-   return (storedTp3 > 0.0);
-}
-
-//+------------------------------------------------------------------+
-bool V2TrySyncPreEntryWatchForHunt(const int huntIndex, int &outPendingCount)
-{
-   outPendingCount = 0;
-   if(huntIndex < 0 || huntIndex >= V2_MAX_HUNT_SESSIONS)
-      return false;
-
-   const datetime sessionId = g_v2Hunts[huntIndex].sessionId;
-   if(sessionId == 0)
-      return false;
-
-   bool   isBuy      = false;
-   double tp3Level   = 0.0;
-   double entryPrice = 0.0;
-   return V2TrySyncPreEntryWatchForSession(sessionId, huntIndex, outPendingCount,
-                                           isBuy, tp3Level, entryPrice);
-}
-
-//+------------------------------------------------------------------+
-void V2RefreshGlobalHuntTradeWatchFromSessions()
-{
-   bool refreshed = false;
-   for(int huntIndex = 0; huntIndex < V2_MAX_HUNT_SESSIONS; huntIndex++)
-   {
-      int pendingCount = 0;
-      if(!V2TrySyncPreEntryWatchForHunt(huntIndex, pendingCount) || pendingCount <= 0)
-         continue;
-
-      g_huntTradeOrdersActive           = true;
-      g_huntOrdersFvgFormationTime      = g_v2Hunts[huntIndex].ordersFvgFormationTime;
-      g_huntTradeIsBuy                  = g_v2Hunts[huntIndex].tradeIsBuy;
-      g_huntTradeEntryPrice             = g_v2Hunts[huntIndex].tradeEntryPrice;
-      g_huntPreEntryCancelTpLevel       = g_v2Hunts[huntIndex].preEntryCancelTpLevel;
-      g_huntTradeSessionCommentPrefix   = V2HuntTradeCommentPrefix(g_v2Hunts[huntIndex].sessionId);
-      refreshed                         = true;
-      break;
-   }
-
-   if(!refreshed && !HasOurHuntTradeOpenPosition())
-      ResetHuntTradeState();
-}
-
-//+------------------------------------------------------------------+
 datetime HuntSessionIdFromTradeCommentPrefix(const string commentPrefix)
 {
    if(StringFind(commentPrefix, "LQ2_HS") != 0)
@@ -8083,101 +6827,6 @@ void ManageHuntOpenPositionsOnM2BarClose()
    ManageHuntTradeTieredStopLoss(isBuy);
 }
 
-//+------------------------------------------------------------------+
-// Formation bar tick volume must be >= percent of average tick volume on
-// the next InputFvgTradeTickVolumeAvgM2BarCount older M2 bars (excludes formation).
-// InputFvgTradeMinTickVolumePercentOfM2Avg <= 0 disables the filter.
-bool FvgFormationBarMeetsMinTickVolume(const int formationBarShift)
-{
-   if(InputFvgTradeMinTickVolumePercentOfM2Avg <= 0.0)
-      return true;
-   if(formationBarShift < 0)
-      return false;
-
-   const int avgBarCount = MathMax(1, InputFvgTradeTickVolumeAvgM2BarCount);
-   const long formationVol = iTickVolume(_Symbol, InputM2NarrativeTimeframe, formationBarShift);
-   if(formationVol <= 0)
-      return false;
-
-   long volSum = 0;
-   int  counted = 0;
-   for(int shift = formationBarShift + 1; shift <= formationBarShift + avgBarCount; shift++)
-   {
-      const long barVol = iTickVolume(_Symbol, InputM2NarrativeTimeframe, shift);
-      if(barVol < 0)
-         continue;
-      volSum += barVol;
-      counted++;
-   }
-   if(counted == 0)
-      return false;
-
-   const double avgVol = (double)volSum / (double)counted;
-   const double requiredVol = avgVol * (InputFvgTradeMinTickVolumePercentOfM2Avg / 100.0);
-   if((double)formationVol < requiredVol)
-   {
-      LogHuntEvent("TRADE_SKIP", StringFormat(
-         "tick vol low formation=%I64d need>=%.0f (%.0f%% of avg=%.0f over %d M2 bars)",
-         formationVol, requiredVol, InputFvgTradeMinTickVolumePercentOfM2Avg, avgVol, counted));
-      return false;
-   }
-   return true;
-}
-
-//+------------------------------------------------------------------+
-bool HasOurHuntOpenPosition()
-{
-   for(int positionIndex = PositionsTotal() - 1; positionIndex >= 0; positionIndex--)
-   {
-      const ulong ticket = PositionGetTicket(positionIndex);
-      if(ticket == 0)
-         continue;
-      if(!PositionSelectByTicket(ticket))
-         continue;
-      if(PositionGetString(POSITION_SYMBOL) != _Symbol)
-         continue;
-      if((ulong)PositionGetInteger(POSITION_MAGIC) != LQ_EXPERT_MAGIC)
-         continue;
-      if(OrderCommentBelongsToActiveHunt(PositionGetString(POSITION_COMMENT)))
-         return true;
-   }
-   return false;
-}
-
-//+------------------------------------------------------------------+
-bool HasOurHuntPendingOrders()
-{
-   for(int orderIndex = OrdersTotal() - 1; orderIndex >= 0; orderIndex--)
-   {
-      const ulong ticket = OrderGetTicket(orderIndex);
-      if(ticket == 0)
-         continue;
-      if(!OrderSelect(ticket))
-         continue;
-      if(OrderGetString(ORDER_SYMBOL) != _Symbol)
-         continue;
-      if((ulong)OrderGetInteger(ORDER_MAGIC) != LQ_EXPERT_MAGIC)
-         continue;
-      if(OrderCommentBelongsToActiveHunt(OrderGetString(ORDER_COMMENT)))
-         return true;
-   }
-   return false;
-}
-
-//+------------------------------------------------------------------+
-bool HasOurHuntTradePendingOrders()
-{
-   for(int huntIndex = 0; huntIndex < V2_MAX_HUNT_SESSIONS; huntIndex++)
-   {
-      if(g_v2Hunts[huntIndex].sessionId == 0)
-         continue;
-      if(V2HuntHasPendingOrdersForSession(g_v2Hunts[huntIndex].sessionId))
-         return true;
-   }
-   return false;
-}
-
-//+------------------------------------------------------------------+
 //| huntSessionId=0: all LQ2_HS pendings; else that session only (TP3 / chart-range cancel). |
 //+------------------------------------------------------------------+
 void CancelOurHuntPendingOrders(const datetime huntSessionId)
@@ -8255,18 +6904,6 @@ void ResetHuntTradeState()
 }
 
 //+------------------------------------------------------------------+
-bool IsConsecutiveM2FvgBarAfter(const datetime priorFvgFormationTime,
-                                const datetime newFvgFormationTime)
-{
-   if(priorFvgFormationTime == 0 || newFvgFormationTime == 0)
-      return false;
-   if(newFvgFormationTime <= priorFvgFormationTime)
-      return false;
-
-   const int priorBarShift = iBarShift(_Symbol, InputM2NarrativeTimeframe, priorFvgFormationTime, true);
-   return (priorBarShift == 2);
-}
-
 //+------------------------------------------------------------------+
 bool V2HuntHasOpenPositionForSession(const datetime huntSessionId)
 {
@@ -8360,141 +6997,221 @@ void RegisterHuntTradeAfterSuccessfulPlace(const bool isBuy, const double entryP
 }
 
 //+------------------------------------------------------------------+
-void CheckHuntFvgBeyondChartRangeCancelOnTick()
-{
-   datetime sessionIds[];
-   if(!V2CollectUniquePendingHuntSessionIds(sessionIds, 8))
-      return;
-
-   const int maxShift = InputChartRangeBarCount;
-
-   for(int sessionIndex = 0; sessionIndex < ArraySize(sessionIds); sessionIndex++)
-   {
-      const datetime sessionId = sessionIds[sessionIndex];
-      if(V2HuntHasOpenPositionForSession(sessionId))
-         continue;
-
-      const int huntIndex = V2FindHuntSlotBySessionId(sessionId);
-      int pendingCount = 0;
-      bool isBuy = false;
-      double tp3Level = 0.0;
-      double entryPrice = 0.0;
-      if(!V2TrySyncPreEntryWatchForSession(sessionId, huntIndex, pendingCount,
-                                           isBuy, tp3Level, entryPrice))
-         continue;
-
-      datetime formationTime = 0;
-      if(huntIndex >= 0)
-         formationTime = g_v2Hunts[huntIndex].ordersFvgFormationTime;
-
-      if(formationTime == 0)
-      {
-         const string prefix = V2HuntTradeCommentPrefix(sessionId);
-         for(int orderIndex = OrdersTotal() - 1; orderIndex >= 0; orderIndex--)
-         {
-            const ulong ticket = OrderGetTicket(orderIndex);
-            if(ticket == 0 || !OrderSelect(ticket))
-               continue;
-            const string comment = OrderGetString(ORDER_COMMENT);
-            if(StringFind(comment, prefix) != 0)
-               continue;
-            if(TryParseFormationTimeFromHuntOrderComment(comment, formationTime))
-               break;
-         }
-      }
-
-      if(formationTime == 0)
-         continue;
-
-      int barShift = 0;
-      if(!FvgFormationBarBeyondChartRange(formationTime, barShift))
-         continue;
-
-      CancelOurHuntPendingOrders(sessionId);
-      V2ClearHuntTradeOrdersActiveForSession(sessionId);
-      if(huntIndex >= 0)
-         V2LogHuntEvent(huntIndex, "HUNT_FVG_CHART_RANGE_CANCEL",
-                        StringFormat("FVG %s beyond chart range: shift=%d max=%d pend=%d",
-                                     IntegerToString((long)formationTime), barShift, maxShift,
-                                     pendingCount));
-      else
-         LogHuntEvent("HUNT_FVG_CHART_RANGE_CANCEL",
-                      StringFormat("HS%lld FVG %s beyond chart range: shift=%d max=%d pend=%d",
-                                   (long)sessionId, IntegerToString((long)formationTime),
-                                   barShift, maxShift, pendingCount));
-   }
-
-   V2RefreshGlobalHuntTradeWatchFromSessions();
-}
-
 //+------------------------------------------------------------------+
 //| Bull: bid > top+1% M2 chart rng â†’ BuyLimit @ top+1%; else market buy.          |
 //| Bear: ask < lowâˆ’1% M2 chart rng â†’ SellLimit @ lowâˆ’1%; else market sell.         |
 //+------------------------------------------------------------------+
 // Latest completed H4 same-dir leg (MTF SMC). TP = 0.9x / 1.4x / 1.9x from entry.
-//+------------------------------------------------------------------+
-int V4TradeLegDirectionForFvg(const bool isBullishFairValueGap)
+double M2PendingStopEntryPrice(const bool isBuy, const double referenceEntryPrice)
 {
-   return isBullishFairValueGap ? 1 : -1;
+   if(referenceEntryPrice <= 0.0)
+      return 0.0;
+
+   const double pointSize = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   if(pointSize <= 0.0)
+      return 0.0;
+
+   int offsetPoints = InputPendingStopEntryOffsetPoints;
+   if(offsetPoints < 1)
+      offsetPoints = 1;
+   else if(offsetPoints > 2)
+      offsetPoints = 2;
+
+   const double offsetPrice = (double)offsetPoints * pointSize;
+   double stopEntry = isBuy
+                      ? referenceEntryPrice + offsetPrice
+                      : referenceEntryPrice - offsetPrice;
+   stopEntry = NormalizeDouble(stopEntry, _Digits);
+
+   const int stopsLevelPoints = (int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+   const double minDistance   = (double)stopsLevelPoints * pointSize;
+   const double ask           = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   const double bid           = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+   if(isBuy)
+   {
+      const double minBuyStop = ask + minDistance;
+      if(stopEntry <= minBuyStop)
+         stopEntry = NormalizeDouble(minBuyStop + offsetPrice, _Digits);
+   }
+   else
+   {
+      const double maxSellStop = bid - minDistance;
+      if(stopEntry >= maxSellStop)
+         stopEntry = NormalizeDouble(maxSellStop - offsetPrice, _Digits);
+   }
+
+   return stopEntry;
 }
 
 //+------------------------------------------------------------------+
-bool ComputeAbsorptionLegTakeProfits(const bool isBullishFairValueGap, const double entryPrice,
-                                     const double legRange, double &outTakeProfitPrices[])
+double ResolveTradeEntryPriceForOrderType(const bool isBuy, const double referenceEntryPrice)
 {
-   ArrayResize(outTakeProfitPrices, LQ_TP_COUNT);
+   if(referenceEntryPrice <= 0.0)
+      return 0.0;
 
-   const double minDistance = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-   if(legRange <= minDistance)
-      return false;
-
-   const double tpMultipliers[3] = {0.9, 1.4, 1.9};
-
-   if(isBullishFairValueGap)
+   switch(InputTradeEntryOrderType)
    {
-      for(int tpIndex = 0; tpIndex < LQ_TP_COUNT; tpIndex++)
+      case TRADE_ENTRY_ORDER_MARKET:
       {
-         const double tpDistance = tpMultipliers[tpIndex] * legRange;
-         if(tpDistance <= minDistance)
-            return false;
-         outTakeProfitPrices[tpIndex] = NormalizeDouble(entryPrice + tpDistance, _Digits);
+         double marketPrice = isBuy ? SymbolInfoDouble(_Symbol, SYMBOL_ASK)
+                                    : SymbolInfoDouble(_Symbol, SYMBOL_BID);
+         if(marketPrice <= 0.0)
+            marketPrice = isBuy ? SymbolInfoDouble(_Symbol, SYMBOL_LAST)
+                                : SymbolInfoDouble(_Symbol, SYMBOL_LAST);
+         return (marketPrice > 0.0 ? NormalizeDouble(marketPrice, _Digits) : 0.0);
       }
-      return (outTakeProfitPrices[0] > entryPrice);
+      case TRADE_ENTRY_ORDER_STOP:
+         return M2PendingStopEntryPrice(isBuy, referenceEntryPrice);
+      case TRADE_ENTRY_ORDER_LIMIT:
+      default:
+         return NormalizeDouble(referenceEntryPrice, _Digits);
    }
-
-   for(int tpIndex = 0; tpIndex < LQ_TP_COUNT; tpIndex++)
-   {
-      const double tpDistance = tpMultipliers[tpIndex] * legRange;
-      if(tpDistance <= minDistance)
-         return false;
-      outTakeProfitPrices[tpIndex] = NormalizeDouble(entryPrice - tpDistance, _Digits);
-   }
-   return (outTakeProfitPrices[0] < entryPrice);
 }
 
 //+------------------------------------------------------------------+
-bool V4ResolveH4SameDirLegRangeForTp(const bool isBullishFairValueGap, double &outLegRange,
-                                      datetime &outLegEndTime)
+bool TradeEntryOrderTypeIsPending(const ENUM_TRADE_ENTRY_ORDER_TYPE orderType)
 {
-   outLegRange   = 0.0;
-   outLegEndTime = 0;
-
-   const int tradeLegDir = V4TradeLegDirectionForFvg(isBullishFairValueGap);
-
-   double legHigh = 0.0;
-   double legLow  = 0.0;
-   datetime legStart = 0;
-   if(!MtfTryNthCompletedSwingLeg(PERIOD_H4, tradeLegDir, 1, legHigh, legLow, legStart, outLegEndTime))
-      return false;
-
-   outLegRange = legHigh - legLow;
-   return (outLegRange > SymbolInfoDouble(_Symbol, SYMBOL_POINT));
+   return (orderType == TRADE_ENTRY_ORDER_LIMIT || orderType == TRADE_ENTRY_ORDER_STOP);
 }
 
 //+------------------------------------------------------------------+
-bool PlaceOneFvgTradeOrder(const bool isBullishFairValueGap, const bool useMarketOrder,
+bool ValidateTradeOrderEntryVsStop(const bool isBuy, const double orderEntry, const double stopLoss,
+                                    string &outReason)
+{
+   outReason = "";
+   if(orderEntry <= 0.0)
+   {
+      outReason = "order entry invalid";
+      return false;
+   }
+   if(isBuy && orderEntry <= stopLoss)
+   {
+      outReason = StringFormat("buy entry<=SL entry=%.5f sl=%.5f", orderEntry, stopLoss);
+      return false;
+   }
+   if(!isBuy && orderEntry >= stopLoss)
+   {
+      outReason = StringFormat("sell entry>=SL entry=%.5f sl=%.5f", orderEntry, stopLoss);
+      return false;
+   }
+   return true;
+}
+
+//+------------------------------------------------------------------+
+bool HasOurHuntPendingEntryOrders(const datetime huntSessionId)
+{
+   const string sessionPrefix =
+      (huntSessionId != 0 ? V2HuntTradeCommentPrefix(huntSessionId) : "");
+
+   for(int orderIndex = OrdersTotal() - 1; orderIndex >= 0; orderIndex--)
+   {
+      const ulong ticket = OrderGetTicket(orderIndex);
+      if(ticket == 0 || !OrderSelect(ticket))
+         continue;
+      if(OrderGetString(ORDER_SYMBOL) != _Symbol)
+         continue;
+      if((ulong)OrderGetInteger(ORDER_MAGIC) != LQ_EXPERT_MAGIC)
+         continue;
+
+      const ENUM_ORDER_STATE orderState = (ENUM_ORDER_STATE)OrderGetInteger(ORDER_STATE);
+      if(orderState != ORDER_STATE_PLACED && orderState != ORDER_STATE_PARTIAL)
+         continue;
+
+      const ENUM_ORDER_TYPE orderType = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+      if(orderType != ORDER_TYPE_BUY_LIMIT && orderType != ORDER_TYPE_SELL_LIMIT &&
+         orderType != ORDER_TYPE_BUY_STOP && orderType != ORDER_TYPE_SELL_STOP &&
+         orderType != ORDER_TYPE_BUY_STOP_LIMIT && orderType != ORDER_TYPE_SELL_STOP_LIMIT)
+         continue;
+
+      const string comment = OrderGetString(ORDER_COMMENT);
+      if(StringFind(comment, "LQ2_HS") != 0)
+         continue;
+      if(sessionPrefix != "" && StringFind(comment, sessionPrefix) != 0)
+         continue;
+
+      return true;
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+void ClearPendingEntryOrderExpiry()
+{
+   g_pendingEntryOrderExpiryDeadline = 0;
+   g_pendingEntryOrderExpirySessionId = 0;
+   if(g_pendingEntryOrderExpiryTimerOn && !HasOurHuntPendingEntryOrders(0))
+   {
+      EventKillTimer();
+      g_pendingEntryOrderExpiryTimerOn = false;
+   }
+}
+
+//+------------------------------------------------------------------+
+void ArmPendingEntryOrderExpiry(const datetime huntSessionId)
+{
+   if(InputPendingOrderExpirySeconds <= 0)
+      return;
+   if(!TradeEntryOrderTypeIsPending(InputTradeEntryOrderType))
+      return;
+
+   g_pendingEntryOrderExpiryDeadline  = TimeCurrent() + (datetime)InputPendingOrderExpirySeconds;
+   g_pendingEntryOrderExpirySessionId = huntSessionId;
+
+   if(!g_pendingEntryOrderExpiryTimerOn)
+   {
+      EventSetTimer(1);
+      g_pendingEntryOrderExpiryTimerOn = true;
+   }
+}
+
+//+------------------------------------------------------------------+
+void ProcessPendingEntryOrderExpiry()
+{
+   if(g_pendingEntryOrderExpiryDeadline == 0)
+      return;
+
+   if(TimeCurrent() < g_pendingEntryOrderExpiryDeadline)
+   {
+      if(!HasOurHuntPendingEntryOrders(g_pendingEntryOrderExpirySessionId))
+         ClearPendingEntryOrderExpiry();
+      return;
+   }
+
+   if(!HasOurHuntPendingEntryOrders(g_pendingEntryOrderExpirySessionId))
+   {
+      ClearPendingEntryOrderExpiry();
+      return;
+   }
+
+   CancelOurHuntPendingOrders(g_pendingEntryOrderExpirySessionId);
+   LogHuntEvent("PENDING_EXPIRE",
+                StringFormat("HS%lld cancelled unfilled pendings after %d sec orderType=%d",
+                             (long)g_pendingEntryOrderExpirySessionId,
+                             InputPendingOrderExpirySeconds,
+                             (int)InputTradeEntryOrderType));
+   ClearPendingEntryOrderExpiry();
+}
+
+//+------------------------------------------------------------------+
+void FinalizeTradePlacementBatch(const bool isBuy, const double orderEntry, const double tp1,
+                                  const double farthestTp, const datetime formationTime,
+                                  const datetime huntSessionId, const int placedCount)
+{
+   if(placedCount <= 0)
+      return;
+
+   if(TradeEntryOrderTypeIsPending(InputTradeEntryOrderType))
+      ArmPendingEntryOrderExpiry(huntSessionId);
+
+   RegisterHuntTradeAfterSuccessfulPlace(isBuy, orderEntry, tp1, farthestTp, formationTime,
+                                         huntSessionId);
+}
+
+//+------------------------------------------------------------------+
+bool PlaceOneFvgTradeOrder(const bool isBuy, const ENUM_TRADE_ENTRY_ORDER_TYPE orderType,
                            const double entryPrice, const double stopLossPrice, const double takeProfitPrice,
-                           const double volume, const string comment)
+                           const double volume, const string comment, const double setupScore)
 {
    if(volume <= 0.0)
    {
@@ -8507,44 +7224,61 @@ bool PlaceOneFvgTradeOrder(const bool isBullishFairValueGap, const bool useMarke
    ApplyTradeFillingModeFromSymbol();
 
    bool ok = false;
-   if(useMarketOrder)
+   switch(orderType)
    {
-      if(isBullishFairValueGap)
-         ok = g_trade.Buy(volume, _Symbol, 0.0, stopLossPrice, takeProfitPrice, comment);
-      else
-         ok = g_trade.Sell(volume, _Symbol, 0.0, stopLossPrice, takeProfitPrice, comment);
+      case TRADE_ENTRY_ORDER_MARKET:
+         if(isBuy)
+            ok = g_trade.Buy(volume, _Symbol, 0.0, stopLossPrice, takeProfitPrice, comment);
+         else
+            ok = g_trade.Sell(volume, _Symbol, 0.0, stopLossPrice, takeProfitPrice, comment);
+         break;
+
+      case TRADE_ENTRY_ORDER_STOP:
+         if(isBuy)
+            ok = g_trade.BuyStop(volume, entryPrice, _Symbol, stopLossPrice, takeProfitPrice,
+                                 ORDER_TIME_GTC, 0, comment);
+         else
+            ok = g_trade.SellStop(volume, entryPrice, _Symbol, stopLossPrice, takeProfitPrice,
+                                  ORDER_TIME_GTC, 0, comment);
+         break;
+
+      case TRADE_ENTRY_ORDER_LIMIT:
+      default:
+         if(isBuy)
+            ok = g_trade.BuyLimit(volume, entryPrice, _Symbol, stopLossPrice, takeProfitPrice,
+                                  ORDER_TIME_GTC, 0, comment);
+         else
+            ok = g_trade.SellLimit(volume, entryPrice, _Symbol, stopLossPrice, takeProfitPrice,
+                                   ORDER_TIME_GTC, 0, comment);
+         break;
    }
-   else if(isBullishFairValueGap)
-      ok = g_trade.BuyLimit(volume, entryPrice, _Symbol, stopLossPrice, takeProfitPrice,
-                            ORDER_TIME_GTC, 0, comment);
-   else
-      ok = g_trade.SellLimit(volume, entryPrice, _Symbol, stopLossPrice, takeProfitPrice,
-                             ORDER_TIME_GTC, 0, comment);
 
    if(!ok)
       LogHuntEvent("TRADE_ORDER_FAIL",
-                   StringFormat("%s ret=%d %s", comment,
+                   StringFormat("%s type=%d ret=%d %s", comment, (int)orderType,
                                 (int)g_trade.ResultRetcode(), g_trade.ResultRetcodeDescription()));
    else
       LogHuntEvent("TRADE_ORDER",
-                   StringFormat("setupScore=%.2f %s %s",
-                                CalculateSetupTradeScoreFromStopLoss(isBullishFairValueGap, stopLossPrice),
-                                isBullishFairValueGap ? "buy" : "sell", comment));
+                   StringFormat("type=%d setupScore=%.2f %s %s entry=%.5f",
+                                (int)orderType, setupScore,
+                                isBuy ? "buy" : "sell", comment, entryPrice));
    return ok;
 }
 
 //+------------------------------------------------------------------+
-bool PlaceOneFvgTradeOrderLimitThenMarket(const bool isBuy, const double entryPrice,
-                                           const double stopLossPrice, const double takeProfitPrice,
-                                           const double volume, const string comment)
+bool PlaceFvgTradeOrderForSetup(const bool isBuy, const double referenceEntryPrice,
+                                 const double stopLossPrice, const double takeProfitPrice,
+                                 const double volume, const string comment, const double setupScore)
 {
-   if(PlaceOneFvgTradeOrder(isBuy, false, entryPrice, stopLossPrice, takeProfitPrice, volume, comment))
-      return true;
+   const double entryPrice = ResolveTradeEntryPriceForOrderType(isBuy, referenceEntryPrice);
+   if(entryPrice <= 0.0)
+   {
+      LogHuntEvent("TRADE_ORDER_FAIL", StringFormat("%s entry resolve failed", comment));
+      return false;
+   }
 
-   LogHuntEvent("TRADE_LIMIT_FAIL",
-                StringFormat("%s ret=%d %s — retry market",
-                             comment, (int)g_trade.ResultRetcode(), g_trade.ResultRetcodeDescription()));
-   return PlaceOneFvgTradeOrder(isBuy, true, entryPrice, stopLossPrice, takeProfitPrice, volume, comment);
+   return PlaceOneFvgTradeOrder(isBuy, InputTradeEntryOrderType, entryPrice,
+                                stopLossPrice, takeProfitPrice, volume, comment, setupScore);
 }
 
 //+------------------------------------------------------------------+
@@ -8561,38 +7295,33 @@ double ComputeDoubleRiskTakeProfitPrice(const bool isBuy, const double entryPric
 }
 
 //+------------------------------------------------------------------+
-bool TryPlaceFvgTradeDoubleRiskAddonOrder(const bool isBuy, const bool useMarketOrder,
-                                           const double entryPrice, const double stopLossPrice,
+bool TryPlaceFvgTradeDoubleRiskAddonOrder(const bool isBuy, const double referenceEntryPrice,
+                                           const double stopLossPrice,
                                            const string huntCommentPrefix, const string formationTag,
                                            int &inOutPlacedCount, int &inOutZeroVolumeCount,
-                                           const double setupScore,
-                                           const bool tryLimitBeforeMarket = false)
+                                           const double setupScore)
 {
+   const double orderEntry =
+      ResolveTradeEntryPriceForOrderType(isBuy, referenceEntryPrice);
    const double takeProfit2R =
-      ComputeDoubleRiskTakeProfitPrice(isBuy, entryPrice, stopLossPrice);
+      ComputeDoubleRiskTakeProfitPrice(isBuy, orderEntry, stopLossPrice);
    if(takeProfit2R <= 0.0)
       return false;
 
-   if(!StopsDistanceAllowed(isBuy, entryPrice, stopLossPrice, takeProfit2R))
+   if(!StopsDistanceAllowed(isBuy, orderEntry, stopLossPrice, takeProfit2R))
       return false;
 
    const string comment2R = StringFormat("%sOV_2R_%s", huntCommentPrefix, formationTag);
    const double volume2R  =
-      GetOptimizedLotSize(entryPrice, stopLossPrice, setupScore, isBuy, 1.0);
+      GetOptimizedLotSize(orderEntry, stopLossPrice, setupScore, isBuy, 1.0);
    if(volume2R <= 0.0)
    {
       inOutZeroVolumeCount++;
       return false;
    }
 
-   if(tryLimitBeforeMarket)
-   {
-      if(!PlaceOneFvgTradeOrderLimitThenMarket(isBuy, entryPrice, stopLossPrice, takeProfit2R,
-                                               volume2R, comment2R))
-         return false;
-   }
-   else if(!PlaceOneFvgTradeOrder(isBuy, useMarketOrder, entryPrice, stopLossPrice, takeProfit2R,
-                                  volume2R, comment2R))
+   if(!PlaceFvgTradeOrderForSetup(isBuy, referenceEntryPrice, stopLossPrice, takeProfit2R,
+                                  volume2R, comment2R, setupScore))
       return false;
 
    inOutPlacedCount++;
@@ -8632,365 +7361,19 @@ bool IsFvgAutomatedTradingAllowed(string &outBlockReason)
    return true;
 }
 
-//+------------------------------------------------------------------+
-bool TryPlaceTouchVolumeBarTradeSetup(const int huntIndex, const bool isBuy,
-                                       const datetime maxVolBarOpenTime, const long maxVolume,
-                                       const datetime slWindowStartOpen,
-                                       const datetime huntSessionId)
-{
-   if(huntIndex < 0 || huntIndex >= V2_MAX_HUNT_SESSIONS || maxVolBarOpenTime == 0)
-   {
-      if(huntIndex >= 0 && huntIndex < V2_MAX_HUNT_SESSIONS)
-         V2LogHuntEvent(huntIndex, "TRADE_SKIP", "touch vol bar entry â€” maxVolBarOpenTime=0");
-      return false;
-   }
-
-   if(V2IsHuntSessionStillActive(huntSessionId))
-   {
-      V2LogHuntEvent(huntIndex, "TRADE_SKIP", "hunt still ON â€” orders after touch");
-      return false;
-   }
-
-   string bosBiasBlockReason = "";
-   if(!FvgTradeAllowedByH4BosBias(isBuy, bosBiasBlockReason))
-   {
-      V2LogHuntEvent(huntIndex, "TRADE_SKIP", bosBiasBlockReason);
-      return false;
-   }
-
-   bool replacePendingOnly = false;
-   if(!ResolveHuntFvgOrderPlacementGate(maxVolBarOpenTime, huntSessionId, replacePendingOnly))
-      return false;
-
-   const int barShift = iBarShift(_Symbol, InputM2NarrativeTimeframe, maxVolBarOpenTime, true);
-   if(barShift < 0 || barShift > LQ_FVG_TRADE_MAX_M2_BAR_SHIFT)
-   {
-      V2LogHuntEvent(huntIndex, "TRADE_SKIP",
-                     StringFormat("touch vol bar too old shift=%d max=%d", barShift,
-                                  LQ_FVG_TRADE_MAX_M2_BAR_SHIFT));
-      return false;
-   }
-
-   if(barShift < 0)
-   {
-      V2LogHuntEvent(huntIndex, "TRADE_SKIP", "touch vol bar shift invalid");
-      return false;
-   }
-
-   bool   useMarketOrder = false;
-   double entryPrice     = 0.0;
-   double stopLossOverall = 0.0;
-   string entryFailReason = "";
-   if(!ResolveTouchLegVolumeBarEntryAndSl(isBuy, barShift, slWindowStartOpen, huntIndex,
-                                          useMarketOrder, entryPrice, stopLossOverall,
-                                          entryFailReason))
-   {
-      V2LogHuntEvent(huntIndex, "TRADE_SKIP",
-                     StringFormat("touch vol bar entry/SL invalid sh=%d entry=%.5f sl=%.5f buy=%s â€” %s",
-                                  barShift, entryPrice, stopLossOverall, isBuy ? "Y" : "N",
-                                  entryFailReason));
-      return false;
-   }
-
-   double normalizedEntry = NormalizeDouble(entryPrice, _Digits);
-   const double setupScore = CalculateSetupTradeScoreFromStopLoss(isBuy, stopLossOverall);
-   if(!SetupScoreAllowsTradeEntry(setupScore))
-   {
-      V2LogHuntEvent(huntIndex, "TRADE_SKIP",
-                     StringFormat("setupScore=%.2f < min %.2f", setupScore, InputMinScore));
-      return false;
-   }
-
-   const datetime formationTime = maxVolBarOpenTime;
-   double takeProfitPrices[];
-   int    takeProfitCount = 0;
-   if(!BuildTradeSwingGroupTakeProfits(isBuy, formationTime, normalizedEntry,
-                                       stopLossOverall, takeProfitPrices, takeProfitCount))
-   {
-      V2LogHuntEvent(huntIndex, "TRADE_SKIP",
-                     StringFormat("no swing-group TP with min R:R %.2f entry=%.5f sl=%.5f",
-                                  InputTradeSwingTpMinRewardToRisk, normalizedEntry, stopLossOverall));
-      return false;
-   }
-
-   for(int tpIndex = 0; tpIndex < takeProfitCount; tpIndex++)
-   {
-      if(!StopsDistanceAllowed(isBuy, normalizedEntry, stopLossOverall, takeProfitPrices[tpIndex]))
-      {
-         V2LogHuntEvent(huntIndex, "TRADE_SKIP",
-                          StringFormat("broker stops level tp=%d", tpIndex + 1));
-         return false;
-      }
-   }
-
-   if(InputBaseRiskPercent <= 0.0)
-   {
-      V2LogHuntEvent(huntIndex, "TRADE_SKIP", "InputBaseRiskPercent invalid");
-      return false;
-   }
-
-   const double tpRiskWeights[3] = {3.0, 1.0, 1.0};
-   const double riskTotalParts  = tpRiskWeights[0] + tpRiskWeights[1] + tpRiskWeights[2];
-
-   const string huntCommentPrefix = V2HuntTradeCommentPrefix(huntSessionId);
-   const string formationTag      = IntegerToString((long)formationTime);
-   int          placedCount       = 0;
-   int          zeroVolumeCount   = 0;
-
-   string tpLog = StringFormat("%.5f", takeProfitPrices[0]);
-   for(int tpLogIndex = 1; tpLogIndex < takeProfitCount; tpLogIndex++)
-      tpLog += StringFormat("/%.5f", takeProfitPrices[tpLogIndex]);
-
-   double slRefExtreme  = 0.0;
-   int    slRefBarShift = barShift;
-   double   slLegLow  = 0.0;
-   double   slLegHigh = 0.0;
-   datetime slLegStart = 0;
-   datetime slLegEnd   = 0;
-   if(V2TryGetOppositeM2LegExtentsForTouch(huntIndex, slLegLow, slLegHigh, slLegStart, slLegEnd))
-   {
-      datetime slScanStart = slWindowStartOpen;
-      if(slLegStart > 0 && (slScanStart == 0 || slLegStart < slScanStart))
-         slScanStart = slLegStart;
-      const double legFloor = isBuy ? slLegLow : slLegHigh;
-      M2TouchVolSlReferenceExtreme(isBuy, barShift, slScanStart, legFloor, slRefExtreme, slRefBarShift);
-   }
-   else
-      M2TouchVolSlReferenceExtreme(isBuy, barShift, slWindowStartOpen, 0.0, slRefExtreme, slRefBarShift);
-   const double volBarLow  = iLow(_Symbol, InputM2NarrativeTimeframe, barShift);
-   const double volBarHigh = iHigh(_Symbol, InputM2NarrativeTimeframe, barShift);
-   const double entryOff   = M2TouchVolEntryOffsetPrice(barShift);
-   const double bufferPrice = M2TouchVolSlBufferPrice(barShift);
-   const double limitRef   = M2TouchVolLimitEntryPrice(isBuy, barShift, volBarLow, volBarHigh);
-   const string logDetail = StringFormat(
-      "%s entry=%.5f sl=%.5f (volBar sh=%d vol=%lld barL=%.5f barH=%.5f limitRef=%.5f off=%.5f anchor=%s slWin=%s slRef sh=%d %s=%.5f buf=%.5f) swingTP=%s count=%d limit=Y",
-      isBuy ? "buyHunt" : "sellHunt", normalizedEntry, stopLossOverall, barShift, (long)maxVolume,
-      volBarLow, volBarHigh, limitRef, entryOff, isBuy ? "low+N%rng" : "high-N%rng",
-      TimeToString(slWindowStartOpen, TIME_DATE | TIME_MINUTES), slRefBarShift,
-      isBuy ? "low" : "high", slRefExtreme, bufferPrice,
-      tpLog, takeProfitCount);
-
-   string tradeBlockReason = "";
-   if(!IsFvgAutomatedTradingAllowed(tradeBlockReason))
-   {
-      LogHuntEvent("TRADE_PLAN", logDetail + " | " + tradeBlockReason);
-      return false;
-   }
-
-   for(int tpIndex = 0; tpIndex < takeProfitCount; tpIndex++)
-   {
-      const string commentOv =
-         StringFormat("%sOV_TP%d_%s", huntCommentPrefix, tpIndex + 1, formationTag);
-      const double riskFraction = tpRiskWeights[tpIndex] / riskTotalParts;
-      const double volumeOv =
-         GetOptimizedLotSize(normalizedEntry, stopLossOverall, setupScore, isBuy, riskFraction);
-      if(volumeOv <= 0.0)
-         zeroVolumeCount++;
-      else if(PlaceOneFvgTradeOrder(isBuy, useMarketOrder, normalizedEntry,
-                                    stopLossOverall, takeProfitPrices[tpIndex], volumeOv, commentOv))
-         placedCount++;
-   }
-
-   TryPlaceFvgTradeDoubleRiskAddonOrder(isBuy, useMarketOrder, normalizedEntry, stopLossOverall,
-                                         huntCommentPrefix, formationTag, placedCount,
-                                         zeroVolumeCount, setupScore);
-
-   const int orderTargetCount = takeProfitCount + 1;
-   if(placedCount > 0)
-   {
-      const double farthestTp = takeProfitPrices[takeProfitCount - 1];
-      RegisterHuntTradeAfterSuccessfulPlace(isBuy, normalizedEntry, takeProfitPrices[0],
-                                            farthestTp, formationTime, huntSessionId);
-      LogHuntEvent("TRADE_PLACE",
-                   StringFormat("%s touchVol placed=%d/%d replace=%s %s", formationTag, placedCount,
-                                orderTargetCount, replacePendingOnly ? "Y" : "N", logDetail));
-      return true;
-   }
-
-   V2LogHuntEvent(huntIndex, "TRADE_FAIL",
-                  StringFormat("%s touchVol zeroVol=%d %s", formationTag, zeroVolumeCount, logDetail));
-   return false;
-}
-
-//+------------------------------------------------------------------+
-bool TryPlaceOppositeFvgTradeSetup(const bool isBullishFairValueGap, const double zoneLowPrice,
-                                    const double zoneHighPrice, const datetime formationTime,
-                                    const datetime huntSessionId, const double h4LegRange)
-{
-   const int huntIndex = V2FindHuntSlotBySessionId(huntSessionId);
-   if(formationTime == 0)
-   {
-      V2LogHuntEvent(huntIndex, "TRADE_SKIP", "formationTime=0");
-      return false;
-   }
-
-   if(V2IsHuntSessionStillActive(huntSessionId))
-   {
-      V2LogHuntEvent(huntIndex, "TRADE_SKIP", "hunt still ON â€” orders after touch");
-      return false;
-   }
-
-   string bosBiasBlockReason = "";
-   if(!FvgTradeAllowedByH4BosBias(isBullishFairValueGap, bosBiasBlockReason))
-   {
-      V2LogHuntEvent(huntIndex, "TRADE_SKIP", bosBiasBlockReason);
-      return false;
-   }
-
-   bool replacePendingOnly = false;
-   if(!ResolveHuntFvgOrderPlacementGate(formationTime, huntSessionId, replacePendingOnly))
-      return false;
-
-   const int formationShift = iBarShift(_Symbol, InputM2NarrativeTimeframe, formationTime, true);
-   if(formationShift < 0 || formationShift > LQ_FVG_TRADE_MAX_M2_BAR_SHIFT)
-   {
-      V2LogHuntEvent(huntIndex, "TRADE_SKIP",
-                     StringFormat("FVG too old shift=%d max=%d", formationShift,
-                                  LQ_FVG_TRADE_MAX_M2_BAR_SHIFT));
-      return false;
-   }
-
-   if(!FvgFormationBarMeetsMinTickVolume(formationShift))
-      return false;
-
-   // Middle bar of the 3-bar FVG pattern (The displacement candle that created the gap)
-   const int entryBarShift = formationShift + 1; 
-   if(entryBarShift >= iBars(_Symbol, InputM2NarrativeTimeframe))
-   {
-      V2LogHuntEvent(huntIndex, "TRADE_SKIP", "FVG middle pattern bar unavailable");
-      return false;
-   }
-
-   bool   useMarketOrder  = false;
-   double entryPrice      = 0.0;
-   double stopLossOverall = 0.0;
-   string entryFailReason = "";
-
-   // Rely entirely on the unified TouchVol offset logic (3.0% offset, 2.0% SL buffer)
-   if(!ResolveTouchLegVolumeBarEntryAndSl(isBullishFairValueGap, entryBarShift, 0, huntIndex,
-                                          useMarketOrder, entryPrice, stopLossOverall,
-                                          entryFailReason))
-   {
-      V2LogHuntEvent(huntIndex, "TRADE_SKIP",
-                     StringFormat("FVG entry/SL via TouchVol invalid sh=%d buy=%s â€” %s",
-                                  entryBarShift, isBullishFairValueGap ? "Y" : "N",
-                                  entryFailReason));
-      return false;
-   }
-
-   double normalizedEntry = NormalizeDouble(entryPrice, _Digits);
-   const bool isBuy       = isBullishFairValueGap;
-   const double setupScore = CalculateSetupTradeScoreFromStopLoss(isBuy, stopLossOverall);
-   if(!SetupScoreAllowsTradeEntry(setupScore))
-   {
-      V2LogHuntEvent(huntIndex, "TRADE_SKIP",
-                     StringFormat("setupScore=%.2f < min %.2f", setupScore, InputMinScore));
-      return false;
-   }
-
-   double takeProfitPrices[];
-   int    takeProfitCount = 0;
-   if(!BuildTradeSwingGroupTakeProfits(isBuy, formationTime, normalizedEntry,
-                                       stopLossOverall, takeProfitPrices, takeProfitCount))
-   {
-      V2LogHuntEvent(huntIndex, "TRADE_SKIP",
-                     StringFormat("no swing-group TP with min R:R %.2f entry=%.5f sl=%.5f",
-                                  InputTradeSwingTpMinRewardToRisk, normalizedEntry, stopLossOverall));
-      return false;
-   }
-
-   for(int tpIndex = 0; tpIndex < takeProfitCount; tpIndex++)
-   {
-      if(!StopsDistanceAllowed(isBuy, normalizedEntry, stopLossOverall, takeProfitPrices[tpIndex]))
-      {
-         V2LogHuntEvent(huntIndex, "TRADE_SKIP",
-                          StringFormat("broker stops level tp=%d", tpIndex + 1));
-         return false;
-      }
-   }
-
-   if(InputBaseRiskPercent <= 0.0)
-   {
-      V2LogHuntEvent(huntIndex, "TRADE_SKIP", "InputBaseRiskPercent invalid");
-      return false;
-   }
-
-   const double tpRiskWeights[3] = {3.0, 1.0, 1.0};
-   const double riskTotalParts   = tpRiskWeights[0] + tpRiskWeights[1] + tpRiskWeights[2];
-
-   const string huntCommentPrefix = V2HuntTradeCommentPrefix(huntSessionId);
-   const string formationTag      = IntegerToString((long)formationTime);
-   int          placedCount       = 0;
-   int          zeroVolumeCount   = 0;
-
-   string tpLog = StringFormat("%.5f", takeProfitPrices[0]);
-   for(int tpLogIndex = 1; tpLogIndex < takeProfitCount; tpLogIndex++)
-      tpLog += StringFormat("/%.5f", takeProfitPrices[tpLogIndex]);
-
-   const string logDetail = StringFormat(
-      "%s entry=%.5f sl=%.5f (FVG 1st-bar sh=%d offset=%.1f%%) swingTP=%s count=%d",
-      isBuy ? "bull" : "bear", normalizedEntry, stopLossOverall, entryBarShift,
-      InputTouchVolEntryOffsetPercentChart, tpLog, takeProfitCount);
-
-   string tradeBlockReason = "";
-   if(!IsFvgAutomatedTradingAllowed(tradeBlockReason))
-   {
-      LogHuntEvent("TRADE_PLAN", logDetail + " | " + tradeBlockReason);
-      return false;
-   }
-
-   for(int tpIndex = 0; tpIndex < takeProfitCount; tpIndex++)
-   {
-      const string commentOv =
-         StringFormat("%sOV_TP%d_%s", huntCommentPrefix, tpIndex + 1, formationTag);
-      const double riskFraction = tpRiskWeights[tpIndex] / riskTotalParts;
-      const double volumeOv =
-         GetOptimizedLotSize(normalizedEntry, stopLossOverall, setupScore, isBuy, riskFraction);
-      if(volumeOv <= 0.0)
-         zeroVolumeCount++;
-      else if(PlaceOneFvgTradeOrder(isBuy, useMarketOrder, normalizedEntry,
-                                    stopLossOverall, takeProfitPrices[tpIndex], volumeOv, commentOv))
-         placedCount++;
-   }
-
-   TryPlaceFvgTradeDoubleRiskAddonOrder(isBuy, useMarketOrder, normalizedEntry, stopLossOverall,
-                                         huntCommentPrefix, formationTag, placedCount,
-                                         zeroVolumeCount, setupScore);
-
-   const int orderTargetCount = takeProfitCount + 1;
-   if(placedCount > 0)
-   {
-      const double farthestTp = takeProfitPrices[takeProfitCount - 1];
-      RegisterHuntTradeAfterSuccessfulPlace(isBuy, normalizedEntry, takeProfitPrices[0],
-                                            farthestTp, formationTime, huntSessionId);
-      LogHuntEvent("TRADE_PLACE",
-                   StringFormat("%s placed=%d/%d replace=%s %s", formationTag, placedCount,
-                                orderTargetCount, replacePendingOnly ? "Y" : "N", logDetail));
-      return true;
-   }
-
-   V2LogHuntEvent(huntIndex, "TRADE_FAIL",
-                  StringFormat("%s zeroVol=%d %s", formationTag, zeroVolumeCount, logDetail));
-   return false;
-}
-
-//+------------------------------------------------------------------+
 bool TryPlaceEngulfAbsorptionTradeSetup(const int huntIndex, const bool isBuy,
                                          const double entryPrice, const double stopLossPrice,
                                          const datetime signalBarOpenTime,
                                          const datetime huntSessionId,
                                          const double setupScore)
 {
+   if(ScoreLogWriteModeSkipsTrading())
+      return false;
+
    if(signalBarOpenTime == 0)
       return false;
    if(huntIndex >= V2_MAX_HUNT_SESSIONS)
       return false;
-
-   if(huntIndex >= 0 && V2IsHuntSessionStillActive(huntSessionId))
-   {
-      V2LogHuntEvent(huntIndex, "TRADE_SKIP", "hunt still ON — orders after engulf signal");
-      return false;
-   }
 
    if(!SetupScoreAllowsTradeEntry(setupScore))
    {
@@ -9011,27 +7394,37 @@ bool TryPlaceEngulfAbsorptionTradeSetup(const int huntIndex, const bool isBuy,
       return false;
 
    const double normalizedEntry = NormalizeDouble(entryPrice, _Digits);
+   const double referenceEntry  = normalizedEntry;
    double stopLoss = NormalizeDouble(stopLossPrice, _Digits);
-   if(!ApplyTouchVolMinimumSlDistance(isBuy, normalizedEntry, stopLoss))
+   if(!ApplyTouchVolMinimumSlDistance(isBuy, referenceEntry, stopLoss))
    {
       V2LogHuntEvent(huntIndex, "TRADE_SKIP", "engulf SL distance invalid");
       return false;
    }
 
+   const double orderEntry =
+      ResolveTradeEntryPriceForOrderType(isBuy, referenceEntry);
+   string entrySideReason = "";
+   if(!ValidateTradeOrderEntryVsStop(isBuy, orderEntry, stopLoss, entrySideReason))
+   {
+      V2LogHuntEvent(huntIndex, "TRADE_SKIP", entrySideReason);
+      return false;
+   }
+
    double takeProfitPrices[];
    int    takeProfitCount = 0;
-   if(!BuildTradeSwingGroupTakeProfits(isBuy, signalBarOpenTime, normalizedEntry,
+   if(!BuildTradeSwingGroupTakeProfits(isBuy, signalBarOpenTime, orderEntry,
                                        stopLoss, takeProfitPrices, takeProfitCount))
    {
       V2LogHuntEvent(huntIndex, "TRADE_SKIP",
                      StringFormat("no swing-group TP with min R:R %.2f entry=%.5f sl=%.5f",
-                                  InputTradeSwingTpMinRewardToRisk, normalizedEntry, stopLoss));
+                                  InputTradeSwingTpMinRewardToRisk, orderEntry, stopLoss));
       return false;
    }
 
    for(int tpIndex = 0; tpIndex < takeProfitCount; tpIndex++)
    {
-      if(!StopsDistanceAllowed(isBuy, normalizedEntry, stopLoss, takeProfitPrices[tpIndex]))
+      if(!StopsDistanceAllowed(isBuy, orderEntry, stopLoss, takeProfitPrices[tpIndex]))
       {
          V2LogHuntEvent(huntIndex, "TRADE_SKIP",
                           StringFormat("broker stops level tp=%d", tpIndex + 1));
@@ -9050,8 +7443,9 @@ bool TryPlaceEngulfAbsorptionTradeSetup(const int huntIndex, const bool isBuy,
    const string huntCommentPrefix = V2HuntTradeCommentPrefix(huntSessionId);
    const string formationTag      = TimeToString(signalBarOpenTime, TIME_DATE | TIME_MINUTES);
    const string logDetail =
-      StringFormat("buy=%s entry=%.5f sl=%.5f signal=%s score=%.2f",
-                   isBuy ? "Y" : "N", normalizedEntry, stopLoss, formationTag, setupScore);
+      StringFormat("buy=%s ref=%.5f orderEntry=%.5f sl=%.5f type=%d signal=%s score=%.2f",
+                   isBuy ? "Y" : "N", referenceEntry, orderEntry, stopLoss,
+                   (int)InputTradeEntryOrderType, formationTag, setupScore);
 
    string tradeBlockReason = "";
    if(!IsFvgAutomatedTradingAllowed(tradeBlockReason))
@@ -9069,25 +7463,25 @@ bool TryPlaceEngulfAbsorptionTradeSetup(const int huntIndex, const bool isBuy,
          StringFormat("%sOV_TP%d_%s", huntCommentPrefix, tpIndex + 1, formationTag);
       const double riskFraction = tpRiskWeights[tpIndex] / riskTotalParts;
       const double volumeOv =
-         GetOptimizedLotSize(normalizedEntry, stopLoss, setupScore, isBuy, riskFraction);
+         GetOptimizedLotSize(orderEntry, stopLoss, setupScore, isBuy, riskFraction);
       if(volumeOv <= 0.0)
          zeroVolumeCount++;
-      else if(PlaceOneFvgTradeOrderLimitThenMarket(isBuy, normalizedEntry,
-                                                   stopLoss, takeProfitPrices[tpIndex], volumeOv,
-                                                   commentOv))
+      else if(PlaceFvgTradeOrderForSetup(isBuy, referenceEntry,
+                                         stopLoss, takeProfitPrices[tpIndex], volumeOv,
+                                         commentOv, setupScore))
          placedCount++;
    }
 
-   TryPlaceFvgTradeDoubleRiskAddonOrder(isBuy, false, normalizedEntry, stopLoss,
+   TryPlaceFvgTradeDoubleRiskAddonOrder(isBuy, referenceEntry, stopLoss,
                                          huntCommentPrefix, formationTag, placedCount,
-                                         zeroVolumeCount, setupScore, true);
+                                         zeroVolumeCount, setupScore);
 
    const int orderTargetCount = takeProfitCount + 1;
    if(placedCount > 0)
    {
       const double farthestTp = takeProfitPrices[takeProfitCount - 1];
-      RegisterHuntTradeAfterSuccessfulPlace(isBuy, normalizedEntry, takeProfitPrices[0],
-                                            farthestTp, signalBarOpenTime, huntSessionId);
+      FinalizeTradePlacementBatch(isBuy, orderEntry, takeProfitPrices[0],
+                                  farthestTp, signalBarOpenTime, huntSessionId, placedCount);
       LogHuntEvent("TRADE_PLACE",
                    StringFormat("ENG_%s placed=%d/%d %s", formationTag, placedCount,
                                 orderTargetCount, logDetail));
@@ -9124,20 +7518,6 @@ void V2InitHuntSlot(const int huntIndex)
 }
 
 //+------------------------------------------------------------------+
-void V2ResetHuntSlotSessionCounters(const int huntIndex)
-{
-   if(huntIndex < 0 || huntIndex >= V2_MAX_HUNT_SESSIONS)
-      return;
-   g_v2Hunts[huntIndex].lastEngulfPairExtremeChecked = 0.0;
-   g_v2Hunts[huntIndex].tradeOrdersActive     = false;
-   g_v2Hunts[huntIndex].ordersFvgFormationTime = 0;
-   g_v2Hunts[huntIndex].tradeIsBuy            = false;
-   g_v2Hunts[huntIndex].tradeEntryPrice       = 0.0;
-   g_v2Hunts[huntIndex].tradeTp1Price         = 0.0;
-   g_v2Hunts[huntIndex].preEntryCancelTpLevel = 0.0;
-   g_v2Hunts[huntIndex].firstOppBosMgmtDone     = false;
-}
-
 //+------------------------------------------------------------------+
 void V2InitAllHuntSlots()
 {
@@ -9145,77 +7525,6 @@ void V2InitAllHuntSlots()
       V2InitHuntSlot(i);
 }
 
-//+------------------------------------------------------------------+
-int V2CountActiveHunts()
-{
-   int count = 0;
-   for(int i = 0; i < V2_MAX_HUNT_SESSIONS; i++)
-      if(g_v2Hunts[i].active)
-         count++;
-   return count;
-}
-
-//+------------------------------------------------------------------+
-int V2AllocHuntSlot()
-{
-   for(int i = 0; i < V2_MAX_HUNT_SESSIONS; i++)
-   {
-      if(g_v2Hunts[i].active)
-         continue;
-      if(g_v2Hunts[i].sessionId != 0 &&
-         V2HuntHasPendingOrdersForSession(g_v2Hunts[i].sessionId))
-         continue;
-      return i;
-   }
-
-   LogHuntEvent("HUNT_ARRAY_FULL",
-                StringFormat("max=%d slots; all reserved (active, deferred M2 leg, or pending orders)",
-                             V2_MAX_HUNT_SESSIONS));
-   return -1;
-}
-
-//+------------------------------------------------------------------+
-int V2FindActiveHuntByH4Leg(const datetime legEndTime, const bool h4HighBreached)
-{
-   if(legEndTime == 0)
-      return -1;
-   for(int i = 0; i < V2_MAX_HUNT_SESSIONS; i++)
-   {
-      if(!g_v2Hunts[i].active)
-         continue;
-      if(g_v2Hunts[i].h4BreachedLegEndTime == legEndTime &&
-         g_v2Hunts[i].h4HighWasBreached == h4HighBreached)
-         return i;
-   }
-   return -1;
-}
-
-//+------------------------------------------------------------------+
-int V2FindActiveHuntByBreachPolarity(const bool h4HighBreached)
-{
-   for(int i = 0; i < V2_MAX_HUNT_SESSIONS; i++)
-   {
-      if(g_v2Hunts[i].active && g_v2Hunts[i].h4HighWasBreached == h4HighBreached)
-         return i;
-   }
-   return -1;
-}
-
-//+------------------------------------------------------------------+
-void V2AbortHuntSessionForRestart(const int huntIndex)
-{
-   if(huntIndex < 0 || huntIndex >= V2_MAX_HUNT_SESSIONS || !g_v2Hunts[huntIndex].active)
-      return;
-
-   const datetime sessionId = g_v2Hunts[huntIndex].sessionId;
-   if(sessionId != 0 && g_huntTradeSessionCommentPrefix == V2HuntTradeCommentPrefix(sessionId))
-      ResetHuntTradeState();
-
-   V2ClearImpulseBufferZone(huntIndex);
-   V2InitHuntSlot(huntIndex);
-}
-
-//+------------------------------------------------------------------+
 int V2FindHuntSlotBySessionId(const datetime sessionId)
 {
    if(sessionId == 0)
@@ -9234,31 +7543,6 @@ string V2HuntObjectSuffix(const datetime sessionId)
    return IntegerToString((long)sessionId) + "_";
 }
 
-//+------------------------------------------------------------------+
-string V2FvgRectPrefixForSession(const datetime sessionId)
-{
-   return LQ_OBJ_PREFIX_FVG_RECT + V2HuntObjectSuffix(sessionId);
-}
-
-//+------------------------------------------------------------------+
-string V2TouchObjectName(const datetime sessionId)
-{
-   return LQ_OBJ_TOUCH_POINT + V2HuntObjectSuffix(sessionId);
-}
-
-//+------------------------------------------------------------------+
-string V2ImpulseObjectName(const datetime sessionId)
-{
-   return LQ_OBJ_IMPULSE_PREFIX + V2HuntObjectSuffix(sessionId);
-}
-
-//+------------------------------------------------------------------+
-string V2TouchRecalcBufferObjectName(const datetime sessionId)
-{
-   return LQ_OBJ_TOUCH_RECALC_PREFIX + V2HuntObjectSuffix(sessionId);
-}
-
-//+------------------------------------------------------------------+
 void V2LogHuntEvent(const int huntIndex, const string eventName, const string detail = "")
 {
    if(!H4LqLoggingEnabled())
@@ -9275,328 +7559,15 @@ void V2LogHuntEvent(const int huntIndex, const string eventName, const string de
 }
 
 //+------------------------------------------------------------------+
-int V2OppositeM2LegDirectionForHunt(const int huntIndex)
-{
-   return g_v2Hunts[huntIndex].h4HighWasBreached ? -1 : 1;
-}
-
 //+------------------------------------------------------------------+
 //| H4 up-leg breach â†’ bull FVG; H4 down-leg breach â†’ bear FVG.       |
-//+------------------------------------------------------------------+
-bool V2HuntExpectsBullishFvg(const int huntIndex)
-{
-   return g_v2Hunts[huntIndex].h4HighWasBreached;
-}
-
-//+------------------------------------------------------------------+
-bool V2FvgPolarityMatchesHunt(const int huntIndex, const bool isBullishFairValueGap)
-{
-   return isBullishFairValueGap == V2HuntExpectsBullishFvg(huntIndex);
-}
-
-//+------------------------------------------------------------------+
-bool V2TryGetOppositeM2LegExtentsForTouch(const int huntIndex, double &outLegLow, double &outLegHigh,
-                                           datetime &outLegStartTime, datetime &outLegEndTime)
-{
-   outLegLow  = 0.0;
-   outLegHigh = 0.0;
-   outLegStartTime = 0;
-   outLegEndTime   = 0;
-
-   const int oppositeDir = V2OppositeM2LegDirectionForHunt(huntIndex);
-   datetime compStart = 0;
-   datetime compEnd   = 0;
-   double compLow  = 0.0;
-   double compHigh = 0.0;
-   const bool haveCompleted =
-      V2TryGetLastCompletedM2Leg(oppositeDir, compLow, compHigh, compStart, compEnd);
-
-   if(g_m2Swing.currentSwingLeg.swingDirection == oppositeDir)
-   {
-      outLegStartTime = g_m2Swing.currentSwingLeg.legStartTime;
-      outLegEndTime   = 0;
-      if(!haveCompleted)
-      {
-         outLegLow  = g_m2Swing.currentSwingLeg.legLowPrice;
-         outLegHigh = g_m2Swing.currentSwingLeg.legHighPrice;
-         return (outLegLow > 0.0 && outLegHigh > 0.0);
-      }
-      outLegLow  = MathMin(compLow, g_m2Swing.currentSwingLeg.legLowPrice);
-      outLegHigh = MathMax(compHigh, g_m2Swing.currentSwingLeg.legHighPrice);
-      if(compStart > 0 && (outLegStartTime == 0 || compStart < outLegStartTime))
-         outLegStartTime = compStart;
-      return true;
-   }
-
-   if(haveCompleted)
-   {
-      outLegLow         = compLow;
-      outLegHigh        = compHigh;
-      outLegStartTime   = compStart;
-      outLegEndTime     = compEnd;
-   }
-   return haveCompleted;
-}
-
-//+------------------------------------------------------------------+
 //| Touch recalc: active opposite M2 leg while open; else last completed opposite. |
 //+------------------------------------------------------------------+
-bool V2TryGetOppositeM2LegExtentsForTouchRecalc(const int huntIndex, double &outLegLow, double &outLegHigh,
-                                                 datetime &outLegStartTime, datetime &outLegEndTime)
-{
-   outLegLow  = 0.0;
-   outLegHigh = 0.0;
-   outLegStartTime = 0;
-   outLegEndTime   = 0;
-
-   const int oppositeDir = V2OppositeM2LegDirectionForHunt(huntIndex);
-   if(g_m2Swing.currentSwingLeg.swingDirection == oppositeDir)
-   {
-      outLegLow         = g_m2Swing.currentSwingLeg.legLowPrice;
-      outLegHigh        = g_m2Swing.currentSwingLeg.legHighPrice;
-      outLegStartTime   = g_m2Swing.currentSwingLeg.legStartTime;
-      outLegEndTime     = 0;
-      return (outLegLow > 0.0 && outLegHigh > 0.0);
-   }
-
-   return V2TryGetLastCompletedM2Leg(oppositeDir, outLegLow, outLegHigh, outLegStartTime, outLegEndTime);
-}
-
 //+------------------------------------------------------------------+
 //| Same-dir extreme tracked while hunt is ON (path max high / min low). |
-//+------------------------------------------------------------------+
-bool V2GetSameDirExtremeWhileHuntOn(const int huntIndex, double &outExtreme)
-{
-   outExtreme = 0.0;
-   if(!g_v2Hunts[huntIndex].active)
-      return false;
-
-   if(g_v2Hunts[huntIndex].h4HighWasBreached)
-   {
-      outExtreme = g_v2Hunts[huntIndex].pathMaxHighSinceH4Breach;
-      return (outExtreme > 0.0);
-   }
-
-   outExtreme = g_v2Hunts[huntIndex].pathMinLowSinceH4Breach;
-   return (outExtreme > 0.0);
-}
-
-//+------------------------------------------------------------------+
-void V2EndOppositeFvgHuntSession(const int huntIndex, const string offReason,
-                                  const bool tryPlaceTradeAfterOff)
-{
-   if(huntIndex < 0 || huntIndex >= V2_MAX_HUNT_SESSIONS || !g_v2Hunts[huntIndex].active)
-      return;
-
-   const string reason = (StringLen(offReason) > 0 ? offReason : "unspecified");
-   V2LogHuntEvent(huntIndex, "HUNT_OFF",
-                  StringFormat("%s | HS%lld hunt=%s",
-                               reason,
-                               (long)g_v2Hunts[huntIndex].sessionId,
-                               g_v2Hunts[huntIndex].h4HighWasBreached ? "bull/buy" : "bear/sell"));
-
-   g_v2Hunts[huntIndex].active = false;
-   V2ClearImpulseBufferZone(huntIndex);
-   if(tryPlaceTradeAfterOff)
-      V2TryPlacePendingFvgTradesAfterHuntOff(huntIndex);
-}
-
-//+------------------------------------------------------------------+
-void V2ClearImpulseBufferZone(const int huntIndex)
-{
-   if(huntIndex < 0 || huntIndex >= V2_MAX_HUNT_SESSIONS)
-      return;
-   if(g_v2Hunts[huntIndex].sessionId != 0)
-      ObjectDelete(0, V2ImpulseObjectName(g_v2Hunts[huntIndex].sessionId));
-}
-
-//+------------------------------------------------------------------+
-void V2UpdateImpulseBufferZone(const int huntIndex)
-{
-   if(!H4LqChartDrawEnabled(InputDrawImpulseCancelBufferZone) || !g_v2Hunts[huntIndex].active)
-   {
-      V2ClearImpulseBufferZone(huntIndex);
-      return;
-   }
-
-   double zoneLow = 0.0;
-   double zoneHigh = 0.0;
-   double cancelLimitPrice = 0.0;
-   if(!H4BreachImpulseCancelZonePrices(V2HuntExpectsBullishFvg(huntIndex),
-                                        g_v2Hunts[huntIndex].h4BreachedLegLevelPrice,
-                                        zoneLow, zoneHigh, cancelLimitPrice) ||
-      g_v2Hunts[huntIndex].sessionId == 0)
-   {
-      V2ClearImpulseBufferZone(huntIndex);
-      return;
-   }
-
-   datetime timeRight = iTime(_Symbol, InputM2NarrativeTimeframe, 0);
-   if(timeRight <= g_v2Hunts[huntIndex].sessionId)
-      timeRight = g_v2Hunts[huntIndex].sessionId + (datetime)PeriodSeconds(InputM2NarrativeTimeframe);
-   const datetime timeLeft = g_v2Hunts[huntIndex].sessionId;
-   const string objName = V2ImpulseObjectName(g_v2Hunts[huntIndex].sessionId);
-   if(ObjectFind(0, objName) < 0)
-   {
-      if(!ObjectCreate(0, objName, OBJ_RECTANGLE, 0, timeLeft, zoneHigh, timeRight, zoneLow))
-         return;
-   }
-   else
-   {
-      ObjectSetInteger(0, objName, OBJPROP_TIME, 0, timeLeft);
-      ObjectSetDouble(0, objName, OBJPROP_PRICE, 0, zoneHigh);
-      ObjectSetInteger(0, objName, OBJPROP_TIME, 1, timeRight);
-      ObjectSetDouble(0, objName, OBJPROP_PRICE, 1, zoneLow);
-   }
-   ObjectSetInteger(0, objName, OBJPROP_COLOR, InputImpulseCancelBufferColor);
-   ObjectSetInteger(0, objName, OBJPROP_STYLE, STYLE_SOLID);
-   ObjectSetInteger(0, objName, OBJPROP_WIDTH, 2);
-   ObjectSetInteger(0, objName, OBJPROP_FILL, false);
-   ObjectSetInteger(0, objName, OBJPROP_BACK, true);
-   ObjectSetInteger(0, objName, OBJPROP_SELECTABLE, false);
-   ObjectSetInteger(0, objName, OBJPROP_HIDDEN, false);
-   ObjectSetInteger(0, objName, OBJPROP_TIMEFRAMES, OBJ_ALL_PERIODS);
-}
-
-//+------------------------------------------------------------------+
-void V2UpdateAllImpulseBufferZones()
-{
-   for(int i = 0; i < V2_MAX_HUNT_SESSIONS; i++)
-   {
-      if(g_v2Hunts[i].active)
-         V2UpdateImpulseBufferZone(i);
-      else
-         V2ClearImpulseBufferZone(i);
-   }
-}
-
-//+------------------------------------------------------------------+
-int V2OppositeH4LegDirectionForHunt(const int huntIndex)
-{
-   return g_v2Hunts[huntIndex].h4HighWasBreached ? -1 : 1;
-}
-
-//+------------------------------------------------------------------+
-void V2OnH4LegClosedForHunts(const int closedLegDirection, const datetime closedLegEndTime)
-{
-   // v3: no touch-level hunt cancel on opposite H4 leg close
-}
-
-//+------------------------------------------------------------------+
 //| v3 legacy stubs
-//+------------------------------------------------------------------+
-bool V2TryGetTouchRecalcBufferAnchorExtreme(const int huntIndex, double &outAnchor)
-{
-   outAnchor = 0.0;
-   return false;
-}
-
-void V2InitTouchRecalcBufferAnchor(const int huntIndex) {}
-void V2BeginTouchRecalcBufferActiveLegTrack(const int huntIndex) {}
-void V2SyncTouchRecalcBufferAnchorFromActiveLeg(const int huntIndex) {}
-void V2StopTouchRecalcBufferActiveLegTrack(const int huntIndex) {}
-
-bool V2DetectTouchRecalcBufferCrossOrTouch(const int huntIndex, const double barHigh,
-                                             const double barLow, const double barClose)
-{
-   return false;
-}
-
-void V2TryArmTouchRecalcBufferResumeOnCross(const int huntIndex, const double barHigh,
-                                              const double barLow, const double barClose) {}
-void V2OnTouchRecalcBufferLegChange(const int huntIndex, const int closingLegDirection,
-                                     const int nextLegDirection) {}
-
-double V2TouchRecalcBufferBandHalfWidth() { return 0.0; }
-
-bool V2BarOverlapsPriceZone(const double barHigh, const double barLow,
-                             const double zoneLow, const double zoneHigh, const double eps)
-{
-   return false;
-}
-
-bool V2DetectTouchRecalcBufferHit(const int huntIndex, const double barHigh, const double barLow,
-                                   const double barClose, bool &outNearHuntExtreme,
-                                   bool &outNearOppositeBuffer,
-                                   const double huntExtremeAtBarStart)
-{
-   outNearHuntExtreme    = false;
-   outNearOppositeBuffer = false;
-   return false;
-}
-
-bool V2TouchSideBlocksBufferRecalc(const int huntIndex, const double barHigh, const double barLow,
-                                    const double pointSize)
-{
-   return false;
-}
-
-void V2TryTouchRecalcAfterBufferEvent(const int huntIndex, const double barHigh,
-                                       const double barLow, const double barClose,
-                                       const string bufferTriggerTag) {}
-
-void V2TryRecalcTouchOnHuntSameDirProgress(const int huntIndex, const double barHigh,
-                                            const double barLow, const double barClose,
-                                            const bool forceRecalc, const string bufferTriggerTag,
-                                            const double huntExtremeAtBarStart) {}
-
-bool V2PushHuntFvgMemory(const int huntIndex, const bool isBullishFairValueGap,
-                         const double zoneLowPrice, const double zoneHighPrice,
-                         const datetime fairValueGapBarOpenTime)
-{
-   return false;
-}
-
-void V2DrawHuntFairValueGapZone(const int huntIndex, const bool isBullishFairValueGap,
-                                const double zoneLowPrice, const double zoneHighPrice,
-                                const datetime leftBarTime, const datetime rightBarTime) {}
-
-void V2UpdateTouchLevelFromM2Swing(const int huntIndex) {}
-void V2OnM2LegChangeForHunt(const int huntIndex, const int closingLegDirection,
-                            const int nextLegDirection) {}
-void V2DrawTouchPointLine(const int huntIndex) {}
-
-void V2ClearTouchPointLine(const int huntIndex)
-{
-   if(huntIndex < 0 || huntIndex >= V2_MAX_HUNT_SESSIONS)
-      return;
-   if(g_v2Hunts[huntIndex].sessionId != 0)
-      ObjectDelete(0, V2TouchObjectName(g_v2Hunts[huntIndex].sessionId));
-}
-
-void V2RemoveHuntSessionFvgPlots(const int huntIndex) {}
-
-
-//+------------------------------------------------------------------+
-bool V2TryDetectOppositeDirBosForHunt(const int huntIndex, string &outBosDetail)
-{
-   outBosDetail = "";
-   if(huntIndex < 0 || huntIndex >= V2_MAX_HUNT_SESSIONS || !g_v2Hunts[huntIndex].active)
-      return false;
-
-   double brokenLevel = 0.0;
-   const bool bullBos = TryDetectM2PriceBreakAboveLatestUpLegHigh(brokenLevel);
-   double bearBrokenLevel = 0.0;
-   const bool bearBos = TryDetectM2PriceBreakBelowLatestDownLegLow(bearBrokenLevel);
-
-   if(g_v2Hunts[huntIndex].h4HighWasBreached && bearBos)
-   {
-      outBosDetail = StringFormat("bear BOS lvl=%.5f (H4 up leg breach)", bearBrokenLevel);
-      return true;
-   }
-   if(!g_v2Hunts[huntIndex].h4HighWasBreached && bullBos)
-   {
-      outBosDetail = StringFormat("bull BOS lvl=%.5f (H4 down leg breach)", brokenLevel);
-      return true;
-   }
-   return false;
-}
-
-//+------------------------------------------------------------------+
 //| Hunt ON only. Opposite M2 BOS clears marked same-dir FVGs.       |
 //+------------------------------------------------------------------+
-void V2TryClearHuntFvgsOnSameDirectionBosWhileHuntOn(const int huntIndex) {}
-
 //+------------------------------------------------------------------+
 bool M2TryGetLegBarOpenFromEnd(const datetime legStartTime, const datetime legEndTime,
                                 const int barsFromEnd, datetime &outBarOpen)
@@ -9621,87 +7592,6 @@ bool M2TryGetLegBarOpenFromEnd(const datetime legStartTime, const datetime legEn
    outBarOpen = targetOpen;
    return true;
 }
-
-bool V2TryGetM2TouchLegVolumeWindowBounds(const int huntIndex, const int lastClosedBarShift,
-                                           datetime &outWindowStartOpen, datetime &outWindowEndOpen)
-{
-   outWindowStartOpen = 0;
-   outWindowEndOpen   = 0;
-   return false;
-}
-
-bool V2ValidateTouchHitOppositeM2LegVolume(const int huntIndex, const int lastClosedBarShift,
-                                            long &outVolumes[], int &outVolumeCount,
-                                            datetime &outWindowStartOpen, datetime &outWindowEndOpen)
-{
-   outVolumeCount = 0;
-   ArrayResize(outVolumes, 0);
-   outWindowStartOpen = 0;
-   outWindowEndOpen   = 0;
-   return false;
-}
-
-void V2InvalidateTouchHitVolumeFailed(const int huntIndex, const double barClose,
-                                       const long &volumes[], const int volumeCount,
-                                       const datetime windowStartOpen, const datetime windowEndOpen) {}
-
-bool V2TryDetectTouchOfStoredLevel(const int huntIndex, const double barHigh, const double barLow,
-                                    const double pointSize)
-{
-   return false;
-}
-
-void V2HandleTouchHitConfirmed(const int huntIndex, const double barHigh, const double barLow,
-                                const double barClose, const long &volumes[], const int volumeCount,
-                                const datetime windowStartOpen, const datetime windowEndOpen) {}
-
-void V2StorePendingTradeFvg(const int huntIndex, const bool isBullishFairValueGap,
-                            const double zoneLowPrice, const double zoneHighPrice,
-                            const datetime formationTime) {}
-
-bool V2TryGetEarliestHuntFvgFormationBarOpenTime(const int huntIndex, datetime &outFormationBarOpen)
-{
-   outFormationBarOpen = 0;
-   return false;
-}
-
-bool V2TryGetEarliestHuntFvgFirstPatternBarOpen(const int huntIndex, datetime &outFirstBarOpen,
-                                                 datetime &outFormationBarOpen)
-{
-   outFirstBarOpen     = 0;
-   outFormationBarOpen = 0;
-   return false;
-}
-
-int V2SelectTradeFvgMemIndexForHunt(const int huntIndex) { return -1; }
-
-bool V2ResolveTradeFvgForHunt(const int huntIndex, bool &outIsBullishFvg, double &outZoneLow,
-                              double &outZoneHigh, datetime &outFormationTime)
-{
-   outIsBullishFvg  = false;
-   outZoneLow       = 0.0;
-   outZoneHigh      = 0.0;
-   outFormationTime = 0;
-   return false;
-}
-
-void V2TryPlacePendingFvgTradesAfterHuntOff(const int huntIndex) {}
-
-void V2TryPlaceFvgAndEndHuntAfterRecalcSkip(const int huntIndex, const bool isBullishFairValueGap,
-                                             const double zoneLowPrice, const double zoneHighPrice,
-                                             const datetime formationTime) {}
-
-void V2ClearTouchRecalcBufferZone(const int huntIndex)
-{
-   if(huntIndex < 0 || huntIndex >= V2_MAX_HUNT_SESSIONS)
-      return;
-   if(g_v2Hunts[huntIndex].sessionId != 0)
-      ObjectDelete(0, LQ_OBJ_TOUCH_RECALC_PREFIX + V2HuntObjectSuffix(g_v2Hunts[huntIndex].sessionId));
-}
-
-void V2UpdateTouchRecalcBufferZone(const int huntIndex) { V2ClearTouchRecalcBufferZone(huntIndex); }
-
-void V2UpdateAllTouchRecalcBufferZones() {}
 
 //+------------------------------------------------------------------+
 //| v3 — Engulfing Volume Absorption model                             |
@@ -10390,41 +8280,6 @@ bool V3ValidateM2LegExhaustion(const bool isBuy, string &outDetail)
    return volC > volB;
 }
 
-//+------------------------------------------------------------------+
-bool V3ValidateM2LegExhaustionForHunt(const int huntIndex, string &outDetail)
-{
-   outDetail = "";
-   if(huntIndex < 0 || huntIndex >= V2_MAX_HUNT_SESSIONS)
-      return false;
-
-   return V3ValidateM2LegExhaustion(V2HuntExpectsBullishFvg(huntIndex), outDetail);
-}
-
-//+------------------------------------------------------------------+
-bool V3ComputeEngulfStopLoss(const bool isBuy, const int candle1Shift, const int candle2Shift,
-                              double &outStopLoss)
-{
-   outStopLoss = 0.0;
-   const ENUM_TIMEFRAMES timeframe = InputM2NarrativeTimeframe;
-   const double bufferPrice = M2EngulfSlBufferPrice(candle2Shift);
-
-   if(isBuy)
-   {
-      const double low1 = iLow(_Symbol, timeframe, candle1Shift);
-      const double low2 = iLow(_Symbol, timeframe, candle2Shift);
-      outStopLoss = MathMin(low1, low2) - bufferPrice;
-   }
-   else
-   {
-      const double high1 = iHigh(_Symbol, timeframe, candle1Shift);
-      const double high2 = iHigh(_Symbol, timeframe, candle2Shift);
-      outStopLoss = MathMax(high1, high2) + bufferPrice;
-   }
-
-   return outStopLoss > 0.0;
-}
-
-//+------------------------------------------------------------------+
 bool V3M2SwingSweepSetupPatternValidCore(const bool isBuy, const double barClose,
                                           double &outStopLoss, datetime &outSignalBarOpen,
                                           double &outRefLevel, int &outCountdown,
@@ -10470,19 +8325,8 @@ bool V3M2SwingSweepSetupPatternValidCore(const bool isBuy, const double barClose
 }
 
 //+------------------------------------------------------------------+
-bool V3M2SwingSweepSetupPatternValid(const bool isBuy, const double barClose)
-{
-   double stopLoss = 0.0;
-   datetime signalBarOpen = 0;
-   double refLevel = 0.0;
-   int countdown = 0;
-   string exhaustDetail = "";
-   return V3M2SwingSweepSetupPatternValidCore(isBuy, barClose, stopLoss, signalBarOpen,
-                                                refLevel, countdown, exhaustDetail);
-}
-
 //+------------------------------------------------------------------+
-void V3TryScanM2SwingSweepSetup(const bool isBuy, const double barClose, const double setupScore)
+void V3TryScanM2SwingSweepSetup(const bool isBuy, const double barClose)
 {
    double stopLoss = 0.0;
    datetime signalBarOpen = 0;
@@ -10493,13 +8337,27 @@ void V3TryScanM2SwingSweepSetup(const bool isBuy, const double barClose, const d
                                            refLevel, countdown, exhaustDetail))
    {
       const double entryPrice = barClose;
-      const double setupScore = CalculateSetupTradeScoreFromStopLoss(isBuy, stopLoss);
+      const double setupScore = CalculateSetupTradeScore(isBuy);
 
       V2LogHuntEvent(-1, "SWEEP_SIGNAL",
-                     StringFormat("%s entry=%.5f sl=%.5f ref=%.5f cd=%d %s bar=%s",
+                     StringFormat("%s entry=%.5f sl=%.5f ref=%.5f cd=%d score=%.2f %s bar=%s",
                                   isBuy ? "bull" : "bear", entryPrice, stopLoss, refLevel, countdown,
-                                  exhaustDetail,
+                                  setupScore, exhaustDetail,
                                   TimeToString(signalBarOpen, TIME_DATE | TIME_MINUTES)));
+
+      if(InputScoreLogWriteCsv)
+      {
+         LogAllSetupScores(setupScore);
+         return;
+      }
+
+      if(!SetupScoreAllowsTradeEntry(setupScore))
+      {
+         V2LogHuntEvent(-1, "SWEEP_SKIP",
+                        StringFormat("%s setupScore=%.2f < min %.2f",
+                                     isBuy ? "bull" : "bear", setupScore, InputMinScore));
+         return;
+      }
 
       TryPlaceEngulfAbsorptionTradeSetup(-1, isBuy, entryPrice, stopLoss,
                                           signalBarOpen, signalBarOpen, setupScore);
@@ -10539,313 +8397,16 @@ void V3TryScanM2SwingSweepSetup(const bool isBuy, const double barClose, const d
                      StringFormat("%s SL vs entry invalid", isBuy ? "bull" : "bear"));
 }
 
-//+------------------------------------------------------------------+
-void V3RunM2SwingSweepScansOnBarClose(const double barClose)
-{
-   const double bullScore = CalculateSetupTradeScore(true);
-   if(SetupScoreAllowsTradeEntry(bullScore))
-      V3TryScanM2SwingSweepSetup(true, barClose, bullScore);
-
-   const double bearScore = CalculateSetupTradeScore(false);
-   if(SetupScoreAllowsTradeEntry(bearScore))
-      V3TryScanM2SwingSweepSetup(false, barClose, bearScore);
-}
-
-//+------------------------------------------------------------------+
-void V3ProcessM2SwingSweepSetupsOnBarClose()
-{
-   if(!InputEnableEngulfHuntAfterH4Breach)
-      return;
-
-   const double barClose = iClose(_Symbol, InputM2NarrativeTimeframe, 1);
-   V3RunM2SwingSweepScansOnBarClose(barClose);
-}
-
-//+------------------------------------------------------------------+
-void V3TryScanEngulfAbsorptionOnM2Close(const int huntIndex, const double barClose)
-{
-   if(huntIndex < 0 || huntIndex >= V2_MAX_HUNT_SESSIONS || !g_v2Hunts[huntIndex].active)
-      return;
-
-   const bool   isBuy  = V2HuntExpectsBullishFvg(huntIndex);
-   const double score  = CalculateSetupTradeScore(isBuy);
-   if(!SetupScoreAllowsTradeEntry(score))
-      return;
-
-   V3TryScanM2SwingSweepSetup(isBuy, barClose, score);
-}
-
 #ifdef H4_LQ_VOLUME_BREACH_ENABLED
 // --- hunt arm on H4 volume breach (disabled v3.04) ---
 
 //+------------------------------------------------------------------+
-int V2ArmOppositeFvgHuntAfterH4Breach(const double h4Level, const bool h4HighBreached,
-                                         const datetime breachedLegEndTime,
-                                         const double barClose, const double barLow,
-                                         const double barHigh)
-{
-   const int existing = V2FindActiveHuntByH4Leg(breachedLegEndTime, h4HighBreached);
-   if(existing >= 0)
-      return existing;
-
-   const int huntIndex = V2AllocHuntSlot();
-   if(huntIndex < 0)
-      return -1;
-
-   H4MarkVolumeBreachRecordSwept(breachedLegEndTime, h4HighBreached ? 1 : -1, h4Level);
-
-   g_v2Hunts[huntIndex].active                         = true;
-   g_v2Hunts[huntIndex].h4HighWasBreached             = h4HighBreached;
-   g_v2Hunts[huntIndex].h4BreachedLegLevelPrice       = h4Level;
-   g_v2Hunts[huntIndex].h4BreachedLegEndTime          = breachedLegEndTime;
-   g_v2Hunts[huntIndex].closeWhenH4LiquidityBreached  = barClose;
-   g_v2Hunts[huntIndex].pathMinLowSinceH4Breach       = barLow;
-   g_v2Hunts[huntIndex].pathMaxHighSinceH4Breach      = barHigh;
-   g_v2Hunts[huntIndex].impulseCloseExtremeSinceH4Breach = barClose;
-   g_v2Hunts[huntIndex].sessionId                      = iTime(_Symbol, InputM2NarrativeTimeframe, 1);
-   V2ResetHuntSlotSessionCounters(huntIndex);
-
-   if(h4HighBreached)
-   {
-      double bandLow = 0.0;
-      double bandHigh = 0.0;
-      H4BreachBufferBandForUpLegHigh(h4Level, bandLow, bandHigh);
-      V2LogHuntEvent(huntIndex, "HUNT_ON",
-                     StringFormat("H4 up leg=%.5f wick band %.5f..%.5f leg=%s → bull engulf scan",
-                                  h4Level, bandLow, bandHigh,
-                                  TimeToString(breachedLegEndTime, TIME_DATE | TIME_MINUTES)));
-   }
-   else
-   {
-      double bandLow = 0.0;
-      double bandHigh = 0.0;
-      H4BreachBufferBandForDownLegLow(h4Level, bandLow, bandHigh);
-      V2LogHuntEvent(huntIndex, "HUNT_ON",
-                     StringFormat("H4 down leg=%.5f wick band %.5f..%.5f leg=%s → bear engulf scan",
-                                  h4Level, bandLow, bandHigh,
-                                  TimeToString(breachedLegEndTime, TIME_DATE | TIME_MINUTES)));
-   }
-   return huntIndex;
-}
-
 #endif // H4_LQ_VOLUME_BREACH_ENABLED
 
 //+------------------------------------------------------------------+
-void V2ProcessOneActiveHuntOnM2Bar(const int huntIndex, const double pointSize,
-                                    const double barClose, const double barHigh,
-                                    const double barLow, const double prevHigh,
-                                    const double prevLow)
-{
-   if(!g_v2Hunts[huntIndex].active)
-      return;
-
-   g_v2Hunts[huntIndex].pathMinLowSinceH4Breach  =
-      MathMin(g_v2Hunts[huntIndex].pathMinLowSinceH4Breach, barLow);
-   g_v2Hunts[huntIndex].pathMaxHighSinceH4Breach =
-      MathMax(g_v2Hunts[huntIndex].pathMaxHighSinceH4Breach, barHigh);
-
-   double impulseZoneLow = 0.0;
-   double impulseZoneHigh = 0.0;
-   double impulseCancelLimitPrice = 0.0;
-   if(H4BreachImpulseCancelZonePrices(V2HuntExpectsBullishFvg(huntIndex),
-                                       g_v2Hunts[huntIndex].h4BreachedLegLevelPrice,
-                                       impulseZoneLow, impulseZoneHigh, impulseCancelLimitPrice))
-   {
-      bool cancelHunt = false;
-      if(V2HuntExpectsBullishFvg(huntIndex))
-      {
-         g_v2Hunts[huntIndex].impulseCloseExtremeSinceH4Breach =
-            MathMin(g_v2Hunts[huntIndex].impulseCloseExtremeSinceH4Breach, barClose);
-         if(g_v2Hunts[huntIndex].impulseCloseExtremeSinceH4Breach < impulseCancelLimitPrice)
-            cancelHunt = true;
-      }
-      else
-      {
-         g_v2Hunts[huntIndex].impulseCloseExtremeSinceH4Breach =
-            MathMax(g_v2Hunts[huntIndex].impulseCloseExtremeSinceH4Breach, barClose);
-         if(g_v2Hunts[huntIndex].impulseCloseExtremeSinceH4Breach > impulseCancelLimitPrice)
-            cancelHunt = true;
-      }
-      if(cancelHunt)
-      {
-         V2EndOppositeFvgHuntSession(huntIndex,
-                                     StringFormat("impulse cancel close=%.5f limit=%.5f (H4 FAR %.1f%%)",
-                                                  barClose, impulseCancelLimitPrice,
-                                                  H4_BREACH_BUFFER_PERCENT_FAR),
-                                     false);
-         return;
-      }
-   }
-
-   V3TryScanEngulfAbsorptionOnM2Close(huntIndex, barClose);
-}
-
 //+------------------------------------------------------------------+
-void OnM2SwingLegDirectionChange(const int closingLegDirection, const int nextLegDirection)
-{
-   // v3: no touch/recalc-buffer leg hooks
-}
-
 #ifdef H4_LQ_VOLUME_BREACH_ENABLED
 // --- M2 wick vs breach-record level → hunt arm (disabled v3.04) ---
-
-//+------------------------------------------------------------------+
-bool TryDetectH4WickLiquidityBreachForLeg(const int swingDirection, const double breachLevel,
-                                            const datetime huntLegKey, const double barHigh,
-                                            const double barLow, const double prevHigh,
-                                            const double prevLow, const double pointSize,
-                                            double &outLevel, bool &outHighBreached,
-                                            datetime &outLegEndTime)
-{
-   if(swingDirection == 0 || breachLevel <= 0.0 || huntLegKey == 0)
-      return false;
-
-   if(H4IsVolumeBreachRecordSwept(huntLegKey, swingDirection, breachLevel))
-      return false;
-
-   if(swingDirection == 1)
-   {
-      double bandLow = 0.0;
-      double bandHigh = 0.0;
-      H4BreachBufferBandForUpLegHigh(breachLevel, bandLow, bandHigh);
-      const bool bufferCross =
-         M2WickCrossesIntoH4UpBreachBuffer(bandLow, bandHigh, barHigh, prevHigh, pointSize);
-      const bool levelCross =
-         M2WickCrossesBelowLevel(breachLevel, barLow, prevLow, pointSize);
-      if(!bufferCross && !levelCross)
-         return false;
-
-      return TryAcceptH4BreachForHunt(true, breachLevel, huntLegKey,
-                                      outLevel, outHighBreached, outLegEndTime);
-   }
-
-   if(swingDirection == -1)
-   {
-      double bandLow = 0.0;
-      double bandHigh = 0.0;
-      H4BreachBufferBandForDownLegLow(breachLevel, bandLow, bandHigh);
-      const bool bufferCross =
-         M2WickCrossesIntoH4DownBreachBuffer(bandLow, bandHigh, barLow, prevLow, pointSize);
-      const bool levelCross =
-         M2WickCrossesAboveLevel(breachLevel, barHigh, prevHigh, pointSize);
-      if(!bufferCross && !levelCross)
-         return false;
-
-      return TryAcceptH4BreachForHunt(false, breachLevel, huntLegKey,
-                                      outLevel, outHighBreached, outLegEndTime);
-   }
-
-   return false;
-}
-
-//+------------------------------------------------------------------+
-bool TryGetActiveH4LegVolumeBreachLevel(double &outBreachLevel, datetime &outVolumeBarOpenTime)
-{
-   outBreachLevel       = 0.0;
-   outVolumeBarOpenTime = 0;
-
-   const Swing activeLeg = g_mtfSwingH4.swing.currentSwingLeg;
-   if(activeLeg.swingDirection == 0 || activeLeg.legStartTime == 0)
-      return false;
-
-   for(int i = 0; i < g_h4LegVolumeBreachCount; i++)
-   {
-      if(g_h4LegVolumeBreaches[i].legStartTime == activeLeg.legStartTime &&
-         g_h4LegVolumeBreaches[i].swingDirection == activeLeg.swingDirection &&
-         g_h4LegVolumeBreaches[i].legEndTime == 0 &&
-         g_h4LegVolumeBreaches[i].breachLevelPrice > 0.0)
-      {
-         outBreachLevel       = g_h4LegVolumeBreaches[i].breachLevelPrice;
-         outVolumeBarOpenTime = g_h4LegVolumeBreaches[i].volumeBarOpenTime;
-         return outVolumeBarOpenTime > 0;
-      }
-   }
-
-   if(g_h4ActiveLegVolumeTrack.legStartTime == activeLeg.legStartTime &&
-      g_h4ActiveLegVolumeTrack.breachLevelPrice > 0.0 &&
-      g_h4ActiveLegVolumeTrack.maxVolumeBarOpenTime > 0)
-   {
-      outBreachLevel       = g_h4ActiveLegVolumeTrack.breachLevelPrice;
-      outVolumeBarOpenTime = g_h4ActiveLegVolumeTrack.maxVolumeBarOpenTime;
-      return true;
-   }
-
-   return false;
-}
-
-//+------------------------------------------------------------------+
-bool TryDetectH4WickLiquidityBreach(const double barHigh, const double barLow,
-                                     const double prevHigh, const double prevLow,
-                                     const double pointSize, double &outLevel,
-                                     bool &outHighBreached, datetime &outLegEndTime)
-{
-   outLevel        = 0.0;
-   outHighBreached = false;
-   outLegEndTime   = 0;
-
-   if(InputH4BreachBufferChartBarCount < 1)
-      return false;
-
-   const Swing activeLeg = g_mtfSwingH4.swing.currentSwingLeg;
-   if(activeLeg.swingDirection != 0 && activeLeg.legStartTime != 0)
-   {
-      double breachLevel = 0.0;
-      datetime volumeBarOpenTime = 0;
-      if(TryGetActiveH4LegVolumeBreachLevel(breachLevel, volumeBarOpenTime) &&
-         IsH4BarWithinBreachBufferChartWindow(volumeBarOpenTime))
-      {
-         if(TryDetectH4WickLiquidityBreachForLeg(activeLeg.swingDirection, breachLevel,
-                                                  activeLeg.legStartTime, barHigh, barLow,
-                                                  prevHigh, prevLow, pointSize,
-                                                  outLevel, outHighBreached, outLegEndTime))
-            return true;
-      }
-   }
-
-   for(int legIndex = g_mtfSwingH4.swing.swingHistoryCount - 1; legIndex >= 0; legIndex--)
-   {
-      const Swing leg = g_mtfSwingH4.swing.swingHistory[legIndex];
-      if(leg.swingDirection != 1 || leg.legEndTime == 0)
-         continue;
-
-      if(!IsH4LegVolumeBreachActiveInBufferWindow(leg.legEndTime, 1))
-         continue;
-
-      double breachLevel = 0.0;
-      datetime volumeBarOpenTime = 0;
-      if(!TryResolveH4LegVolumeBreachLevel(leg.legStartTime, leg.legEndTime, 1,
-                                            breachLevel, volumeBarOpenTime))
-         continue;
-
-      if(TryDetectH4WickLiquidityBreachForLeg(1, breachLevel, leg.legEndTime, barHigh, barLow,
-                                               prevHigh, prevLow, pointSize,
-                                               outLevel, outHighBreached, outLegEndTime))
-         return true;
-   }
-
-   for(int legIndex = g_mtfSwingH4.swing.swingHistoryCount - 1; legIndex >= 0; legIndex--)
-   {
-      const Swing leg = g_mtfSwingH4.swing.swingHistory[legIndex];
-      if(leg.swingDirection != -1 || leg.legEndTime == 0)
-         continue;
-
-      if(!IsH4LegVolumeBreachActiveInBufferWindow(leg.legEndTime, -1))
-         continue;
-
-      double breachLevel = 0.0;
-      datetime volumeBarOpenTime = 0;
-      if(!TryResolveH4LegVolumeBreachLevel(leg.legStartTime, leg.legEndTime, -1,
-                                            breachLevel, volumeBarOpenTime))
-         continue;
-
-      if(TryDetectH4WickLiquidityBreachForLeg(-1, breachLevel, leg.legEndTime, barHigh, barLow,
-                                               prevHigh, prevLow, pointSize,
-                                               outLevel, outHighBreached, outLegEndTime))
-         return true;
-   }
-
-   return false;
-}
 
 #endif // H4_LQ_VOLUME_BREACH_ENABLED
 
@@ -10887,19 +8448,9 @@ double CalculateSetupTradeScore(const bool isBullishTrade)
 }
 
 //+------------------------------------------------------------------+
-double CalculateSetupTradeScoreFromStopLoss(const bool isBuy, const double stopLossPrice)
+void ProcessM2EngulfDirectionOnBarClose(const bool isBuy, const double barClose)
 {
-   double setupLow  = 0.0;
-   double setupHigh = 0.0;
-   V3ResolveSetupExtremesForZoneScoring(isBuy, setupLow, setupHigh);
-   if(stopLossPrice > 0.0)
-   {
-      if(isBuy)
-         setupLow = stopLossPrice;
-      else
-         setupHigh = stopLossPrice;
-   }
-   return CalculateTotalTradeScore(isBuy, setupLow, setupHigh);
+   V3TryScanM2SwingSweepSetup(isBuy, barClose);
 }
 
 //+------------------------------------------------------------------+
@@ -10910,23 +8461,8 @@ void ProcessHuntEngulfingOnM2BarClose()
 
    const double barClose = iClose(_Symbol, InputM2NarrativeTimeframe, 1);
 
-   const double bullScore = CalculateSetupTradeScore(true);
-   if(bullScore > 0.0)
-      LogAllSetupScores(bullScore);
-   if(SetupScoreAllowsTradeEntry(bullScore))
-      V3TryScanM2SwingSweepSetup(true, barClose, bullScore);
-   else if(H4LqLoggingEnabled())
-      V2LogHuntEvent(-1, "SWEEP_SKIP",
-                     StringFormat("bull setupScore=%.2f < min %.2f", bullScore, InputMinScore));
-
-   const double bearScore = CalculateSetupTradeScore(false);
-   if(bearScore > 0.0)
-      LogAllSetupScores(bearScore);
-   if(SetupScoreAllowsTradeEntry(bearScore))
-      V3TryScanM2SwingSweepSetup(false, barClose, bearScore);
-   else if(H4LqLoggingEnabled())
-      V2LogHuntEvent(-1, "SWEEP_SKIP",
-                     StringFormat("bear setupScore=%.2f < min %.2f", bearScore, InputMinScore));
+   ProcessM2EngulfDirectionOnBarClose(true, barClose);
+   ProcessM2EngulfDirectionOnBarClose(false, barClose);
 }
 
 //+------------------------------------------------------------------+
