@@ -1,6 +1,9 @@
 //+------------------------------------------------------------------+
 //| h4_lq_v3.mq5                                                      |
 //| H4 breach hunt + M2 Engulfing Volume Absorption entry model       |
+//| v3.92: solo fallback fills only remaining TP slots (nearest qualifying levels) |
+//| v3.91: merge cluster + solo TPs, sort nearest-first, then assign TP1..TPn |
+//| v3.90: InputTradeSwingTpCount — 2 TP (2:1 risk) or 3 TP (3:1:1 risk) + 2R addon |
 //| v3.88: setup score calculated only after sweep pattern confirmed |
 //| v3.87: single CalculateSetupTradeScore per M2 bar (removed FromStopLoss duplicate) |
 //| v3.86: zone score — each weight input counts at most once (ConfluenceScoring v1.2) |
@@ -88,7 +91,7 @@
 //| v3.01: exhaustion leg filter — min leg range % of M2 chart height (replaces min bar count) |
 //| v3.00: replace M2 touch/FVG with engulfing vol absorption + exhaustion gate |
 //+------------------------------------------------------------------+
-#define H4_LQ_V3_VERSION "3.88"
+#define H4_LQ_V3_VERSION "3.92"
 // Breach record array + hunt arming: uncomment next line to re-enable.
 // #define H4_LQ_VOLUME_BREACH_ENABLED
 #property copyright ""
@@ -152,6 +155,14 @@ input color  InputTradeSwingProximityLineColorBull = clrLimeGreen;
 input color  InputTradeSwingProximityRectColorBear = clrCrimson;
 input color  InputTradeSwingProximityLineColorBear = clrCrimson;
 input double InputTradeSwingTpMinRewardToRisk = 2.0; // skip line/TP when reward:risk below this (1:2 = 2.0)
+
+enum ENUM_TRADE_SWING_TP_COUNT
+{
+   TRADE_SWING_TP_TWO   = 2, // 2 swing TPs — risk split 2:1 (+ separate 2R order)
+   TRADE_SWING_TP_THREE = 3  // 3 swing TPs — risk split 3:1:1 (+ separate 2R order)
+};
+
+input ENUM_TRADE_SWING_TP_COUNT InputTradeSwingTpCount = TRADE_SWING_TP_THREE;
 input double InputEngulfSlBufferPercentChart    = 2.0; // SL beyond engulf ref extreme; 0=SL at ref extreme
 input int    InputEngulfMinSlPoints           = 0;     // min entryâ€“SL pts; 0=broker stops level only when widening SL
 input int    InputEngulfVolAvgBarCount        = 15;  // avg tick vol baseline for engulf pair spike check
@@ -229,11 +240,37 @@ bool ScoreLogWriteModeSkipsTrading()
    return InputScoreLogWriteCsv;
 }
 
-// --- trade sizing (3 swing-TP orders + 1 fixed 2R order; USD risk from score normalization) ---
+// --- trade sizing (N swing-TP orders + 1 fixed 2R order; USD risk from score normalization) ---
 const ulong    LQ_EXPERT_MAGIC                    = 940029;
 const double   LQ_STOP_BUFFER_PERCENT_CHART       = 1.0;
 const int      LQ_FVG_TRADE_MAX_M2_BAR_SHIFT      = 24;
-const int      LQ_TP_COUNT                        = 3;
+const int      LQ_TP_COUNT_MAX                    = 3;
+
+//+------------------------------------------------------------------+
+int TradeSwingTpTargetCount()
+{
+   return (InputTradeSwingTpCount == TRADE_SWING_TP_TWO) ? 2 : 3;
+}
+
+//+------------------------------------------------------------------+
+void GetTradeSwingTpRiskWeights(double &outWeights[], double &outTotalParts)
+{
+   const int tpCount = TradeSwingTpTargetCount();
+   ArrayResize(outWeights, tpCount);
+   if(tpCount == 2)
+   {
+      outWeights[0] = 2.0;
+      outWeights[1] = 1.0;
+      outTotalParts = 3.0;
+   }
+   else
+   {
+      outWeights[0] = 3.0;
+      outWeights[1] = 1.0;
+      outWeights[2] = 1.0;
+      outTotalParts = 5.0;
+   }
+}
 
 CTrade         g_trade;
 
@@ -1644,6 +1681,16 @@ void SortTakeProfitLevelsNearestFirst(const bool isBuy, double &tpPrices[], cons
 }
 
 //+------------------------------------------------------------------+
+void TrimTakeProfitLevelsToTargetCount(double &tpPrices[], int &tpCount, const int targetCount)
+{
+   if(targetCount < 1 || tpCount <= targetCount)
+      return;
+
+   ArrayResize(tpPrices, targetCount);
+   tpCount = targetCount;
+}
+
+//+------------------------------------------------------------------+
 bool TakeProfitLevelWithinProximityBand(const double tpLinePrice,
                                         const double &existingTpPrices[],
                                         const int existingTpCount,
@@ -1661,18 +1708,27 @@ bool TakeProfitLevelWithinProximityBand(const double tpLinePrice,
 }
 
 //+------------------------------------------------------------------+
-int AppendIndividualSwingTakeProfitLevels(const bool isBuy, const double entryPrice,
-                                          const double stopLossPrice,
-                                          const M2SwingExtremePoint &points[], const int pointCount,
-                                          const double frontRunOffset, const double proximityBand,
-                                          double &outTakeProfitPrices[], int &outTakeProfitCount,
-                                          const int maxTakeProfitCount, int &outSkippedRewardToRisk,
-                                          int &outSkippedProximity)
+int AppendNearestIndividualSwingTakeProfitLevels(const bool isBuy, const double entryPrice,
+                                                  const double stopLossPrice,
+                                                  const M2SwingExtremePoint &points[],
+                                                  const int pointCount,
+                                                  const double frontRunOffset,
+                                                  const double proximityBand,
+                                                  double &outTakeProfitPrices[],
+                                                  int &outTakeProfitCount,
+                                                  const int maxLevelsToAppend,
+                                                  int &outSkippedRewardToRisk,
+                                                  int &outSkippedProximity)
 {
    outSkippedRewardToRisk = 0;
    outSkippedProximity    = 0;
-   int added = 0;
-   for(int i = 0; i < pointCount && outTakeProfitCount < maxTakeProfitCount; i++)
+   if(maxLevelsToAppend <= 0)
+      return 0;
+
+   double candidates[];
+   int    candidateCount = 0;
+
+   for(int i = 0; i < pointCount; i++)
    {
       double linePrice = points[i].extremePrice;
       if(frontRunOffset > 0.0)
@@ -1690,6 +1746,12 @@ int AppendIndividualSwingTakeProfitLevels(const bool isBuy, const double entryPr
          continue;
       }
 
+      if(TakeProfitLevelWithinProximityBand(linePrice, candidates, candidateCount, proximityBand))
+      {
+         outSkippedProximity++;
+         continue;
+      }
+
       if(!SwingGroupLineMeetsMinRiskReward(isBuy, entryPrice, stopLossPrice, linePrice,
                                            InputTradeSwingTpMinRewardToRisk))
       {
@@ -1697,17 +1759,31 @@ int AppendIndividualSwingTakeProfitLevels(const bool isBuy, const double entryPr
          continue;
       }
 
+      AppendUniqueTakeProfitLevel(candidates, candidateCount, linePrice);
+   }
+
+   if(candidateCount < 1)
+      return 0;
+
+   SortTakeProfitLevelsNearestFirst(isBuy, candidates, candidateCount);
+
+   const int takeCount = MathMin(maxLevelsToAppend, candidateCount);
+   int added = 0;
+   for(int i = 0; i < takeCount; i++)
+   {
       const int beforeCount = outTakeProfitCount;
-      AppendUniqueTakeProfitLevel(outTakeProfitPrices, outTakeProfitCount, linePrice);
+      AppendUniqueTakeProfitLevel(outTakeProfitPrices, outTakeProfitCount, candidates[i]);
       if(outTakeProfitCount > beforeCount)
          added++;
    }
+
    return added;
 }
 
 //+------------------------------------------------------------------+
 //| Group swing extremes → qualifying line TPs (min R:R) + optional chart zones. |
-//| Falls back to individual swing levels when cluster count < LQ_TP_COUNT.        |
+//| Solo fallback fills only remaining slots (target − cluster); nearest solos picked. |
+//| Cluster + solo merged, sorted nearest-first, trimmed to InputTradeSwingTpCount.   |
 //+------------------------------------------------------------------+
 bool BuildTradeSwingGroupTakeProfits(const bool isBullishTrade, const datetime formationTime,
                                      const double entryPrice, const double stopLossPrice,
@@ -1901,14 +1977,18 @@ bool BuildTradeSwingGroupTakeProfits(const bool isBullishTrade, const datetime f
    int soloSkippedRR      = 0;
    int soloSkippedProx    = 0;
    const int clusterTpCount = outTakeProfitCount;
-   if(outTakeProfitCount < LQ_TP_COUNT)
+   const int targetTpCount = TradeSwingTpTargetCount();
+   const int remainingTpSlots = targetTpCount - clusterTpCount;
+
+   if(remainingTpSlots > 0)
    {
-      soloAdded = AppendIndividualSwingTakeProfitLevels(isBuy, entryPrice, stopLossPrice,
-                                                        points, pointCount, frontRunOffset,
-                                                        proximityBand,
-                                                        outTakeProfitPrices, outTakeProfitCount,
-                                                        LQ_TP_COUNT, soloSkippedRR,
-                                                        soloSkippedProx);
+      soloAdded = AppendNearestIndividualSwingTakeProfitLevels(isBuy, entryPrice, stopLossPrice,
+                                                                points, pointCount, frontRunOffset,
+                                                                proximityBand,
+                                                                outTakeProfitPrices,
+                                                                outTakeProfitCount,
+                                                                remainingTpSlots,
+                                                                soloSkippedRR, soloSkippedProx);
    }
 
    if(outTakeProfitCount < 1)
@@ -1922,9 +2002,7 @@ bool BuildTradeSwingGroupTakeProfits(const bool isBullishTrade, const datetime f
    }
 
    SortTakeProfitLevelsNearestFirst(isBuy, outTakeProfitPrices, outTakeProfitCount);
-
-   if(outTakeProfitCount > LQ_TP_COUNT)
-      outTakeProfitCount = LQ_TP_COUNT;
+   TrimTakeProfitLevelsToTargetCount(outTakeProfitPrices, outTakeProfitCount, targetTpCount);
 
    if(soloAdded > 0)
    {
@@ -6506,7 +6584,7 @@ bool HuntTradeCommentIsOverall(const string orderComment)
 //+------------------------------------------------------------------+
 bool HuntTradeCommentIsOvTpIndex(const string orderComment, const int tpIndex)
 {
-   if(tpIndex < 1 || tpIndex > LQ_TP_COUNT)
+   if(tpIndex < 1 || tpIndex > TradeSwingTpTargetCount())
       return false;
    return (StringFind(orderComment, "_OV_TP" + IntegerToString(tpIndex) + "_") >= 0);
 }
@@ -7438,8 +7516,9 @@ bool TryPlaceEngulfAbsorptionTradeSetup(const int huntIndex, const bool isBuy,
       return false;
    }
 
-   const double tpRiskWeights[3] = {3.0, 1.0, 1.0};
-   const double riskTotalParts   = tpRiskWeights[0] + tpRiskWeights[1] + tpRiskWeights[2];
+   double tpRiskWeights[];
+   double riskTotalParts = 0.0;
+   GetTradeSwingTpRiskWeights(tpRiskWeights, riskTotalParts);
    const string huntCommentPrefix = V2HuntTradeCommentPrefix(huntSessionId);
    const string formationTag      = TimeToString(signalBarOpenTime, TIME_DATE | TIME_MINUTES);
    const string logDetail =
