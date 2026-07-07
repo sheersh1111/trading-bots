@@ -1,12 +1,12 @@
-//+------------------------------------------------------------------+
+﻿//+------------------------------------------------------------------+
 //| scalping.mq5                                                      |
 //| M15 primary narrative + M2 engulfing volume absorption (from h4_lq_v3) |
-//| v1.00: primary narrative H4 -> M15 |
+//| v1.00: M15 primary narrative (breach hunt + M2 engulf) |
 //+------------------------------------------------------------------+
-#define SCALPING_VERSION "1.00"
+#define SCALPING_VERSION "1.01"
 #property copyright ""
 #property version   SCALPING_VERSION
-#property description "scalping — M15 breach hunt + M2 engulfing volume absorption"
+#property description "scalping â€” M15 breach hunt + M2 engulfing volume absorption"
 
 #include <Trade\Trade.mqh>
 
@@ -14,13 +14,13 @@ input group "Tester performance"
 input bool   InputFastTesterMode = false; // true: no hunt logs, no chart objects/HUDs (faster backtest)
 
 input group "Narrative timeframes"
-input ENUM_TIMEFRAMES InputH4NarrativeTimeframe = PERIOD_M15; // primary: breach legs, BOS, liquidity pivots
+input ENUM_TIMEFRAMES InputM15NarrativeTimeframe = PERIOD_M15; // primary: breach legs, BOS, liquidity pivots
 input ENUM_TIMEFRAMES InputM2NarrativeTimeframe  = PERIOD_M2;  // secondary: engulf hunt, entry management
 
-input bool   InputSwitchChartToH4       = true;
+input bool   InputSwitchChartToM15       = true;
 input int    InputWarmupBars             = 500;  // 0 = off: replay closed primary narrative bars on attach
-input bool   InputDrawH4SwingLegVisuals = true;
-input color  InputH4SwingTrendLineColor = clrGold;
+input bool   InputDrawM15SwingLegVisuals = true;
+input color  InputM15SwingTrendLineColor = clrGold;
 
 input bool   InputDrawM2SwingLegs        = false; // chart trend lines/labels only; does not disable M2 swing or hunt logic
 input color  InputM2SwingLineColor       = clrMediumPurple;
@@ -29,9 +29,9 @@ input color  InputM2SwingAnchorColor     = clrYellow;
 input int    InputM2SwingWarmupBars      = 500; // 0 = off: replay M2 on attach (plot_swing_h1_m5_copy)
 
 input group "M15 breach -> M2 engulfing absorption"
-input bool   InputEnableEngulfHuntAfterH4Breach = true;
-input int    InputH4BreachBufferChartBarCount = 74; // primary-TF bars: buffer reference height + active volume breach records
-input int    InputH4LiquidityPivotLookbackBars = 1166; // primary-TF replay lookback for liquidity pivot rebuild
+input bool   InputEnableEngulfHuntAfterM15Breach = true;
+input int    InputM15BreachBufferChartBarCount = 74; // primary-TF bars: buffer reference height + active volume breach records
+input int    InputM15LiquidityPivotLookbackBars = 1166; // primary-TF replay lookback for liquidity pivot rebuild
 input bool   InputDrawImpulseCancelBufferZone = true;  // hollow rect while hunt ON
 input color  InputImpulseCancelBufferColor    = clrDarkOrange;
 input int    InputChartRangeBarCount     = 147;
@@ -39,16 +39,16 @@ input bool   InputShowLiquidityHuntHud   = true;
 input bool   InputLogHuntEvents          = true;  // Experts tab: hunt / engulf / BOS
 
 input group "Primary BOS trade direction bias"
-input bool   InputEnableH4BosTradeDirectionBias = true;  // trade with last primary-TF close-cross BOS (bull/bear)
-input bool   InputShowH4BosBiasHud              = true;  // top-right bias HUD
+input bool   InputEnableM15BosTradeDirectionBias = true;  // trade with last primary-TF close-cross BOS (bull/bear)
+input bool   InputShowM15BosBiasHud              = true;  // top-right bias HUD
 
-const double H4_BREACH_ANCHOR_MULTIPLIER = 0.2; // wick+body vs prior 5-bar avg â€” breaches / hunt / liquidity pivots
+const double M15_BREACH_ANCHOR_MULTIPLIER = 0.2; // wick+body vs prior 5-bar avg Ã¢â‚¬â€ breaches / hunt / liquidity pivots
 const double M2_SWING_ANCHOR_MULTIPLIER  = 1.0; // M2 body vs prior 5-bar avg (plot_swing_h1_m5_copy)
 const double M2_TOUCH_VOLUME_MIN_EXPAND_RATIO = 3.0; // touch window: max & touch bar vs window min tick vol
 const int    M2_TOUCH_VOLUME_MIN_INCREASE_EVENTS = 2; // bar-over-bar vol increases required when window >= 4 bars
-const double H4_BOS_ANCHOR_MULTIPLIER    = 1.0; // full bar range vs prior 5-bar avg â€” BOS only (plot_swing_h4)
-const double H4_BREACH_BUFFER_PERCENT_NEAR = 0.0;  // below high / above low
-const double H4_BREACH_BUFFER_PERCENT_FAR  = 2.5; // above high / below low
+const double M15_BOS_ANCHOR_MULTIPLIER    = 1.0; // full bar range vs prior 5-bar avg Ã¢â‚¬â€ BOS only (plot_swing_h4)
+const double M15_BREACH_BUFFER_PERCENT_NEAR = 0.0;  // below high / above low
+const double M15_BREACH_BUFFER_PERCENT_FAR  = 2.5; // above high / below low
 
 input group "Engulfing absorption trade"
 input bool   InputEnableAutomatedTrading = true;   // false = log trade plan only (no orders)
@@ -62,7 +62,7 @@ input color  InputTradeSwingProximityRectColorBear = clrCrimson;
 input color  InputTradeSwingProximityLineColorBear = clrCrimson;
 input double InputTradeSwingTpMinRewardToRisk = 2.0; // skip line/TP when reward:risk below this (1:2 = 2.0)
 input double InputEngulfSlBufferPercentChart    = 2.0; // SL beyond engulf ref extreme; 0=SL at ref extreme
-input int    InputEngulfMinSlPoints           = 0;     // min entryâ€“SL pts; 0=broker stops level only when widening SL
+input int    InputEngulfMinSlPoints           = 0;     // min entryÃ¢â‚¬â€œSL pts; 0=broker stops level only when widening SL
 input int    InputPendingStopEntryOffsetPoints = 2;    // buy stop above / sell stop below reference entry (points)
 input int    InputEngulfVolMaxBaselineBars    = 30;  // max M2 bars to average between H4 breach time (T1) and Engulf pair (T2)
 input double InputEngulfVolBufferPercentChart = 2.0; // spike buffer: 0..N% chart height above pair low / below pair high
@@ -75,7 +75,7 @@ input color  InputEngulfVolSpikeArrivalColor    = clrGold;
 #define InputTouchVolMinSlPoints             InputEngulfMinSlPoints
 #define InputTouchVolEntryOffsetPercentChart 0.0
 #define InputTouchVolRequireAscendingVolume  false
-#define InputEnableOppositeFvgHuntAfterH4Breach InputEnableEngulfHuntAfterH4Breach
+#define InputEnableOppositeFvgHuntAfterM15Breach InputEnableEngulfHuntAfterM15Breach
 #define InputFairValueGapMinimumPercentOfChartRange 0.0
 #define InputDrawBosOppositeFairValueGapZones     false
 #define InputMaximumFairValueGapRectangles        0
@@ -87,16 +87,16 @@ input color  InputEngulfVolSpikeArrivalColor    = clrGold;
 input group "BOS SL/TP management"
 input bool   InputEnableBosMoveSlAndTp = false; // disable trailing/moving SL & TP on BOS for now
 
-const string H4_LQ_LOG_PREFIX = "scalping";
+const string M15_LQ_LOG_PREFIX = "scalping";
 
 //+------------------------------------------------------------------+
-bool H4LqLoggingEnabled()
+bool M15LqLoggingEnabled()
 {
    return (!InputFastTesterMode && InputLogHuntEvents);
 }
 
 //+------------------------------------------------------------------+
-bool H4LqChartDrawEnabled(const bool featureFlag = true)
+bool M15LqChartDrawEnabled(const bool featureFlag = true)
 {
    return (!InputFastTesterMode && featureFlag);
 }
@@ -148,19 +148,19 @@ struct M2SwingExtremePoint
 
 #define LiquidityPoolCapacity 32
 
-const string ChartObjectNamePrefixH4SwingTrendLine = "LQ2_H4_Swing_";
-const string ChartObjectNamePrefixH4SwingLabelText = "LQ2_H4_SWLBL_";
-const string ChartObjectNamePrefixH4VolumeBreachRay = "LQ2_H4_VOL_BREACH_";
-const color  H4_VOLUME_BREACH_RAY_COLOR_UP   = clrGreen;
-const color  H4_VOLUME_BREACH_RAY_COLOR_DOWN = clrDeepPink;
-const int    H4_VOLUME_BREACH_RAY_ZORDER     = 128;
+const string ChartObjectNamePrefixM15SwingTrendLine = "LQ2_M15_Swing_";
+const string ChartObjectNamePrefixM15SwingLabelText = "LQ2_M15_SWLBL_";
+const string ChartObjectNamePrefixM15VolumeBreachRay = "LQ2_M15_VOL_BREACH_";
+const color  M15_VOLUME_BREACH_RAY_COLOR_UP   = clrGreen;
+const color  M15_VOLUME_BREACH_RAY_COLOR_DOWN = clrDeepPink;
+const int    M15_VOLUME_BREACH_RAY_ZORDER     = 128;
 const string PFX_M2_TREND  = "LQ2_M2_TR_";
 const string PFX_M2_LBL    = "LQ2_M2_LB_";
 const string PFX_M2_ANCHOR = "LQ2_M2_AN_";
 const string LQ_OBJ_PREFIX_FVG_RECT = "LQ2_M2_FVG_";
 const string LQ_OBJ_PREFIX_FVG_LBL  = "LQ2_M2_FVGT_";
 const string LQ_OBJ_HUNT_HUD        = "LQ2_HUNT_HUD";
-const string LQ_OBJ_H4_BIAS_HUD    = "LQ4_H4_BIAS";
+const string LQ_OBJ_M15_BIAS_HUD    = "LQ4_H4_BIAS";
 const string LQ_OBJ_IMPULSE_BUFFER  = "LQ2_IMPULSE_BUF";
 const string LQ_OBJ_TOUCH_POINT     = "LQ2_TOUCH_PT";
 const string LQ_OBJ_IMPULSE_PREFIX      = "LQ2_IMPULSE_BUF_";
@@ -206,10 +206,10 @@ struct V2HuntSession
 
 #define BosOppositeFairValueGapMemoryCapacity 32
 
-#define H4_LIQUIDITY_PIVOT_CAPACITY 600
-#define H4_REPLAY_LEG_CAPACITY      512
+#define M15_LIQUIDITY_PIVOT_CAPACITY 600
+#define M15_REPLAY_LEG_CAPACITY      512
 
-struct H4LiquidityPivot
+struct M15LiquidityPivot
 {
    double   levelPrice;
    datetime legEndTime;
@@ -218,7 +218,7 @@ struct H4LiquidityPivot
    int      swingDirection; // 1 = up leg (high liquidity), -1 = down leg (low liquidity)
 };
 
-struct H4ReplayLeg
+struct M15ReplayLeg
 {
    double   legHighPrice;
    double   legLowPrice;
@@ -227,9 +227,9 @@ struct H4ReplayLeg
    int      swingDirection;
 };
 
-#define H4_LEG_VOLUME_BREACH_CAPACITY 128
+#define M15_LEG_VOLUME_BREACH_CAPACITY 128
 
-struct H4LegVolumeBreachRecord
+struct M15LegVolumeBreachRecord
 {
    datetime            legStartTime;
    datetime            legEndTime;
@@ -241,7 +241,7 @@ struct H4LegVolumeBreachRecord
    bool                huntArmed; // hunt triggered for this breach record
 };
 
-struct H4ActiveLegVolumeBreachTrack
+struct M15ActiveLegVolumeBreachTrack
 {
    datetime legStartTime;
    int      swingDirection;
@@ -251,29 +251,29 @@ struct H4ActiveLegVolumeBreachTrack
    double   breachLevelPrice;
 };
 
-H4LegVolumeBreachRecord      g_h4LegVolumeBreaches[H4_LEG_VOLUME_BREACH_CAPACITY];
-int                          g_h4LegVolumeBreachCount = 0;
-H4ActiveLegVolumeBreachTrack g_h4ActiveLegVolumeTrack;
+M15LegVolumeBreachRecord      g_m15LegVolumeBreaches[M15_LEG_VOLUME_BREACH_CAPACITY];
+int                          g_m15LegVolumeBreachCount = 0;
+M15ActiveLegVolumeBreachTrack g_m15ActiveLegVolumeTrack;
 
-SwingState     g_h4Swing;     // anchor 0.5 â€” breaches, chart legs, liquidity pivots
-SwingState     g_h4BosSwing;  // anchor 1.0 â€” BOS close-cross levels only (no visuals)
+SwingState     g_m15Swing;     // anchor 0.5 Ã¢â‚¬â€ breaches, chart legs, liquidity pivots
+SwingState     g_m15BosSwing;  // anchor 1.0 Ã¢â‚¬â€ BOS close-cross levels only (no visuals)
 SwingState     g_m2Swing;
 LiquidityPool  g_liquidityPools[LiquidityPoolCapacity];
 int            g_liquidityPoolCount = 0;
 
-datetime g_lastH4BarOpen = 0;
+datetime g_lastM15BarOpen = 0;
 datetime g_lastM2BarOpen  = 0;
 
 V2HuntSession g_v2Hunts[V2_MAX_HUNT_SESSIONS];
 
-H4LiquidityPivot g_h4DescHighPivots[H4_LIQUIDITY_PIVOT_CAPACITY];
-int               g_h4DescHighPivotCount = 0;
-H4LiquidityPivot g_h4AscLowPivots[H4_LIQUIDITY_PIVOT_CAPACITY];
-int               g_h4AscLowPivotCount = 0;
+M15LiquidityPivot g_m15DescHighPivots[M15_LIQUIDITY_PIVOT_CAPACITY];
+int               g_m15DescHighPivotCount = 0;
+M15LiquidityPivot g_m15AscLowPivots[M15_LIQUIDITY_PIVOT_CAPACITY];
+int               g_m15AscLowPivotCount = 0;
 
-#define H4_BOS_RECORDED_LEG_CAPACITY 32
+#define M15_BOS_RECORDED_LEG_CAPACITY 32
 
-struct H4BosRecord
+struct M15BosRecord
 {
    int      direction;   // 1 = bull BOS, -1 = bear BOS
    datetime barOpenTime;
@@ -281,13 +281,13 @@ struct H4BosRecord
    double   brokenLevel;
 };
 
-struct H4BosRecordedLeg
+struct M15BosRecordedLeg
 {
    int      direction;
    datetime legEndTime;
 };
 
-struct H4BosPendingConfirm
+struct M15BosPendingConfirm
 {
    bool     active;
    int      direction;        // 1 bull / -1 bear
@@ -296,13 +296,13 @@ struct H4BosPendingConfirm
    datetime breakBarOpenTime; // H4 bar that closed through the level (await 1 more close)
 };
 
-H4BosPendingConfirm g_h4BosPendingConfirm;
-H4BosRecord        g_h4LastBosRecord;
-bool                g_h4LastBosRecordValid     = false;
-H4BosRecordedLeg   g_h4BosRecordedLegs[H4_BOS_RECORDED_LEG_CAPACITY];
-int                 g_h4BosRecordedLegCount    = 0;
-int                 g_h4LastLoggedEffectiveBias    = 0;
-bool                g_h4EffectiveBiasLogReady      = false;
+M15BosPendingConfirm g_m15BosPendingConfirm;
+M15BosRecord        g_m15LastBosRecord;
+bool                g_m15LastBosRecordValid     = false;
+M15BosRecordedLeg   g_m15BosRecordedLegs[M15_BOS_RECORDED_LEG_CAPACITY];
+int                 g_m15BosRecordedLegCount    = 0;
+int                 g_m15LastLoggedEffectiveBias    = 0;
+bool                g_m15EffectiveBiasLogReady      = false;
 bool     g_huntTradeOrdersActive         = false;
 datetime g_huntOrdersFvgFormationTime    = 0;
 bool     g_huntTradeIsBuy                = false;
@@ -319,13 +319,13 @@ void   SwingStartNew(SwingState &swingState, const ENUM_TIMEFRAMES timeframe, co
 void   SwingExtend(SwingState &swingState, const double highPrice, const double lowPrice);
 void   DrawSwingLegLabel(const string chartObjectNamePrefix, const datetime labelBarTime,
                          const double labelPrice, const bool isUplegSwingDirection, const int keyLevelIdForLabel);
-void   SwingCloseH4Context(SwingState &swingState, const ENUM_TIMEFRAMES timeframe,
+void   SwingCloseM15Context(SwingState &swingState, const ENUM_TIMEFRAMES timeframe,
                             const int lastClosedBarShift = 1);
-void   ProcessH4SwingStep(const int lastClosedBarShift = 1);
-void   ProcessH4BosSwingStep(const int lastClosedBarShift = 1);
-void   SwingCloseH4ToHistory(SwingState &swingState, const ENUM_TIMEFRAMES timeframe,
+void   ProcessM15SwingStep(const int lastClosedBarShift = 1);
+void   ProcessM15BosSwingStep(const int lastClosedBarShift = 1);
+void   SwingCloseM15ToHistory(SwingState &swingState, const ENUM_TIMEFRAMES timeframe,
                               const int lastClosedBarShift = 1);
-void   WarmupH4SwingFromHistory();
+void   WarmupM15SwingFromHistory();
 
 void   SwingCloseM2Leg(SwingState &swingState, const ENUM_TIMEFRAMES timeframe, const color swingLineColor,
                        const string chartObjectNamePrefix, const string labelPrefix,
@@ -344,22 +344,6 @@ bool   BuildTradeSwingGroupTakeProfits(const bool isBullishTrade, const datetime
                                        double &outTakeProfitPrices[], int &outTakeProfitCount);
 void   ProcessM2SwingStep();
 void   WarmupM2SwingFromHistory();
-void   UpdateH4LegLiquidityBreachMemoryOnM2Bar();
-bool   H4VolumeBreachLevelsMatch(const double levelA, const double levelB);
-datetime H4LookupBreachVolumeBarOpenTime(const int swingDirection, const ENUM_LIQUIDITY_TYPE lqType,
-                                          const double breachLevel, const datetime legKey);
-bool   H4IsVolumeBreachRecordSwept(const datetime legKey, const int swingDirection,
-                                    const ENUM_LIQUIDITY_TYPE lqType, const double breachLevel);
-bool   H4IsBreachHuntArmed(const datetime legKey, const int swingDirection,
-                            const ENUM_LIQUIDITY_TYPE lqType, const double breachLevel);
-void   H4MarkVolumeBreachRecordSwept(const datetime legKey, const int swingDirection,
-                                      const ENUM_LIQUIDITY_TYPE lqType, const double breachLevel);
-void   H4MarkBreachHuntArmed(const datetime legKey, const int swingDirection,
-                              const ENUM_LIQUIDITY_TYPE lqType, const double breachLevel);
-bool   WasH4VolumeBreachLevelViolatedSinceFormation(const ENUM_LIQUIDITY_TYPE lqType,
-                                                      const double breachLevel,
-                                                      const datetime levelFormedOpenTime,
-                                                      const double pointSize);
 
 void   RefreshLiquidityHuntHud();
 double ReferenceChartHeightForFairValueGapFilterM2();
@@ -371,106 +355,46 @@ bool   TryDetectFairValueGapPatternOnLastClosedBarM2(bool &isBullishFairValueGap
                                                       double &fairValueGapZoneHighPrice);
 bool   DetectFairValueGapOnLastClosedBarM2(bool &isBullishFairValueGap, double &fairValueGapZoneLowPrice,
                                          double &fairValueGapZoneHighPrice);
-bool   TryLatestH4CompletedUpLegHigh(double &outHigh);
-bool   TryLatestH4CompletedDownLegLow(double &outLow);
-bool   TrySecondLastH4CompletedUpLegHigh(double &outHigh);
-bool   TrySecondLastH4CompletedDownLegLow(double &outLow);
-bool   TryNthH4CompletedSwingLeg(const int swingDirection, const int nFromLatest,
+bool   TryLatestM15CompletedUpLegHigh(double &outHigh);
+bool   TryLatestM15CompletedDownLegLow(double &outLow);
+bool   TrySecondLastM15CompletedUpLegHigh(double &outHigh);
+bool   TrySecondLastM15CompletedDownLegLow(double &outLow);
+bool   TryNthM15CompletedSwingLeg(const int swingDirection, const int nFromLatest,
                                   double &outLegHigh, double &outLegLow, datetime &outLegEndTime);
-bool   TryGetH4LegBarOpenTimeFromEnd(const datetime legStartTime, const datetime legEndTime,
+bool   TryGetM15LegBarOpenTimeFromEnd(const datetime legStartTime, const datetime legEndTime,
                                       const int nFromEnd, datetime &outBarOpenTime);
-bool   FindMaxVolumeH4BarBetweenOpenTimes(const datetime rangeStartOpen, const datetime rangeEndOpen,
-                                             datetime &outBarOpenTime, long &outMaxVolume);
-double H4BreachLevelPriceFromVolumeBar(const int swingDirection, const int h4BarShift);
-bool   H4BarHasDecentMovementForLegDirection(const int barShift, const int legSwingDirection);
-bool   H4TryGetLegLastDecentMovementBarOpen(const datetime legStartTime, const datetime legProgressEnd,
-                                              const int swingDirection, datetime &outBarOpenTime);
-datetime H4ProgressEndOpenForDecentLookup(const datetime legProgressEndOpen);
-bool   H4TryGetVolumeBreachWindowBoundFromLastDecent(const datetime legStartTime,
-                                                      const datetime legProgressEnd,
-                                                      const int swingDirection,
-                                                      datetime &outBoundInclusiveOpen);
-bool   H4TryGetLegVolumeBreachWindowStartForScan(const datetime legStartTime,
-                                                  const datetime legProgressEnd,
-                                                  const int swingDirection,
-                                                  datetime &outWindowStartInclusiveOpen);
-bool   H4TryGetLegVolumeBreachWindowEndForScan(const datetime legStartTime,
-                                                const datetime legProgressEnd,
-                                                const int swingDirection,
-                                                datetime &outWindowEndInclusiveOpen);
-bool   H4VolumeBreachWindowShiftRangeValid(const datetime windowStartInclusive,
-                                            const datetime windowEndInclusive);
-bool   H4TryResolveLegVolumeBreachWindowEnd(const datetime legStartTime,
-                                             const datetime legProgressEnd,
-                                             const int swingDirection,
-                                             const datetime windowStartInclusive,
-                                             const int lastClosedBarShift,
-                                             datetime &outWindowEndInclusiveOpen);
-void   H4ScanLegForLiquidityBreaches(const Swing &leg, const datetime progressEndOpen = 0);
-void   H4ScanLegInternalLiquidityBreaches(const Swing &leg, const datetime progressEndOpen);
-void   H4RescanLiquidityBreachesForActiveLeg(const SwingState &swingState, const int lastClosedBarShift);
-void   H4UpdateActiveLegExternalVolumeBreach(const SwingState &swingState, const int lastClosedBarShift);
-void   H4RemoveInternalVolumeBreachRecordsForLeg(const datetime legStartTime);
-void   H4RemoveVolumeBreachRecordsForLeg(const datetime legStartTime);
-void   H4ResetActiveLegVolumeBreachTrack();
-double H4ExternalBreachLevelFromVolumeBar(const int swingDirection, const int h4BarShift);
-ENUM_LIQUIDITY_TYPE H4ExternalLqTypeForSwingDirection(const int swingDirection);
-void   H4ScanExternalVolumeWindowMonotonic(const int swingDirection, const datetime windowStartInclusive,
-                                              const datetime windowEndInclusive, long &inOutMaxVolume,
-                                              datetime &inOutMaxBarOpenTime, double &inOutBreachLevel);
-void   H4RememberExternalBreachForCompletedLeg(const Swing &leg);
-bool   TryGetH4VolumeBreachWindowStartFromLastCompletedLeg(const SwingState &swingState,
-                                                              datetime &outWindowStartOpen);
-void   H4OnH4ActiveLegStarted(SwingState &swingState, const int lastClosedBarShift = 1);
-void   H4OnH4ActiveLegBarClosed(SwingState &swingState, const int lastClosedBarShift = 1);
-void   H4FinalizeActiveLegVolumeBreach(const Swing &closedLeg);
-void   H4PurgeStaleActiveLegVolumeBreachRecords(const datetime keepLegStartTime);
-void   H4RestoreActiveLegVolumeBreachTrackFromSwing();
-void   RememberH4LegVolumeBreachRecord(const datetime legStartTime, const datetime legEndTime,
-                                        const int swingDirection, const ENUM_LIQUIDITY_TYPE lqType,
-                                        const double breachLevel, const datetime volumeBarOpenTime);
-bool   IsH4BreachRecordActiveInBufferWindow(const H4LegVolumeBreachRecord &rec);
-bool   IsH4BarWithinBreachBufferChartWindow(const datetime barOpenTime);
-bool   IsH4LegVolumeBreachActiveInBufferWindow(const datetime legEndTime, const int swingDirection);
-void   RebuildH4LegVolumeBreachLevelsFromSwingHistory();
-void   H4ClearVolumeBreachMemoryAndChart();
-void   DeleteH4VolumeBreachLevelRay(const datetime legStartTime, const ENUM_LIQUIDITY_TYPE lqType,
-                                     const datetime volumeBarOpenTime);
-void   DrawH4VolumeBreachLevelRay(const datetime legStartTime, const datetime legEndTime,
-                                   const int swingDirection, const ENUM_LIQUIDITY_TYPE lqType,
-                                   const datetime volumeBarOpenTime, const double breachLevel);
-void   RebuildAllH4VolumeBreachMarkers();
-void   RebuildH4LiquidityPivotLevels();
-bool   TryDetectH4BosCrossOnBar(const int h4BarShift, int &outDirection,
+ENUM_LIQUIDITY_TYPE M15ExternalLqTypeForSwingDirection(const int swingDirection);
+void   RebuildM15LiquidityPivotLevels();
+bool   TryDetectM15BosCrossOnBar(const int m15BarShift, int &outDirection,
                                  double &outBrokenLevel, datetime &outBarOpenTime,
                                  datetime &outLegEndTime);
-void   ProcessH4BosOnH4Close(const int h4BarShift);
-void   ClearH4BosPendingConfirm();
-bool   H4BosCloseHoldsBeyondLevel(const int direction, const int h4BarShift, const double brokenLevel);
-void   TryConfirmH4BosPendingOnBarClose(const int h4BarShift);
-void   RecordH4BosBreak(const int direction, const datetime barOpenTime, const datetime legEndTime,
+void   ProcessM15BosOnM15Close(const int m15BarShift);
+void   ClearM15BosPendingConfirm();
+bool   M15BosCloseHoldsBeyondLevel(const int direction, const int m15BarShift, const double brokenLevel);
+void   TryConfirmM15BosPendingOnBarClose(const int m15BarShift);
+void   RecordM15BosBreak(const int direction, const datetime barOpenTime, const datetime legEndTime,
                          const double brokenLevel);
-bool   H4BosAlreadyRecordedForLeg(const int direction, const datetime legEndTime);
-void   ResetH4BosBiasState();
+bool   M15BosAlreadyRecordedForLeg(const int direction, const datetime legEndTime);
+void   ResetM15BosBiasState();
 double ReferenceChartHeightForM2BarCount(const int barCount);
 double ReferenceChartHeightForM2BarCountFromShift(const int newestBarShift, const int barCount);
-double ReferenceChartHeightForH4BarCount(const int barCount);
-double ReferenceChartHeightForH4BreachBuffer();
-void   H4BreachBufferBandForUpLegHigh(const double legHigh, double &outBandLow, double &outBandHigh);
-void   H4BreachBufferBandForDownLegLow(const double legLow, double &outBandLow, double &outBandHigh);
-bool   H4BreachImpulseCancelZonePrices(const bool expectBullishFvgHunt, const double breachLevel,
+double ReferenceChartHeightForM15BarCount(const int barCount);
+double ReferenceChartHeightForM15BreachBuffer();
+void   M15BreachBufferBandForUpLegHigh(const double legHigh, double &outBandLow, double &outBandHigh);
+void   M15BreachBufferBandForDownLegLow(const double legLow, double &outBandLow, double &outBandHigh);
+bool   M15BreachImpulseCancelZonePrices(const bool expectBullishFvgHunt, const double breachLevel,
                                         double &outZoneLow, double &outZoneHigh,
                                         double &outCancelLimitPrice);
-int    GetH4TradeDirectionBias(); // 1 bull, -1 bear, 0 undefined/mixed/disabled-filter
-void   LogH4TradeDirectionBiasIfChanged();
-bool   FvgTradeAllowedByH4BosBias(const bool isBullishFairValueGap, string &outBlockReason);
-void   RefreshH4BosBiasHud();
+int    GetM15TradeDirectionBias(); // 1 bull, -1 bear, 0 undefined/mixed/disabled-filter
+void   LogM15TradeDirectionBiasIfChanged();
+bool   FvgTradeAllowedByM15BosBias(const bool isBullishFairValueGap, string &outBlockReason);
+void   RefreshM15BosBiasHud();
 bool   TryDetectM2BreakOfStructureOnLastClosedBar(bool &outExpectsBullishFairValueGap, double &outBosLegLevelPrice);
 void   V2InitHuntSlot(const int huntIndex);
 void   V2InitAllHuntSlots();
 int    V2CountActiveHunts();
 int    V2AllocHuntSlot();
-int    V2FindActiveHuntByH4Leg(const datetime legEndTime, const bool h4HighBreached);
+int    V2FindActiveHuntByM15Leg(const datetime legEndTime, const bool h4HighBreached);
 int    V2FindActiveHuntByBreachPolarity(const bool h4HighBreached);
 void   V2AbortHuntSessionForRestart(const int huntIndex);
 int    V2FindHuntSlotBySessionId(const datetime sessionId);
@@ -500,7 +424,7 @@ void   V3RefreshEngulfVolSpikeBufferDraw(const int huntIndex, const bool isBuy,
                                           const int candle1Shift, const int candle2Shift);
 void   V2UpdateImpulseBufferZone(const int huntIndex);
 void   V2UpdateAllImpulseBufferZones();
-int    V2ArmOppositeFvgHuntAfterH4Breach(const double h4Level, const bool h4HighBreached,
+int    V2ArmOppositeFvgHuntAfterM15Breach(const double h4Level, const bool h4HighBreached,
                                             const datetime breachedLegEndTime,
                                             const int swingDirection, const ENUM_LIQUIDITY_TYPE lqType,
                                             const datetime breachedVolumeBarOpenTime,
@@ -508,8 +432,8 @@ int    V2ArmOppositeFvgHuntAfterH4Breach(const double h4Level, const bool h4High
                                             const double barHigh);
 void   V2EndOppositeFvgHuntSession(const int huntIndex, const string offReason,
                                     const bool tryPlaceTradeAfterOff = false);
-void   V2OnH4LegClosedForHunts(const int closedLegDirection, const datetime closedLegEndTime);
-int    V2OppositeH4LegDirectionForHunt(const int huntIndex);
+void   V2OnM15LegClosedForHunts(const int closedLegDirection, const datetime closedLegEndTime);
+int    V2OppositeM15LegDirectionForHunt(const int huntIndex);
 
 void   ApplyTradeFillingModeFromSymbol();
 double M2TouchVolSlBufferPrice(const int barShift);
@@ -604,15 +528,15 @@ bool   HuntTradeCommentIsOvTpIndex(const string orderComment, const int tpIndex)
 //+------------------------------------------------------------------+
 int OnInit()
 {
-   if(InputSwitchChartToH4 && !InputFastTesterMode)
+   if(InputSwitchChartToM15 && !InputFastTesterMode)
    {
-      ChartSetSymbolPeriod(0, _Symbol, InputH4NarrativeTimeframe);
+      ChartSetSymbolPeriod(0, _Symbol, InputM15NarrativeTimeframe);
       ChartRedraw(0);
    }
 
-   ObjectsDeleteAll(0, ChartObjectNamePrefixH4SwingTrendLine, -1, -1);
-   ObjectsDeleteAll(0, ChartObjectNamePrefixH4SwingLabelText, -1, -1);
-   ObjectsDeleteAll(0, ChartObjectNamePrefixH4VolumeBreachRay, -1, -1);
+   ObjectsDeleteAll(0, ChartObjectNamePrefixM15SwingTrendLine, -1, -1);
+   ObjectsDeleteAll(0, ChartObjectNamePrefixM15SwingLabelText, -1, -1);
+   ObjectsDeleteAll(0, ChartObjectNamePrefixM15VolumeBreachRay, -1, -1);
    ObjectsDeleteAll(0, PFX_M2_TREND, -1, -1);
    ObjectsDeleteAll(0, PFX_M2_LBL, -1, -1);
    ObjectsDeleteAll(0, PFX_M2_ANCHOR, -1, -1);
@@ -627,53 +551,43 @@ int OnInit()
    ObjectsDeleteAll(0, LQ_OBJ_TRADE_SWGRP_RECT_PREFIX, -1, -1);
    ObjectsDeleteAll(0, LQ_OBJ_TRADE_SWGRP_LINE_PREFIX, -1, -1);
 
-   ZeroMemory(g_h4Swing);
-   ZeroMemory(g_h4BosSwing);
+   ZeroMemory(g_m15Swing);
+   ZeroMemory(g_m15BosSwing);
    ZeroMemory(g_m2Swing);
    g_liquidityPoolCount = 0;
 
    V2InitAllHuntSlots();
-   g_h4LegVolumeBreachCount          = 0;
-   H4ResetActiveLegVolumeBreachTrack();
-   ResetH4BosBiasState();
+   g_m15LegVolumeBreachCount          = 0;
+   ZeroMemory(g_m15ActiveLegVolumeTrack);
+   ResetM15BosBiasState();
    ResetHuntTradeState();
 
-   WarmupH4SwingFromHistory();
+   WarmupM15SwingFromHistory();
    WarmupM2SwingFromHistory();
-   ResetH4BosBiasState();
-   H4ClearVolumeBreachMemoryAndChart();
-   RebuildH4LegVolumeBreachLevelsFromSwingHistory();
-   if(g_h4Swing.currentSwingLeg.swingDirection != 0 && g_h4Swing.currentSwingLeg.legStartTime != 0)
-   {
-      H4PurgeStaleActiveLegVolumeBreachRecords(g_h4Swing.currentSwingLeg.legStartTime);
-      H4RestoreActiveLegVolumeBreachTrackFromSwing();
-   }
-   RebuildH4LiquidityPivotLevels();
-   UpdateH4LegLiquidityBreachMemoryOnM2Bar();
-   if(H4LqChartDrawEnabled(InputDrawH4SwingLegVisuals))
-      RebuildAllH4VolumeBreachMarkers();
-   g_h4LastLoggedEffectiveBias = GetH4TradeDirectionBias();
-   g_h4EffectiveBiasLogReady   = true;
+   ResetM15BosBiasState();
+   RebuildM15LiquidityPivotLevels();
+   g_m15LastLoggedEffectiveBias = GetM15TradeDirectionBias();
+   g_m15EffectiveBiasLogReady   = true;
 
-   g_lastH4BarOpen = iTime(_Symbol, InputH4NarrativeTimeframe, 0);
+   g_lastM15BarOpen = iTime(_Symbol, InputM15NarrativeTimeframe, 0);
    g_lastM2BarOpen  = iTime(_Symbol, InputM2NarrativeTimeframe, 0);
 
    g_trade.SetExpertMagicNumber(LQ_EXPERT_MAGIC);
    ApplyTradeFillingModeFromSymbol();
 
-   if(H4LqLoggingEnabled())
+   if(M15LqLoggingEnabled())
    {
       PrintFormat("%s v%s | primary=%s secondary=%s fastTester=%s",
-                  H4_LQ_LOG_PREFIX, SCALPING_VERSION,
-                  EnumToString(InputH4NarrativeTimeframe),
+                  M15_LQ_LOG_PREFIX, SCALPING_VERSION,
+                  EnumToString(InputM15NarrativeTimeframe),
                   EnumToString(InputM2NarrativeTimeframe),
                   InputFastTesterMode ? "Y" : "N");
    }
 
-   if(H4LqChartDrawEnabled())
+   if(M15LqChartDrawEnabled())
    {
       RefreshLiquidityHuntHud();
-      RefreshH4BosBiasHud();
+      RefreshM15BosBiasHud();
       ChartRedraw(0);
    }
    EventSetTimer(1);
@@ -684,16 +598,16 @@ int OnInit()
 void OnDeinit(const int reason)
 {
    EventKillTimer();
-   ObjectsDeleteAll(0, ChartObjectNamePrefixH4SwingTrendLine, -1, -1);
-   ObjectsDeleteAll(0, ChartObjectNamePrefixH4SwingLabelText, -1, -1);
-   ObjectsDeleteAll(0, ChartObjectNamePrefixH4VolumeBreachRay, -1, -1);
+   ObjectsDeleteAll(0, ChartObjectNamePrefixM15SwingTrendLine, -1, -1);
+   ObjectsDeleteAll(0, ChartObjectNamePrefixM15SwingLabelText, -1, -1);
+   ObjectsDeleteAll(0, ChartObjectNamePrefixM15VolumeBreachRay, -1, -1);
    ObjectsDeleteAll(0, PFX_M2_TREND, -1, -1);
    ObjectsDeleteAll(0, PFX_M2_LBL, -1, -1);
    ObjectsDeleteAll(0, PFX_M2_ANCHOR, -1, -1);
    ObjectsDeleteAll(0, LQ_OBJ_PREFIX_FVG_RECT, -1, -1);
    ObjectsDeleteAll(0, LQ_OBJ_PREFIX_FVG_LBL, -1, -1);
    ObjectDelete(0, LQ_OBJ_HUNT_HUD);
-   ObjectDelete(0, LQ_OBJ_H4_BIAS_HUD);
+   ObjectDelete(0, LQ_OBJ_M15_BIAS_HUD);
    ObjectsDeleteAll(0, LQ_OBJ_IMPULSE_PREFIX, -1, -1);
    ObjectsDeleteAll(0, LQ_OBJ_ENGULF_VOL_SPIKE_PREFIX, -1, -1);
    ObjectsDeleteAll(0, LQ_OBJ_ENGULF_VOL_ARRIVAL_PREFIX, -1, -1);
@@ -715,59 +629,53 @@ void OnTick()
 {
    CheckHuntPreEntrySlCancelOnTick();
    CheckHuntPreEntryTp3CancelOnTick();
-   if(H4LqChartDrawEnabled())
+   if(M15LqChartDrawEnabled())
    {
       UpdateM2SwingAnchorVisualRealtime(g_m2Swing);
       UpdateM2LiveSwingLegVisualOnTick();
    }
 
-   const datetime tH4 = iTime(_Symbol, InputH4NarrativeTimeframe, 0);
-   if(tH4 != g_lastH4BarOpen)
+   const datetime tH4 = iTime(_Symbol, InputM15NarrativeTimeframe, 0);
+   if(tH4 != g_lastM15BarOpen)
    {
-      g_lastH4BarOpen = tH4;
-      ProcessH4SwingStep(1);
-      ProcessH4BosSwingStep(1);
-      RebuildH4LiquidityPivotLevels();
-      ProcessH4BosOnH4Close(1);
-      if(H4LqChartDrawEnabled(InputDrawH4SwingLegVisuals))
-         RebuildAllH4VolumeBreachMarkers();
-      if(InputEnableH4BosTradeDirectionBias)
-         LogH4TradeDirectionBiasIfChanged();
-      if(H4LqChartDrawEnabled(InputShowH4BosBiasHud))
-         RefreshH4BosBiasHud();
+      g_lastM15BarOpen = tH4;
+      ProcessM15SwingStep(1);
+      ProcessM15BosSwingStep(1);
+      RebuildM15LiquidityPivotLevels();
+      ProcessM15BosOnM15Close(1);
+      if(InputEnableM15BosTradeDirectionBias)
+         LogM15TradeDirectionBiasIfChanged();
+      if(M15LqChartDrawEnabled(InputShowM15BosBiasHud))
+         RefreshM15BosBiasHud();
    }
 
    const datetime tM2 = iTime(_Symbol, InputM2NarrativeTimeframe, 0);
    if(tM2 != g_lastM2BarOpen)
    {
       g_lastM2BarOpen = tM2;
-      if(InputEnableEngulfHuntAfterH4Breach)
+      if(InputEnableEngulfHuntAfterM15Breach)
          ProcessHuntEngulfingOnM2BarClose();
-      UpdateH4LegLiquidityBreachMemoryOnM2Bar();
-      if(H4LqChartDrawEnabled(InputDrawH4SwingLegVisuals))
-         RebuildAllH4VolumeBreachMarkers();
       ProcessM2SwingStep();
       ManageHuntOpenPositionsOnM2BarClose();
-      if(H4LqChartDrawEnabled(InputShowLiquidityHuntHud))
+      if(M15LqChartDrawEnabled(InputShowLiquidityHuntHud))
          RefreshLiquidityHuntHud();
    }
 }
 
 //+------------------------------------------------------------------+
-void WarmupH4SwingFromHistory()
+void WarmupM15SwingFromHistory()
 {
    if(InputWarmupBars <= 0)
       return;
-   const int bars = iBars(_Symbol, InputH4NarrativeTimeframe);
+   const int bars = iBars(_Symbol, InputM15NarrativeTimeframe);
    const int n = (int)MathMin(bars - 2, InputWarmupBars);
    if(n < 1)
       return;
    for(int k = n; k >= 1; k--)
    {
-      ProcessH4SwingStep(k);
-      ProcessH4BosSwingStep(k);
-      RebuildH4LiquidityPivotLevels();
-      ProcessH4BosOnH4Close(k);
+      ProcessM15SwingStep(k);
+      ProcessM15BosSwingStep(k);
+      ProcessM15BosOnM15Close(k);
    }
 }
 
@@ -909,7 +817,7 @@ bool SetM2SwingTrendSegment(const string objectName, const datetime timeStart, c
 }
 
 //+------------------------------------------------------------------+
-// plot_swing_h1_m5_copy SwingClose â€” M2 only (no H1 keyLevelId).
+// plot_swing_h1_m5_copy SwingClose Ã¢â‚¬â€ M2 only (no H1 keyLevelId).
 //+------------------------------------------------------------------+
 void SwingCloseM2Leg(SwingState &swingState, const ENUM_TIMEFRAMES timeframe, const color swingLineColor,
                      const string chartObjectNamePrefix, const string labelPrefix,
@@ -919,7 +827,7 @@ void SwingCloseM2Leg(SwingState &swingState, const ENUM_TIMEFRAMES timeframe, co
 
    swingState.currentSwingLeg.legEndTime = iTime(_Symbol, timeframe, lastClosedBarShift);
 
-   if(timeframe == InputM2NarrativeTimeframe && H4LqChartDrawEnabled(InputDrawM2SwingLegs))
+   if(timeframe == InputM2NarrativeTimeframe && M15LqChartDrawEnabled(InputDrawM2SwingLegs))
       ObjectDelete(0, PFX_M2_TREND + "LIVE");
 
    const string chartObjectName =
@@ -939,7 +847,7 @@ void SwingCloseM2Leg(SwingState &swingState, const ENUM_TIMEFRAMES timeframe, co
       trendLineEndPrice   = swingState.currentSwingLeg.legLowPrice;
    }
 
-   if(H4LqChartDrawEnabled(InputDrawM2SwingLegs))
+   if(M15LqChartDrawEnabled(InputDrawM2SwingLegs))
    {
       SetM2SwingTrendSegment(chartObjectName, swingState.currentSwingLeg.legStartTime, trendLineStartPrice,
                              swingState.currentSwingLeg.legEndTime, trendLineEndPrice, swingLineColor, false);
@@ -966,7 +874,7 @@ void SwingCloseM2Leg(SwingState &swingState, const ENUM_TIMEFRAMES timeframe, co
 void UpdateM2LiveSwingLegVisualCore(const SwingState &swingState, const double legHighPrice,
                                     const double legLowPrice)
 {
-   if(!H4LqChartDrawEnabled(InputDrawM2SwingLegs) || swingState.currentSwingLeg.swingDirection == 0)
+   if(!M15LqChartDrawEnabled(InputDrawM2SwingLegs) || swingState.currentSwingLeg.swingDirection == 0)
       return;
 
    datetime tEnd = iTime(_Symbol, InputM2NarrativeTimeframe, 0);
@@ -1018,13 +926,13 @@ void UpdateM2LiveSwingLegVisualOnTick()
 }
 
 //+------------------------------------------------------------------+
-//| Realtime segment at priceAnchorLevel â€” close cross vs this flips the M2 leg. |
+//| Realtime segment at priceAnchorLevel Ã¢â‚¬â€ close cross vs this flips the M2 leg. |
 //+------------------------------------------------------------------+
 void UpdateM2SwingAnchorVisualRealtime(const SwingState &swingState)
 {
    const string liveName = PFX_M2_ANCHOR + "LIVE";
 
-   if(!H4LqChartDrawEnabled(InputDrawM2SwingAnchorLevel) ||
+   if(!M15LqChartDrawEnabled(InputDrawM2SwingAnchorLevel) ||
       swingState.currentSwingLeg.swingDirection == 0 ||
       swingState.priceAnchorLevel <= 0.0)
    {
@@ -1077,7 +985,7 @@ void ProcessSwingStepAtShift(SwingState &swingState, const ENUM_TIMEFRAMES timef
    const int candleDirection =
       (lastClosedBarClose > lastClosedBarOpen) ? 1
       : ((lastClosedBarClose < lastClosedBarOpen) ? -1 : 0);
-   // Anchor tolerance: M2 = body vs 0.2Ã— prior avg; H4 = wick AND body vs 0.5Ã— prior avg.
+   // Anchor tolerance: M2 = body vs 0.2Ãƒâ€” prior avg; H4 = wick AND body vs 0.5Ãƒâ€” prior avg.
    const double lastClosedBarBodyRange = MathAbs(lastClosedBarClose - lastClosedBarOpen);
    const double lastClosedBarWickRange  = lastClosedBarHigh - lastClosedBarLow;
 
@@ -1109,7 +1017,7 @@ void ProcessSwingStepAtShift(SwingState &swingState, const ENUM_TIMEFRAMES timef
    const double averageRangeFiveBars = (rangeBarCount > 0) ? sumRangeFivePriorBars / (double)rangeBarCount : 0.0;
 
    const double anchorDecentMovementMultiplier =
-      (timeframe == InputH4NarrativeTimeframe) ? 0.5 : 0.2;
+      (timeframe == InputM15NarrativeTimeframe) ? 0.5 : 0.2;
    const double minDecentRange = averageRangeFiveBars * anchorDecentMovementMultiplier;
    const bool isDecentMovement =
       (timeframe == InputM2NarrativeTimeframe)
@@ -1171,7 +1079,7 @@ void ProcessM2SwingStep()
 }
 
 //+------------------------------------------------------------------+
-void SwingCloseH4Context(SwingState &swingState, const ENUM_TIMEFRAMES timeframe,
+void SwingCloseM15Context(SwingState &swingState, const ENUM_TIMEFRAMES timeframe,
                           const int lastClosedBarShift = 1)
 {
    swingState.currentSwingLeg.legEndTime = iTime(_Symbol, timeframe, lastClosedBarShift);
@@ -1181,10 +1089,10 @@ void SwingCloseH4Context(SwingState &swingState, const ENUM_TIMEFRAMES timeframe
    const bool   isSupplyPool  = (swingState.currentSwingLeg.swingDirection == 1);
    PushLiquidityPoolFromClosedSwing(poolLowPrice, poolHighPrice, isSupplyPool);
 
-   if(H4LqChartDrawEnabled(InputDrawH4SwingLegVisuals))
+   if(M15LqChartDrawEnabled(InputDrawM15SwingLegVisuals))
    {
       const string chartObjectName =
-         ChartObjectNamePrefixH4SwingTrendLine + IntegerToString((long)swingState.currentSwingLeg.legEndTime);
+         ChartObjectNamePrefixM15SwingTrendLine + IntegerToString((long)swingState.currentSwingLeg.legEndTime);
 
       double trendLineStartPrice;
       double trendLineEndPrice;
@@ -1206,7 +1114,7 @@ void SwingCloseH4Context(SwingState &swingState, const ENUM_TIMEFRAMES timeframe
       if(ObjectCreate(0, chartObjectName, OBJ_TREND, 0, swingState.currentSwingLeg.legStartTime,
                       trendLineStartPrice, tRightDraw, trendLineEndPrice))
       {
-         ObjectSetInteger(0, chartObjectName, OBJPROP_COLOR, InputH4SwingTrendLineColor);
+         ObjectSetInteger(0, chartObjectName, OBJPROP_COLOR, InputM15SwingTrendLineColor);
          ObjectSetInteger(0, chartObjectName, OBJPROP_WIDTH, 1);
          ObjectSetInteger(0, chartObjectName, OBJPROP_RAY_RIGHT, false);
          ObjectSetInteger(0, chartObjectName, OBJPROP_SELECTABLE, false);
@@ -1215,7 +1123,7 @@ void SwingCloseH4Context(SwingState &swingState, const ENUM_TIMEFRAMES timeframe
       }
 
       const bool isUplegSwingDirection = (swingState.currentSwingLeg.swingDirection == 1);
-      DrawSwingLegLabel(ChartObjectNamePrefixH4SwingLabelText, swingState.currentSwingLeg.legEndTime,
+      DrawSwingLegLabel(ChartObjectNamePrefixM15SwingLabelText, swingState.currentSwingLeg.legEndTime,
                         trendLineEndPrice, isUplegSwingDirection, 0);
    }
 
@@ -1233,7 +1141,7 @@ void SwingCloseH4Context(SwingState &swingState, const ENUM_TIMEFRAMES timeframe
 }
 
 //+------------------------------------------------------------------+
-void SwingCloseH4ToHistory(SwingState &swingState, const ENUM_TIMEFRAMES timeframe,
+void SwingCloseM15ToHistory(SwingState &swingState, const ENUM_TIMEFRAMES timeframe,
                             const int lastClosedBarShift = 1)
 {
    swingState.currentSwingLeg.legEndTime = iTime(_Symbol, timeframe, lastClosedBarShift);
@@ -1252,11 +1160,11 @@ void SwingCloseH4ToHistory(SwingState &swingState, const ENUM_TIMEFRAMES timefra
 }
 
 //+------------------------------------------------------------------+
-void ProcessH4SwingStepCore(SwingState &swingState, const int lastClosedBarShift,
+void ProcessM15SwingStepCore(SwingState &swingState, const int lastClosedBarShift,
                              const double anchorMultiplier, const bool useWickAndBodyForDecent,
                              const bool withBreachSideEffects)
 {
-   const ENUM_TIMEFRAMES timeframe = InputH4NarrativeTimeframe;
+   const ENUM_TIMEFRAMES timeframe = InputM15NarrativeTimeframe;
    const int         sh            = lastClosedBarShift;
 
    const double lastClosedBarOpen  = iOpen(_Symbol, timeframe, sh);
@@ -1277,8 +1185,6 @@ void ProcessH4SwingStepCore(SwingState &swingState, const int lastClosedBarShift
          return;
       SwingStartNew(swingState, timeframe, candleDirection, lastClosedBarHigh, lastClosedBarLow, sh);
       swingState.priceAnchorLevel = (lastClosedBarHigh + lastClosedBarLow) / 2.0;
-      if(withBreachSideEffects)
-         H4OnH4ActiveLegStarted(swingState, sh);
       return;
    }
 
@@ -1313,31 +1219,21 @@ void ProcessH4SwingStepCore(SwingState &swingState, const int lastClosedBarShift
          swingState.priceAnchorLevel = (lastClosedBarHigh + lastClosedBarLow) / 2.0;
 
       SwingExtend(swingState, lastClosedBarHigh, lastClosedBarLow);
-      if(withBreachSideEffects)
-      {
-         if(g_h4ActiveLegVolumeTrack.legStartTime != swingState.currentSwingLeg.legStartTime)
-            H4OnH4ActiveLegStarted(swingState, sh);
-         else
-            H4OnH4ActiveLegBarClosed(swingState, sh);
-      }
       return;
    }
 
    SwingExtend(swingState, lastClosedBarHigh, lastClosedBarLow);
 
    if(withBreachSideEffects)
-      H4OnH4ActiveLegBarClosed(swingState, sh);
-
-   if(withBreachSideEffects)
-      SwingCloseH4Context(swingState, timeframe, sh);
+      SwingCloseM15Context(swingState, timeframe, sh);
    else
-      SwingCloseH4ToHistory(swingState, timeframe, sh);
+      SwingCloseM15ToHistory(swingState, timeframe, sh);
 
    Swing closedSwingLeg = swingState.swingHistory[swingState.swingHistoryCount - 1];
    if(withBreachSideEffects)
    {
-      H4FinalizeActiveLegVolumeBreach(closedSwingLeg);
-      V2OnH4LegClosedForHunts(closedSwingLeg.swingDirection, closedSwingLeg.legEndTime);
+      M15SyncExternalBreachFromSwingLeg(closedSwingLeg);
+      V2OnM15LegClosedForHunts(closedSwingLeg.swingDirection, closedSwingLeg.legEndTime);
    }
 
    double newSwingLegHigh = lastClosedBarHigh;
@@ -1349,30 +1245,28 @@ void ProcessH4SwingStepCore(SwingState &swingState, const int lastClosedBarShift
 
    SwingStartNew(swingState, timeframe, nextSwingDirection, newSwingLegHigh, newSwingLegLow, sh);
    swingState.priceAnchorLevel = (lastClosedBarHigh + lastClosedBarLow) / 2.0;
-   if(withBreachSideEffects)
-      H4OnH4ActiveLegStarted(swingState, sh);
 }
 
 //+------------------------------------------------------------------+
-//| H4 breach/hunt swing legs: anchor 0.5 (wick + body vs prior 5-bar avg). |
+//| M15 breach/hunt swing legs: anchor 0.5 (wick + body vs prior 5-bar avg). |
 //+------------------------------------------------------------------+
-void ProcessH4SwingStep(const int lastClosedBarShift = 1)
+void ProcessM15SwingStep(const int lastClosedBarShift = 1)
 {
-   ProcessH4SwingStepCore(g_h4Swing, lastClosedBarShift, H4_BREACH_ANCHOR_MULTIPLIER, true, true);
+   ProcessM15SwingStepCore(g_m15Swing, lastClosedBarShift, M15_BREACH_ANCHOR_MULTIPLIER, true, true);
 }
 
 //+------------------------------------------------------------------+
 //| H4 BOS swing legs: anchor 1.0 (full range vs prior 5-bar avg), memory only. |
 //+------------------------------------------------------------------+
-void ProcessH4BosSwingStep(const int lastClosedBarShift = 1)
+void ProcessM15BosSwingStep(const int lastClosedBarShift = 1)
 {
-   ProcessH4SwingStepCore(g_h4BosSwing, lastClosedBarShift, H4_BOS_ANCHOR_MULTIPLIER, false, false);
+   ProcessM15SwingStepCore(g_m15BosSwing, lastClosedBarShift, M15_BOS_ANCHOR_MULTIPLIER, false, false);
 }
 
 //+------------------------------------------------------------------+
 void RefreshLiquidityHuntHud()
 {
-   if(!H4LqChartDrawEnabled(InputShowLiquidityHuntHud))
+   if(!M15LqChartDrawEnabled(InputShowLiquidityHuntHud))
    {
       ObjectDelete(0, LQ_OBJ_HUNT_HUD);
       return;
@@ -1410,9 +1304,9 @@ void RefreshLiquidityHuntHud()
 }
 
 //+------------------------------------------------------------------+
-//| H4 BOS cross: close cross vs latest same-dir leg on g_h4BosSwing (anchor 1.0). |
+//| H4 BOS cross: close cross vs latest same-dir leg on g_m15BosSwing (anchor 1.0). |
 //+------------------------------------------------------------------+
-bool TryDetectH4BosCrossOnBar(const int h4BarShift, int &outDirection,
+bool TryDetectM15BosCrossOnBar(const int m15BarShift, int &outDirection,
                                double &outBrokenLevel, datetime &outBarOpenTime,
                                datetime &outLegEndTime)
 {
@@ -1421,45 +1315,45 @@ bool TryDetectH4BosCrossOnBar(const int h4BarShift, int &outDirection,
    outBarOpenTime = 0;
    outLegEndTime  = 0;
 
-   if(h4BarShift < 0 || g_h4BosSwing.swingHistoryCount < 1)
+   if(m15BarShift < 0 || g_m15BosSwing.swingHistoryCount < 1)
       return false;
 
-   const ENUM_TIMEFRAMES tf = InputH4NarrativeTimeframe;
-   const double closePrice  = iClose(_Symbol, tf, h4BarShift);
-   const double prevClose   = iClose(_Symbol, tf, h4BarShift + 1);
+   const ENUM_TIMEFRAMES tf = InputM15NarrativeTimeframe;
+   const double closePrice  = iClose(_Symbol, tf, m15BarShift);
+   const double prevClose   = iClose(_Symbol, tf, m15BarShift + 1);
    const double pointSize   = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
 
-   outBarOpenTime = iTime(_Symbol, tf, h4BarShift);
+   outBarOpenTime = iTime(_Symbol, tf, m15BarShift);
    if(outBarOpenTime == 0)
       return false;
 
-   for(int historyIndex = g_h4BosSwing.swingHistoryCount - 1; historyIndex >= 0; historyIndex--)
+   for(int historyIndex = g_m15BosSwing.swingHistoryCount - 1; historyIndex >= 0; historyIndex--)
    {
-      if(g_h4BosSwing.swingHistory[historyIndex].swingDirection != 1)
+      if(g_m15BosSwing.swingHistory[historyIndex].swingDirection != 1)
          continue;
 
-      const double legHigh = g_h4BosSwing.swingHistory[historyIndex].legHighPrice;
+      const double legHigh = g_m15BosSwing.swingHistory[historyIndex].legHighPrice;
       if(closePrice > legHigh + pointSize && prevClose <= legHigh + pointSize)
       {
          outDirection   = 1;
          outBrokenLevel = legHigh;
-         outLegEndTime  = g_h4BosSwing.swingHistory[historyIndex].legEndTime;
+         outLegEndTime  = g_m15BosSwing.swingHistory[historyIndex].legEndTime;
          return true;
       }
       break;
    }
 
-   for(int historyIndex = g_h4BosSwing.swingHistoryCount - 1; historyIndex >= 0; historyIndex--)
+   for(int historyIndex = g_m15BosSwing.swingHistoryCount - 1; historyIndex >= 0; historyIndex--)
    {
-      if(g_h4BosSwing.swingHistory[historyIndex].swingDirection != -1)
+      if(g_m15BosSwing.swingHistory[historyIndex].swingDirection != -1)
          continue;
 
-      const double legLow = g_h4BosSwing.swingHistory[historyIndex].legLowPrice;
+      const double legLow = g_m15BosSwing.swingHistory[historyIndex].legLowPrice;
       if(closePrice < legLow - pointSize && prevClose >= legLow - pointSize)
       {
          outDirection   = -1;
          outBrokenLevel = legLow;
-         outLegEndTime  = g_h4BosSwing.swingHistory[historyIndex].legEndTime;
+         outLegEndTime  = g_m15BosSwing.swingHistory[historyIndex].legEndTime;
          return true;
       }
       break;
@@ -1469,18 +1363,18 @@ bool TryDetectH4BosCrossOnBar(const int h4BarShift, int &outDirection,
 }
 
 //+------------------------------------------------------------------+
-void ClearH4BosPendingConfirm()
+void ClearM15BosPendingConfirm()
 {
-   ZeroMemory(g_h4BosPendingConfirm);
+   ZeroMemory(g_m15BosPendingConfirm);
 }
 
 //+------------------------------------------------------------------+
-bool H4BosCloseHoldsBeyondLevel(const int direction, const int h4BarShift, const double brokenLevel)
+bool M15BosCloseHoldsBeyondLevel(const int direction, const int m15BarShift, const double brokenLevel)
 {
    if(direction != 1 && direction != -1)
       return false;
 
-   const double closePrice = iClose(_Symbol, InputH4NarrativeTimeframe, h4BarShift);
+   const double closePrice = iClose(_Symbol, InputM15NarrativeTimeframe, m15BarShift);
    const double pointSize  = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
    const double eps        = (pointSize > 0.0 ? pointSize : 0.00001);
 
@@ -1490,43 +1384,43 @@ bool H4BosCloseHoldsBeyondLevel(const int direction, const int h4BarShift, const
 }
 
 //+------------------------------------------------------------------+
-void ResetH4BosBiasState()
+void ResetM15BosBiasState()
 {
-   ZeroMemory(g_h4LastBosRecord);
-   g_h4LastBosRecordValid    = false;
-   g_h4BosRecordedLegCount   = 0;
-   ClearH4BosPendingConfirm();
+   ZeroMemory(g_m15LastBosRecord);
+   g_m15LastBosRecordValid    = false;
+   g_m15BosRecordedLegCount   = 0;
+   ClearM15BosPendingConfirm();
 }
 
 //+------------------------------------------------------------------+
-void RememberH4BosRecordedLeg(const int direction, const datetime legEndTime)
+void RememberM15BosRecordedLeg(const int direction, const datetime legEndTime)
 {
    if(direction == 0 || legEndTime == 0)
       return;
 
-   if(g_h4BosRecordedLegCount >= H4_BOS_RECORDED_LEG_CAPACITY)
+   if(g_m15BosRecordedLegCount >= M15_BOS_RECORDED_LEG_CAPACITY)
    {
-      for(int shiftIndex = 1; shiftIndex < H4_BOS_RECORDED_LEG_CAPACITY; shiftIndex++)
-         g_h4BosRecordedLegs[shiftIndex - 1] = g_h4BosRecordedLegs[shiftIndex];
-      g_h4BosRecordedLegCount = H4_BOS_RECORDED_LEG_CAPACITY - 1;
+      for(int shiftIndex = 1; shiftIndex < M15_BOS_RECORDED_LEG_CAPACITY; shiftIndex++)
+         g_m15BosRecordedLegs[shiftIndex - 1] = g_m15BosRecordedLegs[shiftIndex];
+      g_m15BosRecordedLegCount = M15_BOS_RECORDED_LEG_CAPACITY - 1;
    }
 
-   const int index = g_h4BosRecordedLegCount;
-   g_h4BosRecordedLegs[index].direction  = direction;
-   g_h4BosRecordedLegs[index].legEndTime   = legEndTime;
-   g_h4BosRecordedLegCount++;
+   const int index = g_m15BosRecordedLegCount;
+   g_m15BosRecordedLegs[index].direction  = direction;
+   g_m15BosRecordedLegs[index].legEndTime   = legEndTime;
+   g_m15BosRecordedLegCount++;
 }
 
 //+------------------------------------------------------------------+
-bool H4BosAlreadyRecordedForLeg(const int direction, const datetime legEndTime)
+bool M15BosAlreadyRecordedForLeg(const int direction, const datetime legEndTime)
 {
    if(legEndTime == 0)
       return false;
 
-   for(int i = 0; i < g_h4BosRecordedLegCount; i++)
+   for(int i = 0; i < g_m15BosRecordedLegCount; i++)
    {
-      if(g_h4BosRecordedLegs[i].direction == direction &&
-         g_h4BosRecordedLegs[i].legEndTime == legEndTime)
+      if(g_m15BosRecordedLegs[i].direction == direction &&
+         g_m15BosRecordedLegs[i].legEndTime == legEndTime)
          return true;
    }
    return false;
@@ -1535,26 +1429,26 @@ bool H4BosAlreadyRecordedForLeg(const int direction, const datetime legEndTime)
 //+------------------------------------------------------------------+
 //| Confirm pending BOS after 1 closed H4 candle (reject fake breakout). |
 //+------------------------------------------------------------------+
-void TryConfirmH4BosPendingOnBarClose(const int h4BarShift)
+void TryConfirmM15BosPendingOnBarClose(const int m15BarShift)
 {
-   if(!g_h4BosPendingConfirm.active)
+   if(!g_m15BosPendingConfirm.active)
       return;
 
-   const int      direction       = g_h4BosPendingConfirm.direction;
-   const double   brokenLevel     = g_h4BosPendingConfirm.brokenLevel;
-   const datetime legEndTime      = g_h4BosPendingConfirm.legEndTime;
-   const datetime breakBarOpenTime = g_h4BosPendingConfirm.breakBarOpenTime;
-   const datetime confirmBarOpenTime = iTime(_Symbol, InputH4NarrativeTimeframe, h4BarShift);
+   const int      direction       = g_m15BosPendingConfirm.direction;
+   const double   brokenLevel     = g_m15BosPendingConfirm.brokenLevel;
+   const datetime legEndTime      = g_m15BosPendingConfirm.legEndTime;
+   const datetime breakBarOpenTime = g_m15BosPendingConfirm.breakBarOpenTime;
+   const datetime confirmBarOpenTime = iTime(_Symbol, InputM15NarrativeTimeframe, m15BarShift);
 
-   ClearH4BosPendingConfirm();
+   ClearM15BosPendingConfirm();
 
    if(confirmBarOpenTime == 0)
       return;
 
-   if(H4BosCloseHoldsBeyondLevel(direction, h4BarShift, brokenLevel))
+   if(M15BosCloseHoldsBeyondLevel(direction, m15BarShift, brokenLevel))
    {
-      RecordH4BosBreak(direction, confirmBarOpenTime, legEndTime, brokenLevel);
-      if(H4LqLoggingEnabled())
+      RecordM15BosBreak(direction, confirmBarOpenTime, legEndTime, brokenLevel);
+      if(M15LqLoggingEnabled())
       {
          LogHuntEvent("H4_BOS",
                       StringFormat("%s BOS confirmed confirmBar=%s breakBar=%s legEnd=%s lvl=%.5f",
@@ -1567,51 +1461,51 @@ void TryConfirmH4BosPendingOnBarClose(const int h4BarShift)
       return;
    }
 
-   if(H4LqLoggingEnabled())
+   if(M15LqLoggingEnabled())
    {
       LogHuntEvent("H4_BOS_REJECT",
                    StringFormat("%s fake breakout breakBar=%s confirmBar=%s close=%.5f lvl=%.5f",
                                 direction == 1 ? "bull" : "bear",
                                 TimeToString(breakBarOpenTime, TIME_DATE | TIME_MINUTES),
                                 TimeToString(confirmBarOpenTime, TIME_DATE | TIME_MINUTES),
-                                iClose(_Symbol, InputH4NarrativeTimeframe, h4BarShift),
+                                iClose(_Symbol, InputM15NarrativeTimeframe, m15BarShift),
                                 brokenLevel));
    }
 }
 
 //+------------------------------------------------------------------+
-//| H4 BOS: cross â†’ pending; next H4 close must hold beyond level.   |
+//| H4 BOS: cross Ã¢â€ â€™ pending; next H4 close must hold beyond level.   |
 //+------------------------------------------------------------------+
-void ProcessH4BosOnH4Close(const int h4BarShift)
+void ProcessM15BosOnM15Close(const int m15BarShift)
 {
-   if(h4BarShift < 1 || g_h4BosSwing.swingHistoryCount < 1)
+   if(m15BarShift < 1 || g_m15BosSwing.swingHistoryCount < 1)
       return;
 
-   TryConfirmH4BosPendingOnBarClose(h4BarShift);
+   TryConfirmM15BosPendingOnBarClose(m15BarShift);
 
    int      bosDirection = 0;
    double   brokenLevel  = 0.0;
    datetime barOpenTime  = 0;
    datetime legEndTime   = 0;
-   if(!TryDetectH4BosCrossOnBar(h4BarShift, bosDirection, brokenLevel, barOpenTime, legEndTime))
+   if(!TryDetectM15BosCrossOnBar(m15BarShift, bosDirection, brokenLevel, barOpenTime, legEndTime))
       return;
 
    if(legEndTime == 0 || barOpenTime == 0)
       return;
 
-   if(H4BosAlreadyRecordedForLeg(bosDirection, legEndTime))
+   if(M15BosAlreadyRecordedForLeg(bosDirection, legEndTime))
       return;
 
-   g_h4BosPendingConfirm.active           = true;
-   g_h4BosPendingConfirm.direction        = bosDirection;
-   g_h4BosPendingConfirm.brokenLevel      = brokenLevel;
-   g_h4BosPendingConfirm.legEndTime       = legEndTime;
-   g_h4BosPendingConfirm.breakBarOpenTime = barOpenTime;
+   g_m15BosPendingConfirm.active           = true;
+   g_m15BosPendingConfirm.direction        = bosDirection;
+   g_m15BosPendingConfirm.brokenLevel      = brokenLevel;
+   g_m15BosPendingConfirm.legEndTime       = legEndTime;
+   g_m15BosPendingConfirm.breakBarOpenTime = barOpenTime;
 
-   if(H4LqLoggingEnabled())
+   if(M15LqLoggingEnabled())
    {
       LogHuntEvent("H4_BOS_PENDING",
-                   StringFormat("%s cross breakBar=%s legEnd=%s lvl=%.5f â€” await 1 H4 close",
+                   StringFormat("%s cross breakBar=%s legEnd=%s lvl=%.5f Ã¢â‚¬â€ await 1 H4 close",
                                 bosDirection == 1 ? "bull" : "bear",
                                 TimeToString(barOpenTime, TIME_DATE | TIME_MINUTES),
                                 TimeToString(legEndTime, TIME_DATE | TIME_MINUTES),
@@ -1620,26 +1514,26 @@ void ProcessH4BosOnH4Close(const int h4BarShift)
 }
 
 //+------------------------------------------------------------------+
-void RecordH4BosBreak(const int direction, const datetime barOpenTime, const datetime legEndTime,
+void RecordM15BosBreak(const int direction, const datetime barOpenTime, const datetime legEndTime,
                        const double brokenLevel)
 {
    if(direction == 0 || barOpenTime == 0 || legEndTime == 0)
       return;
 
-   if(H4BosAlreadyRecordedForLeg(direction, legEndTime))
+   if(M15BosAlreadyRecordedForLeg(direction, legEndTime))
       return;
 
-   RememberH4BosRecordedLeg(direction, legEndTime);
+   RememberM15BosRecordedLeg(direction, legEndTime);
 
-   g_h4LastBosRecord.direction   = direction;
-   g_h4LastBosRecord.barOpenTime = barOpenTime;
-   g_h4LastBosRecord.legEndTime  = legEndTime;
-   g_h4LastBosRecord.brokenLevel = brokenLevel;
-   g_h4LastBosRecordValid        = true;
+   g_m15LastBosRecord.direction   = direction;
+   g_m15LastBosRecord.barOpenTime = barOpenTime;
+   g_m15LastBosRecord.legEndTime  = legEndTime;
+   g_m15LastBosRecord.brokenLevel = brokenLevel;
+   g_m15LastBosRecordValid        = true;
 }
 
 //+------------------------------------------------------------------+
-string H4TradeDirectionBiasText(const int bias)
+string M15TradeDirectionBiasText(const int bias)
 {
    if(bias == 1)
       return "bull";
@@ -1649,33 +1543,33 @@ string H4TradeDirectionBiasText(const int bias)
 }
 
 //+------------------------------------------------------------------+
-void LogH4TradeDirectionBiasIfChanged()
+void LogM15TradeDirectionBiasIfChanged()
 {
-   if(!H4LqLoggingEnabled() || !InputEnableH4BosTradeDirectionBias)
+   if(!M15LqLoggingEnabled() || !InputEnableM15BosTradeDirectionBias)
       return;
 
-   const int bias = GetH4TradeDirectionBias();
-   if(!g_h4EffectiveBiasLogReady)
+   const int bias = GetM15TradeDirectionBias();
+   if(!g_m15EffectiveBiasLogReady)
    {
-      g_h4LastLoggedEffectiveBias = bias;
-      g_h4EffectiveBiasLogReady   = true;
+      g_m15LastLoggedEffectiveBias = bias;
+      g_m15EffectiveBiasLogReady   = true;
       return;
    }
 
-   if(bias == g_h4LastLoggedEffectiveBias)
+   if(bias == g_m15LastLoggedEffectiveBias)
       return;
 
    LogHuntEvent("H4_BIAS",
-                StringFormat("%s â†’ %s (lastBreak=%s bar=%s)",
-                             H4TradeDirectionBiasText(g_h4LastLoggedEffectiveBias),
-                             H4TradeDirectionBiasText(bias),
-                             g_h4LastBosRecordValid
-                                ? (g_h4LastBosRecord.direction == 1 ? "bull" : "bear")
+                StringFormat("%s Ã¢â€ â€™ %s (lastBreak=%s bar=%s)",
+                             M15TradeDirectionBiasText(g_m15LastLoggedEffectiveBias),
+                             M15TradeDirectionBiasText(bias),
+                             g_m15LastBosRecordValid
+                                ? (g_m15LastBosRecord.direction == 1 ? "bull" : "bear")
                                 : "none",
-                             g_h4LastBosRecordValid
-                                ? TimeToString(g_h4LastBosRecord.barOpenTime, TIME_DATE | TIME_MINUTES)
-                                : "â€”"));
-   g_h4LastLoggedEffectiveBias = bias;
+                             g_m15LastBosRecordValid
+                                ? TimeToString(g_m15LastBosRecord.barOpenTime, TIME_DATE | TIME_MINUTES)
+                                : "Ã¢â‚¬â€"));
+   g_m15LastLoggedEffectiveBias = bias;
 }
 
 //+------------------------------------------------------------------+
@@ -1703,12 +1597,12 @@ double ReferenceChartHeightForM2BarCount(const int barCount)
 }
 
 //+------------------------------------------------------------------+
-double ReferenceChartHeightForH4BarCount(const int barCount)
+double ReferenceChartHeightForM15BarCount(const int barCount)
 {
    if(barCount < 1)
       return 0.0;
 
-   const int totalBars = iBars(_Symbol, InputH4NarrativeTimeframe);
+   const int totalBars = iBars(_Symbol, InputM15NarrativeTimeframe);
    if(totalBars < 4)
       return 0.0;
 
@@ -1720,16 +1614,16 @@ double ReferenceChartHeightForH4BarCount(const int barCount)
    double lowestLowPrice   = 1.0e100;
    for(int barShiftIndex = 1; barShiftIndex <= useBarCount; barShiftIndex++)
    {
-      highestHighPrice = MathMax(highestHighPrice, iHigh(_Symbol, InputH4NarrativeTimeframe, barShiftIndex));
-      lowestLowPrice   = MathMin(lowestLowPrice, iLow(_Symbol, InputH4NarrativeTimeframe, barShiftIndex));
+      highestHighPrice = MathMax(highestHighPrice, iHigh(_Symbol, InputM15NarrativeTimeframe, barShiftIndex));
+      lowestLowPrice   = MathMin(lowestLowPrice, iLow(_Symbol, InputM15NarrativeTimeframe, barShiftIndex));
    }
    return highestHighPrice - lowestLowPrice;
 }
 
 //+------------------------------------------------------------------+
-double ReferenceChartHeightForH4BreachBuffer()
+double ReferenceChartHeightForM15BreachBuffer()
 {
-   return ReferenceChartHeightForH4BarCount(InputH4BreachBufferChartBarCount);
+   return ReferenceChartHeightForM15BarCount(InputM15BreachBufferChartBarCount);
 }
 
 //+------------------------------------------------------------------+
@@ -1840,7 +1734,7 @@ void CollectM2SwingExtremesFromSwingHistory(const SwingState &swingState, const 
 }
 
 //+------------------------------------------------------------------+
-//| Same M2 swing legs already drawn on chart (PFX_M2_TREND) â€” optional supplement when draw is on. |
+//| Same M2 swing legs already drawn on chart (PFX_M2_TREND) Ã¢â‚¬â€ optional supplement when draw is on. |
 //+------------------------------------------------------------------+
 void CollectM2SwingExtremesFromDrawnTrendLines(const int formationShift, const int lookbackBars,
                                                const int legDirection,
@@ -1948,7 +1842,7 @@ bool CollectM2SwingExtremesBackwardFromFormation(const datetime formationTime, c
    CollectM2SwingExtremesFromSwingHistory(g_m2Swing, formationShift, lookbackBars, legDirection,
                                         outPoints, outPointCount);
 
-   if(H4LqChartDrawEnabled(InputDrawM2SwingLegs))
+   if(M15LqChartDrawEnabled(InputDrawM2SwingLegs))
    {
       CollectM2SwingExtremesFromDrawnTrendLines(formationShift, lookbackBars, legDirection,
                                                 outPoints, outPointCount);
@@ -2016,7 +1910,7 @@ void SortTakeProfitLevelsNearestFirst(const bool isBuy, double &tpPrices[], cons
 }
 
 //+------------------------------------------------------------------+
-//| Group swing extremes â†’ qualifying line TPs (min R:R) + optional chart zones. |
+//| Group swing extremes Ã¢â€ â€™ qualifying line TPs (min R:R) + optional chart zones. |
 //+------------------------------------------------------------------+
 bool BuildTradeSwingGroupTakeProfits(const bool isBullishTrade, const datetime formationTime,
                                      const double entryPrice, const double stopLossPrice,
@@ -2138,7 +2032,7 @@ bool BuildTradeSwingGroupTakeProfits(const bool isBullishTrade, const datetime f
 
       AppendUniqueTakeProfitLevel(outTakeProfitPrices, outTakeProfitCount, linePrice);
 
-      if(!H4LqChartDrawEnabled(InputDrawTradeSwingGroupTpZones))
+      if(!M15LqChartDrawEnabled(InputDrawTradeSwingGroupTpZones))
       {
          groupSeq++;
          continue;
@@ -2220,29 +2114,29 @@ bool BuildTradeSwingGroupTakeProfits(const bool isBullishTrade, const datetime f
                              groupsSkipped, outTakeProfitPrices[0],
                              outTakeProfitPrices[outTakeProfitCount - 1]));
 
-   if(H4LqChartDrawEnabled(InputDrawTradeSwingGroupTpZones))
+   if(M15LqChartDrawEnabled(InputDrawTradeSwingGroupTpZones))
       ChartRedraw(0);
 
    return true;
 }
 
 //+------------------------------------------------------------------+
-int GetH4TradeDirectionBias()
+int GetM15TradeDirectionBias()
 {
-   if(!InputEnableH4BosTradeDirectionBias || !g_h4LastBosRecordValid)
+   if(!InputEnableM15BosTradeDirectionBias || !g_m15LastBosRecordValid)
       return 0;
 
-   return g_h4LastBosRecord.direction;
+   return g_m15LastBosRecord.direction;
 }
 
 //+------------------------------------------------------------------+
-bool FvgTradeAllowedByH4BosBias(const bool isBullishFairValueGap, string &outBlockReason)
+bool FvgTradeAllowedByM15BosBias(const bool isBullishFairValueGap, string &outBlockReason)
 {
    outBlockReason = "";
-   if(!InputEnableH4BosTradeDirectionBias)
+   if(!InputEnableM15BosTradeDirectionBias)
       return true;
 
-   const int bias = GetH4TradeDirectionBias();
+   const int bias = GetM15TradeDirectionBias();
    if(bias == 0)
       return true;
 
@@ -2258,46 +2152,46 @@ bool FvgTradeAllowedByH4BosBias(const bool isBullishFairValueGap, string &outBlo
 }
 
 //+------------------------------------------------------------------+
-void RefreshH4BosBiasHud()
+void RefreshM15BosBiasHud()
 {
-   if(!H4LqChartDrawEnabled(InputShowH4BosBiasHud))
+   if(!M15LqChartDrawEnabled(InputShowM15BosBiasHud))
    {
-      ObjectDelete(0, LQ_OBJ_H4_BIAS_HUD);
+      ObjectDelete(0, LQ_OBJ_M15_BIAS_HUD);
       return;
    }
 
-   if(ObjectFind(0, LQ_OBJ_H4_BIAS_HUD) < 0)
+   if(ObjectFind(0, LQ_OBJ_M15_BIAS_HUD) < 0)
    {
-      if(!ObjectCreate(0, LQ_OBJ_H4_BIAS_HUD, OBJ_LABEL, 0, 0, 0))
+      if(!ObjectCreate(0, LQ_OBJ_M15_BIAS_HUD, OBJ_LABEL, 0, 0, 0))
          return;
-      ObjectSetInteger(0, LQ_OBJ_H4_BIAS_HUD, OBJPROP_CORNER, CORNER_RIGHT_UPPER);
-      ObjectSetInteger(0, LQ_OBJ_H4_BIAS_HUD, OBJPROP_ANCHOR, ANCHOR_RIGHT_UPPER);
-      ObjectSetInteger(0, LQ_OBJ_H4_BIAS_HUD, OBJPROP_XDISTANCE, 8);
-      ObjectSetInteger(0, LQ_OBJ_H4_BIAS_HUD, OBJPROP_YDISTANCE, 18);
-      ObjectSetString(0, LQ_OBJ_H4_BIAS_HUD, OBJPROP_FONT, "Arial Bold");
-      ObjectSetInteger(0, LQ_OBJ_H4_BIAS_HUD, OBJPROP_SELECTABLE, false);
-      ObjectSetInteger(0, LQ_OBJ_H4_BIAS_HUD, OBJPROP_HIDDEN, true);
+      ObjectSetInteger(0, LQ_OBJ_M15_BIAS_HUD, OBJPROP_CORNER, CORNER_RIGHT_UPPER);
+      ObjectSetInteger(0, LQ_OBJ_M15_BIAS_HUD, OBJPROP_ANCHOR, ANCHOR_RIGHT_UPPER);
+      ObjectSetInteger(0, LQ_OBJ_M15_BIAS_HUD, OBJPROP_XDISTANCE, 8);
+      ObjectSetInteger(0, LQ_OBJ_M15_BIAS_HUD, OBJPROP_YDISTANCE, 18);
+      ObjectSetString(0, LQ_OBJ_M15_BIAS_HUD, OBJPROP_FONT, "Arial Bold");
+      ObjectSetInteger(0, LQ_OBJ_M15_BIAS_HUD, OBJPROP_SELECTABLE, false);
+      ObjectSetInteger(0, LQ_OBJ_M15_BIAS_HUD, OBJPROP_HIDDEN, true);
    }
 
    int          bias  = 0;
-   if(g_h4LastBosRecordValid)
-      bias = g_h4LastBosRecord.direction;
-   string       arrow = "â€”";
+   if(g_m15LastBosRecordValid)
+      bias = g_m15LastBosRecord.direction;
+   string       arrow = "Ã¢â‚¬â€";
    color        col   = clrSilver;
    if(bias == 1)
    {
-      arrow = "â†‘";
+      arrow = "Ã¢â€ â€˜";
       col   = clrLime;
    }
    else if(bias == -1)
    {
-      arrow = "â†“";
+      arrow = "Ã¢â€ â€œ";
       col   = clrTomato;
    }
 
-   ObjectSetString(0, LQ_OBJ_H4_BIAS_HUD, OBJPROP_TEXT, "H4 " + arrow);
-   ObjectSetInteger(0, LQ_OBJ_H4_BIAS_HUD, OBJPROP_COLOR, col);
-   ObjectSetInteger(0, LQ_OBJ_H4_BIAS_HUD, OBJPROP_FONTSIZE, 14);
+   ObjectSetString(0, LQ_OBJ_M15_BIAS_HUD, OBJPROP_TEXT, "H4 " + arrow);
+   ObjectSetInteger(0, LQ_OBJ_M15_BIAS_HUD, OBJPROP_COLOR, col);
+   ObjectSetInteger(0, LQ_OBJ_M15_BIAS_HUD, OBJPROP_FONTSIZE, 14);
 }
 
 //+------------------------------------------------------------------+
@@ -2382,13 +2276,13 @@ bool DetectFairValueGapOnLastClosedBarM2(bool &isBullishFairValueGap, double &fa
 }
 
 //+------------------------------------------------------------------+
-bool TryLatestH4CompletedUpLegHigh(double &outHigh)
+bool TryLatestM15CompletedUpLegHigh(double &outHigh)
 {
-   for(int i = g_h4Swing.swingHistoryCount - 1; i >= 0; i--)
+   for(int i = g_m15Swing.swingHistoryCount - 1; i >= 0; i--)
    {
-      if(g_h4Swing.swingHistory[i].swingDirection == 1)
+      if(g_m15Swing.swingHistory[i].swingDirection == 1)
       {
-         outHigh = g_h4Swing.swingHistory[i].legHighPrice;
+         outHigh = g_m15Swing.swingHistory[i].legHighPrice;
          return true;
       }
    }
@@ -2396,13 +2290,13 @@ bool TryLatestH4CompletedUpLegHigh(double &outHigh)
 }
 
 //+------------------------------------------------------------------+
-bool TryLatestH4CompletedDownLegLow(double &outLow)
+bool TryLatestM15CompletedDownLegLow(double &outLow)
 {
-   for(int i = g_h4Swing.swingHistoryCount - 1; i >= 0; i--)
+   for(int i = g_m15Swing.swingHistoryCount - 1; i >= 0; i--)
    {
-      if(g_h4Swing.swingHistory[i].swingDirection == -1)
+      if(g_m15Swing.swingHistory[i].swingDirection == -1)
       {
-         outLow = g_h4Swing.swingHistory[i].legLowPrice;
+         outLow = g_m15Swing.swingHistory[i].legLowPrice;
          return true;
       }
    }
@@ -2410,17 +2304,17 @@ bool TryLatestH4CompletedDownLegLow(double &outLow)
 }
 
 //+------------------------------------------------------------------+
-bool TrySecondLastH4CompletedUpLegHigh(double &outHigh)
+bool TrySecondLastM15CompletedUpLegHigh(double &outHigh)
 {
    int upLegsFound = 0;
-   for(int i = g_h4Swing.swingHistoryCount - 1; i >= 0; i--)
+   for(int i = g_m15Swing.swingHistoryCount - 1; i >= 0; i--)
    {
-      if(g_h4Swing.swingHistory[i].swingDirection != 1)
+      if(g_m15Swing.swingHistory[i].swingDirection != 1)
          continue;
       upLegsFound++;
       if(upLegsFound == 2)
       {
-         outHigh = g_h4Swing.swingHistory[i].legHighPrice;
+         outHigh = g_m15Swing.swingHistory[i].legHighPrice;
          return true;
       }
    }
@@ -2428,17 +2322,17 @@ bool TrySecondLastH4CompletedUpLegHigh(double &outHigh)
 }
 
 //+------------------------------------------------------------------+
-bool TrySecondLastH4CompletedDownLegLow(double &outLow)
+bool TrySecondLastM15CompletedDownLegLow(double &outLow)
 {
    int downLegsFound = 0;
-   for(int i = g_h4Swing.swingHistoryCount - 1; i >= 0; i--)
+   for(int i = g_m15Swing.swingHistoryCount - 1; i >= 0; i--)
    {
-      if(g_h4Swing.swingHistory[i].swingDirection != -1)
+      if(g_m15Swing.swingHistory[i].swingDirection != -1)
          continue;
       downLegsFound++;
       if(downLegsFound == 2)
       {
-         outLow = g_h4Swing.swingHistory[i].legLowPrice;
+         outLow = g_m15Swing.swingHistory[i].legLowPrice;
          return true;
       }
    }
@@ -2446,7 +2340,7 @@ bool TrySecondLastH4CompletedDownLegLow(double &outLow)
 }
 
 //+------------------------------------------------------------------+
-bool TryNthH4CompletedSwingLeg(const int swingDirection, const int nFromLatest,
+bool TryNthM15CompletedSwingLeg(const int swingDirection, const int nFromLatest,
                               double &outLegHigh, double &outLegLow, datetime &outLegEndTime)
 {
    outLegEndTime = 0;
@@ -2454,16 +2348,16 @@ bool TryNthH4CompletedSwingLeg(const int swingDirection, const int nFromLatest,
       return false;
 
    int legsFound = 0;
-   for(int i = g_h4Swing.swingHistoryCount - 1; i >= 0; i--)
+   for(int i = g_m15Swing.swingHistoryCount - 1; i >= 0; i--)
    {
-      if(g_h4Swing.swingHistory[i].swingDirection != swingDirection)
+      if(g_m15Swing.swingHistory[i].swingDirection != swingDirection)
          continue;
       legsFound++;
       if(legsFound == nFromLatest)
       {
-         outLegHigh    = g_h4Swing.swingHistory[i].legHighPrice;
-         outLegLow     = g_h4Swing.swingHistory[i].legLowPrice;
-         outLegEndTime = g_h4Swing.swingHistory[i].legEndTime;
+         outLegHigh    = g_m15Swing.swingHistory[i].legHighPrice;
+         outLegLow     = g_m15Swing.swingHistory[i].legLowPrice;
+         outLegEndTime = g_m15Swing.swingHistory[i].legEndTime;
          return true;
       }
    }
@@ -2471,14 +2365,14 @@ bool TryNthH4CompletedSwingLeg(const int swingDirection, const int nFromLatest,
 }
 
 //+------------------------------------------------------------------+
-bool TryGetH4LegBarOpenTimeFromEnd(const datetime legStartTime, const datetime legEndTime,
+bool TryGetM15LegBarOpenTimeFromEnd(const datetime legStartTime, const datetime legEndTime,
                                     const int nFromEnd, datetime &outBarOpenTime)
 {
    outBarOpenTime = 0;
    if(legStartTime == 0 || legEndTime == 0 || nFromEnd < 1)
       return false;
 
-   const ENUM_TIMEFRAMES timeframe = InputH4NarrativeTimeframe;
+   const ENUM_TIMEFRAMES timeframe = InputM15NarrativeTimeframe;
    int shiftEnd   = iBarShift(_Symbol, timeframe, legEndTime, false);
    int shiftStart = iBarShift(_Symbol, timeframe, legStartTime, false);
    if(shiftEnd < 0 || shiftStart < 0)
@@ -2501,34 +2395,12 @@ bool TryGetH4LegBarOpenTimeFromEnd(const datetime legStartTime, const datetime l
    return outBarOpenTime > 0;
 }
 
-//+------------------------------------------------------------------+
-double H4BreachLevelPriceFromVolumeBar(const int swingDirection, const int h4BarShift)
-{
-   if(h4BarShift < 0)
-      return 0.0;
-   if(swingDirection == 1)
-      return iLow(_Symbol, InputH4NarrativeTimeframe, h4BarShift);
-   if(swingDirection == -1)
-      return iHigh(_Symbol, InputH4NarrativeTimeframe, h4BarShift);
-   return 0.0;
-}
 
 //+------------------------------------------------------------------+
 //| External breach ray: up-leg high / down-leg low at the vol bar.   |
-//+------------------------------------------------------------------+
-double H4ExternalBreachLevelFromVolumeBar(const int swingDirection, const int h4BarShift)
-{
-   if(h4BarShift < 0)
-      return 0.0;
-   if(swingDirection == 1)
-      return iHigh(_Symbol, InputH4NarrativeTimeframe, h4BarShift);
-   if(swingDirection == -1)
-      return iLow(_Symbol, InputH4NarrativeTimeframe, h4BarShift);
-   return 0.0;
-}
 
 //+------------------------------------------------------------------+
-ENUM_LIQUIDITY_TYPE H4ExternalLqTypeForSwingDirection(const int swingDirection)
+ENUM_LIQUIDITY_TYPE M15ExternalLqTypeForSwingDirection(const int swingDirection)
 {
    if(swingDirection == 1)
       return LQ_EXTERNAL_TOP;
@@ -2536,74 +2408,16 @@ ENUM_LIQUIDITY_TYPE H4ExternalLqTypeForSwingDirection(const int swingDirection)
       return LQ_EXTERNAL_BOTTOM;
    return LQ_EXTERNAL_TOP;
 }
-
 //+------------------------------------------------------------------+
-void H4ScanExternalVolumeWindowMonotonic(const int swingDirection, const datetime windowStartInclusive,
-                                          const datetime windowEndInclusive, long &inOutMaxVolume,
-                                          datetime &inOutMaxBarOpenTime, double &inOutBreachLevel)
+//| Green breach ray -> bull hunt; pink breach ray -> bear hunt.       |
+//+------------------------------------------------------------------+
+bool M15LqTypeExpectsBullishHunt(const ENUM_LIQUIDITY_TYPE lqType)
 {
-   if(swingDirection == 0 || windowStartInclusive == 0 || windowEndInclusive == 0)
-      return;
-
-   const ENUM_TIMEFRAMES timeframe = InputH4NarrativeTimeframe;
-   const int shiftStartOlder = iBarShift(_Symbol, timeframe, windowStartInclusive, true);
-   const int shiftEndNewer   = iBarShift(_Symbol, timeframe, windowEndInclusive, true);
-   if(shiftStartOlder < 0 || shiftEndNewer < 0)
-      return;
-
-   if(shiftEndNewer > shiftStartOlder)
-      return;
-
-   for(int barShift = shiftEndNewer; barShift <= shiftStartOlder; barShift++)
-   {
-      const long barVol = iTickVolume(_Symbol, timeframe, barShift);
-      if(barVol < 0 || barVol <= inOutMaxVolume)
-         continue;
-
-      inOutMaxVolume      = barVol;
-      inOutMaxBarOpenTime = iTime(_Symbol, timeframe, barShift);
-      inOutBreachLevel    = H4ExternalBreachLevelFromVolumeBar(swingDirection, barShift);
-   }
+   return lqType == LQ_EXTERNAL_BOTTOM || lqType == LQ_INTERNAL_BULL;
 }
 
-//+------------------------------------------------------------------+
-bool H4BarHasDecentMovementForLegDirection(const int barShift, const int legSwingDirection)
-{
-   if(barShift < 0 || legSwingDirection == 0)
-      return false;
 
-   const ENUM_TIMEFRAMES timeframe = InputH4NarrativeTimeframe;
-   const double barOpen  = iOpen(_Symbol, timeframe, barShift);
-   const double barClose = iClose(_Symbol, timeframe, barShift);
-   const double barHigh  = iHigh(_Symbol, timeframe, barShift);
-   const double barLow   = iLow(_Symbol, timeframe, barShift);
 
-   const int candleDirection =
-      (barClose > barOpen) ? 1 : ((barClose < barOpen) ? -1 : 0);
-   if(candleDirection != legSwingDirection)
-      return false;
-
-   const double bodyRange = MathAbs(barClose - barOpen);
-   const double wickRange = barHigh - barLow;
-
-   const int barsTotal = iBars(_Symbol, timeframe);
-   double sumRangeFivePriorBars = 0.0;
-   int    rangeBarCount = 0;
-   for(int priorShift = barShift + 1; priorShift <= barShift + 5; priorShift++)
-   {
-      if(priorShift >= barsTotal)
-         break;
-      sumRangeFivePriorBars +=
-         (iHigh(_Symbol, timeframe, priorShift) - iLow(_Symbol, timeframe, priorShift));
-      rangeBarCount++;
-   }
-
-   const double averageRangeFiveBars =
-      (rangeBarCount > 0) ? sumRangeFivePriorBars / (double)rangeBarCount : 0.0;
-   const double minDecentRange = averageRangeFiveBars * H4_BREACH_ANCHOR_MULTIPLIER;
-
-   return wickRange > minDecentRange && bodyRange > minDecentRange;
-}
 
 //+------------------------------------------------------------------+
 bool M2BarHasDecentMovementForLegDirection(const int barShift, const int legSwingDirection)
@@ -3135,1280 +2949,13 @@ bool ResolveTouchLegVolumeBarEntryAndSl(const bool isBuy, const int barShift,
    return true;
 }
 
-//+------------------------------------------------------------------+
-bool H4TryGetLegLastDecentMovementBarOpen(const datetime legStartTime, const datetime legProgressEnd,
-                                           const int swingDirection, datetime &outBarOpenTime)
-{
-   outBarOpenTime = 0;
-   if(legStartTime == 0 || legProgressEnd == 0 || swingDirection == 0)
-      return false;
 
-   const ENUM_TIMEFRAMES timeframe = InputH4NarrativeTimeframe;
-   int shiftNewer = iBarShift(_Symbol, timeframe, legProgressEnd, true);
-   int shiftOlder = iBarShift(_Symbol, timeframe, legStartTime, true);
-   if(shiftNewer < 0 || shiftOlder < 0)
-      return false;
 
-   if(shiftOlder < shiftNewer)
-   {
-      const int tmp = shiftOlder;
-      shiftOlder    = shiftNewer;
-      shiftNewer    = tmp;
-   }
-
-   for(int barShift = shiftNewer; barShift <= shiftOlder; barShift++)
-   {
-      if(!H4BarHasDecentMovementForLegDirection(barShift, swingDirection))
-         continue;
-
-      outBarOpenTime = iTime(_Symbol, timeframe, barShift);
-      return outBarOpenTime > 0;
-   }
-
-   return false;
-}
-
-//+------------------------------------------------------------------+
-datetime H4ProgressEndOpenForDecentLookup(const datetime legProgressEndOpen)
-{
-   if(legProgressEndOpen == 0)
-      return 0;
-
-   const ENUM_TIMEFRAMES timeframe = InputH4NarrativeTimeframe;
-   const int shiftNewer = iBarShift(_Symbol, timeframe, legProgressEndOpen, true);
-   if(shiftNewer < 0)
-      return legProgressEndOpen;
-
-   const int shiftOlder = shiftNewer + 1;
-   if(shiftOlder >= iBars(_Symbol, timeframe))
-      return legProgressEndOpen;
-
-   const datetime olderOpen = iTime(_Symbol, timeframe, shiftOlder);
-   return (olderOpen > 0) ? olderOpen : legProgressEndOpen;
-}
-
-//+------------------------------------------------------------------+
-bool H4TryGetVolumeBreachWindowBoundFromLastDecent(const datetime legStartTime,
-                                                    const datetime legProgressEnd,
-                                                    const int swingDirection,
-                                                    datetime &outBoundInclusiveOpen)
-{
-   outBoundInclusiveOpen = 0;
-   if(legStartTime == 0 || legProgressEnd == 0 || swingDirection == 0)
-      return false;
-
-   const datetime decentLookupEnd = H4ProgressEndOpenForDecentLookup(legProgressEnd);
-
-   datetime lastDecentOpen = 0;
-   if(!H4TryGetLegLastDecentMovementBarOpen(legStartTime, decentLookupEnd, swingDirection,
-                                              lastDecentOpen))
-      return false;
-
-   const ENUM_TIMEFRAMES timeframe = InputH4NarrativeTimeframe;
-   const int shiftDecent = iBarShift(_Symbol, timeframe, lastDecentOpen, true);
-   if(shiftDecent < 0)
-      return false;
-
-   const int shiftBoundInclusive = shiftDecent + 2;
-   if(shiftBoundInclusive >= iBars(_Symbol, timeframe))
-      return false;
-
-   outBoundInclusiveOpen = iTime(_Symbol, timeframe, shiftBoundInclusive);
-   return outBoundInclusiveOpen > 0;
-}
-
-//+------------------------------------------------------------------+
-bool H4TryGetLegVolumeBreachWindowStartForScan(const datetime legStartTime,
-                                               const datetime legProgressEnd,
-                                               const int swingDirection,
-                                               datetime &outWindowStartInclusiveOpen)
-{
-   return H4TryGetVolumeBreachWindowBoundFromLastDecent(legStartTime, legProgressEnd, swingDirection,
-                                                           outWindowStartInclusiveOpen);
-}
-
-//+------------------------------------------------------------------+
-bool H4TryGetLegVolumeBreachWindowEndForScan(const datetime legStartTime,
-                                             const datetime legProgressEnd,
-                                             const int swingDirection,
-                                             datetime &outWindowEndInclusiveOpen)
-{
-   return H4TryGetVolumeBreachWindowBoundFromLastDecent(legStartTime, legProgressEnd, swingDirection,
-                                                         outWindowEndInclusiveOpen);
-}
-
-//+------------------------------------------------------------------+
-bool H4VolumeBreachWindowShiftRangeValid(const datetime windowStartInclusive,
-                                         const datetime windowEndInclusive)
-{
-   if(windowStartInclusive == 0 || windowEndInclusive == 0)
-      return false;
-
-   const ENUM_TIMEFRAMES timeframe = InputH4NarrativeTimeframe;
-   const int shiftStartOlder = iBarShift(_Symbol, timeframe, windowStartInclusive, true);
-   const int shiftEndNewer   = iBarShift(_Symbol, timeframe, windowEndInclusive, true);
-   if(shiftStartOlder < 0 || shiftEndNewer < 0)
-      return false;
-
-   return shiftEndNewer <= shiftStartOlder;
-}
-
-//+------------------------------------------------------------------+
-bool H4TryResolveLegVolumeBreachWindowEnd(const datetime legStartTime,
-                                          const datetime legProgressEnd,
-                                          const int swingDirection,
-                                          const datetime windowStartInclusive,
-                                          const int lastClosedBarShift,
-                                          datetime &outWindowEndInclusiveOpen)
-{
-   outWindowEndInclusiveOpen = 0;
-   if(legStartTime == 0 || legProgressEnd == 0 || swingDirection == 0 || lastClosedBarShift < 1)
-      return false;
-
-   datetime decentBoundOpen = 0;
-   if(H4TryGetLegVolumeBreachWindowEndForScan(legStartTime, legProgressEnd, swingDirection,
-                                               decentBoundOpen) &&
-      H4VolumeBreachWindowShiftRangeValid(windowStartInclusive, decentBoundOpen))
-   {
-      outWindowEndInclusiveOpen = decentBoundOpen;
-      return true;
-   }
-
-   const ENUM_TIMEFRAMES timeframe = InputH4NarrativeTimeframe;
-   const int barsTotal = iBars(_Symbol, timeframe);
-   for(int shiftBound = lastClosedBarShift + 2; shiftBound >= lastClosedBarShift; shiftBound--)
-   {
-      if(shiftBound >= barsTotal)
-         continue;
-
-      const datetime boundOpen = iTime(_Symbol, timeframe, shiftBound);
-      if(boundOpen == 0)
-         continue;
-      if(!H4VolumeBreachWindowShiftRangeValid(windowStartInclusive, boundOpen))
-         continue;
-
-      outWindowEndInclusiveOpen = boundOpen;
-      return true;
-   }
-
-   return false;
-}
-
-//+------------------------------------------------------------------+
-bool FindMaxVolumeH4BarBetweenOpenTimes(const datetime rangeStartOpen, const datetime rangeEndOpen,
-                                         datetime &outBarOpenTime, long &outMaxVolume)
-{
-   outBarOpenTime = 0;
-   outMaxVolume   = -1;
-   if(rangeStartOpen == 0 || rangeEndOpen == 0)
-      return false;
-
-   const ENUM_TIMEFRAMES timeframe = InputH4NarrativeTimeframe;
-   datetime rangeLo = rangeStartOpen;
-   datetime rangeHi = rangeEndOpen;
-   if(rangeLo > rangeHi)
-   {
-      const datetime tmp = rangeLo;
-      rangeLo = rangeHi;
-      rangeHi = tmp;
-   }
-
-   int shiftNewer = iBarShift(_Symbol, timeframe, rangeHi, false);
-   int shiftOlder = iBarShift(_Symbol, timeframe, rangeLo, false);
-   if(shiftNewer < 0 || shiftOlder < 0)
-      return false;
-
-   if(shiftOlder < shiftNewer)
-   {
-      const int tmp = shiftOlder;
-      shiftOlder    = shiftNewer;
-      shiftNewer    = tmp;
-   }
-
-   for(int barShift = shiftNewer; barShift <= shiftOlder; barShift++)
-   {
-      const long barVol = iTickVolume(_Symbol, timeframe, barShift);
-      if(barVol < 0)
-         continue;
-      if(barVol > outMaxVolume)
-      {
-         outMaxVolume   = barVol;
-         outBarOpenTime = iTime(_Symbol, timeframe, barShift);
-      }
-   }
-   return outBarOpenTime > 0 && outMaxVolume >= 0;
-}
-
-#define H4_LIQ_VOL_BASELINE_BAR_COUNT  4
-#define H4_LIQ_VOL_BASELINE_MIN_COUNT  1
-#define H4_LIQ_VOL_SPIKE_MULTIPLIER    1.2
-#define H4_LIQ_FULL_BODY_RANGE_RATIO     0.5
-
-//+------------------------------------------------------------------+
-bool H4TryGetLegBarShiftRange(const Swing &leg, const ENUM_TIMEFRAMES timeframe,
-                               const datetime progressEndOpen,
-                               int &outShiftStartOlder, int &outShiftEndNewer)
-{
-   outShiftStartOlder = -1;
-   outShiftEndNewer   = -1;
-
-   if(leg.legStartTime == 0)
-      return false;
-
-   const datetime windowEndOpen = (leg.legEndTime > 0) ? leg.legEndTime : progressEndOpen;
-   if(windowEndOpen == 0)
-      return false;
-
-   outShiftStartOlder = iBarShift(_Symbol, timeframe, leg.legStartTime, true);
-   if(outShiftStartOlder < 0)
-      outShiftStartOlder = iBarShift(_Symbol, timeframe, leg.legStartTime, false);
-
-   outShiftEndNewer = iBarShift(_Symbol, timeframe, windowEndOpen, true);
-   if(outShiftEndNewer < 0)
-      outShiftEndNewer = iBarShift(_Symbol, timeframe, windowEndOpen, false);
-
-   if(outShiftStartOlder < 0 || outShiftEndNewer < 0 || outShiftEndNewer > outShiftStartOlder)
-      return false;
-
-   return true;
-}
-
-//+------------------------------------------------------------------+
-bool H4BarIsInExtremeTopBottomZone(const int barShift, const int extremeShift)
-{
-   return (barShift >= extremeShift - 1 && barShift <= extremeShift + 1);
-}
-
-//+------------------------------------------------------------------+
-bool H4BarIsFullBodyCandle(const ENUM_TIMEFRAMES timeframe, const int barShift)
-{
-   const double openPrice  = iOpen(_Symbol, timeframe, barShift);
-   const double highPrice  = iHigh(_Symbol, timeframe, barShift);
-   const double lowPrice   = iLow(_Symbol, timeframe, barShift);
-   const double closePrice = iClose(_Symbol, timeframe, barShift);
-   const double range      = highPrice - lowPrice;
-   if(range <= 0.0)
-      return false;
-
-   return MathAbs(closePrice - openPrice) >= range * H4_LIQ_FULL_BODY_RANGE_RATIO;
-}
-
-//+------------------------------------------------------------------+
-//| Collect up to 4 baseline bars (full-body first, then any bar).   |
-//+------------------------------------------------------------------+
-bool H4TryCollectBaselineAvgVol(const ENUM_TIMEFRAMES timeframe,
-                                 const int shiftStartOlder, const int shiftEndNewer,
-                                 const int firstOlderShift, const int extremeShift,
-                                 const bool skipExtremeZone, double &outAvgVol)
-{
-   outAvgVol = 0.0;
-   long vols[];
-   int  usedShifts[];
-   ArrayResize(vols, 0);
-   ArrayResize(usedShifts, 0);
-
-   for(int pass = 0; pass < 2; pass++)
-   {
-      for(int barShift = firstOlderShift;
-          barShift <= shiftStartOlder && ArraySize(vols) < H4_LIQ_VOL_BASELINE_BAR_COUNT;
-          barShift++)
-      {
-         if(barShift < shiftEndNewer)
-            break;
-         if(skipExtremeZone && extremeShift >= 0 &&
-            H4BarIsInExtremeTopBottomZone(barShift, extremeShift))
-            continue;
-
-         bool alreadyUsed = false;
-         for(int i = 0; i < ArraySize(usedShifts); i++)
-         {
-            if(usedShifts[i] == barShift)
-            {
-               alreadyUsed = true;
-               break;
-            }
-         }
-         if(alreadyUsed)
-            continue;
-
-         const bool isFullBody = H4BarIsFullBodyCandle(timeframe, barShift);
-         if(pass == 0 && !isFullBody)
-            continue;
-         if(pass == 1 && isFullBody)
-            continue;
-
-         const long barVol = iTickVolume(_Symbol, timeframe, barShift);
-         if(barVol < 0)
-            continue;
-
-         const int n = ArraySize(vols);
-         ArrayResize(vols, n + 1);
-         ArrayResize(usedShifts, n + 1);
-         vols[n]       = barVol;
-         usedShifts[n] = barShift;
-      }
-   }
-
-   const int counted = ArraySize(vols);
-   if(counted < H4_LIQ_VOL_BASELINE_MIN_COUNT)
-      return false;
-
-   long volSum = 0;
-   for(int i = 0; i < counted; i++)
-      volSum += vols[i];
-
-   outAvgVol = (double)volSum / (double)counted;
-   return outAvgVol > 0.0;
-}
-
-//+------------------------------------------------------------------+
-bool H4TryCollectFullBodyBaselineAvgVol(const ENUM_TIMEFRAMES timeframe,
-                                         const int shiftStartOlder, const int shiftEndNewer,
-                                         const int firstOlderShift, const int extremeShift,
-                                         const bool skipExtremeZone, double &outAvgVol)
-{
-   return H4TryCollectBaselineAvgVol(timeframe, shiftStartOlder, shiftEndNewer,
-                                      firstOlderShift, extremeShift, skipExtremeZone, outAvgVol);
-}
-
-//+------------------------------------------------------------------+
-//| Full-body bars strictly older than the extreme 3-bar window.     |
-//+------------------------------------------------------------------+
-bool H4TryAvgVolBaselineBeforeExtremeWindow(const ENUM_TIMEFRAMES timeframe,
-                                             const int shiftStartOlder, const int shiftEndNewer,
-                                             const int extremeShift, double &outAvgVol)
-{
-   int firstOlderShift = extremeShift + 2;
-   if(firstOlderShift > shiftStartOlder)
-   {
-      firstOlderShift = shiftEndNewer;
-      while(firstOlderShift <= shiftStartOlder &&
-            H4BarIsInExtremeTopBottomZone(firstOlderShift, extremeShift))
-         firstOlderShift++;
-      if(firstOlderShift > shiftStartOlder)
-         return false;
-   }
-
-   return H4TryCollectBaselineAvgVol(timeframe, shiftStartOlder, shiftEndNewer,
-                                        firstOlderShift, extremeShift, false, outAvgVol);
-}
-
-//+------------------------------------------------------------------+
-//| Last full-body bars older than beforeShift, skip extreme zone.   |
-//+------------------------------------------------------------------+
-bool H4TryAvgVolLast4FullBodyBarsBefore(const ENUM_TIMEFRAMES timeframe,
-                                         const int shiftStartOlder, const int shiftEndNewer,
-                                         const int extremeShift, const int beforeShift,
-                                         double &outAvgVol)
-{
-   return H4TryCollectBaselineAvgVol(timeframe, shiftStartOlder, shiftEndNewer,
-                                        beforeShift + 1, extremeShift, true, outAvgVol);
-}
-
-//+------------------------------------------------------------------+
-string H4VolumeBreachRayObjectName(const datetime legStartTime, const ENUM_LIQUIDITY_TYPE lqType,
-                                    const datetime volumeBarOpenTime)
-{
-   return ChartObjectNamePrefixH4VolumeBreachRay +
-          IntegerToString((long)legStartTime) + "_" +
-          IntegerToString((int)lqType) + "_" +
-          IntegerToString((long)volumeBarOpenTime);
-}
-
-//+------------------------------------------------------------------+
-void H4RememberExternalBreachForCompletedLeg(const Swing &leg)
-{
-   if(leg.swingDirection == 0 || leg.legStartTime == 0 || leg.legEndTime == 0)
-      return;
-
-   datetime windowStartOpen = leg.legStartTime;
-   for(int legIndex = 1; legIndex < g_h4Swing.swingHistoryCount; legIndex++)
-   {
-      if(g_h4Swing.swingHistory[legIndex].legStartTime != leg.legStartTime)
-         continue;
-
-      const Swing prevLeg = g_h4Swing.swingHistory[legIndex - 1];
-      if(prevLeg.legEndTime != 0)
-      {
-         if(!H4TryGetLegVolumeBreachWindowStartForScan(prevLeg.legStartTime, prevLeg.legEndTime,
-                                                        prevLeg.swingDirection, windowStartOpen))
-            windowStartOpen = prevLeg.legStartTime;
-      }
-      break;
-   }
-
-   long     maxVol        = -1;
-   datetime maxVolBarOpen = 0;
-   double   breachLevel   = 0.0;
-
-   const ENUM_TIMEFRAMES timeframe = InputH4NarrativeTimeframe;
-   const int shiftLegEnd   = iBarShift(_Symbol, timeframe, leg.legEndTime, true);
-   const int shiftLegStart = iBarShift(_Symbol, timeframe, leg.legStartTime, true);
-   if(shiftLegEnd < 0 || shiftLegStart < 0)
-      return;
-
-   for(int barShift = shiftLegStart; barShift >= shiftLegEnd; barShift--)
-   {
-      const datetime progressEndOpen = iTime(_Symbol, timeframe, barShift);
-      if(progressEndOpen == 0)
-         continue;
-
-      datetime windowEndInclusive = 0;
-      if(!H4TryGetLegVolumeBreachWindowEndForScan(leg.legStartTime, progressEndOpen,
-                                                     leg.swingDirection, windowEndInclusive))
-         continue;
-
-      H4ScanExternalVolumeWindowMonotonic(leg.swingDirection, windowStartOpen, windowEndInclusive,
-                                           maxVol, maxVolBarOpen, breachLevel);
-   }
-
-   datetime finalWindowEndInclusive = 0;
-   if(H4TryGetLegVolumeBreachWindowEndForScan(leg.legStartTime, leg.legEndTime,
-                                               leg.swingDirection, finalWindowEndInclusive))
-   {
-      H4ScanExternalVolumeWindowMonotonic(leg.swingDirection, windowStartOpen, finalWindowEndInclusive,
-                                           maxVol, maxVolBarOpen, breachLevel);
-   }
-
-   if(maxVolBarOpen == 0 || breachLevel <= 0.0)
-      return;
-
-   RememberH4LegVolumeBreachRecord(leg.legStartTime, leg.legEndTime, leg.swingDirection,
-                                    H4ExternalLqTypeForSwingDirection(leg.swingDirection),
-                                    breachLevel, maxVolBarOpen);
-}
-
-//+------------------------------------------------------------------+
-void H4ScanLegInternalLiquidityBreaches(const Swing &leg, const datetime progressEndOpen)
-{
-   if(leg.swingDirection == 0 || leg.legStartTime == 0)
-      return;
-   if(leg.legEndTime == 0 && progressEndOpen == 0)
-      return;
-
-   const ENUM_TIMEFRAMES timeframe = InputH4NarrativeTimeframe;
-   int shiftStartOlder = -1;
-   int shiftEndNewer   = -1;
-   if(!H4TryGetLegBarShiftRange(leg, timeframe, progressEndOpen, shiftStartOlder, shiftEndNewer))
-      return;
-
-   int extremeShift = shiftEndNewer;
-   if(leg.swingDirection == 1)
-   {
-      double extremeHigh = -1.0e100;
-      for(int barShift = shiftEndNewer; barShift <= shiftStartOlder; barShift++)
-      {
-         const double barHigh = iHigh(_Symbol, timeframe, barShift);
-         if(barHigh > extremeHigh)
-         {
-            extremeHigh  = barHigh;
-            extremeShift = barShift;
-         }
-      }
-   }
-   else if(leg.swingDirection == -1)
-   {
-      double extremeLow = 1.0e100;
-      for(int barShift = shiftEndNewer; barShift <= shiftStartOlder; barShift++)
-      {
-         const double barLow = iLow(_Symbol, timeframe, barShift);
-         if(barLow < extremeLow)
-         {
-            extremeLow   = barLow;
-            extremeShift = barShift;
-         }
-      }
-   }
-   else
-      return;
-
-   for(int barShift = shiftStartOlder; barShift >= shiftEndNewer; barShift--)
-   {
-      if(H4BarIsInExtremeTopBottomZone(barShift, extremeShift))
-         continue;
-      if(!H4BarIsFullBodyCandle(timeframe, barShift))
-         continue;
-
-      const double openPrice  = iOpen(_Symbol, timeframe, barShift);
-      const double closePrice = iClose(_Symbol, timeframe, barShift);
-      const long   barVol     = iTickVolume(_Symbol, timeframe, barShift);
-      if(barVol < 0)
-         continue;
-
-      const int prevShift = barShift + 1;
-      if(prevShift > shiftStartOlder)
-         continue;
-
-      const double prevOpen  = iOpen(_Symbol, timeframe, prevShift);
-      const double prevClose = iClose(_Symbol, timeframe, prevShift);
-      const datetime volumeBarOpenTime = iTime(_Symbol, timeframe, barShift);
-      if(volumeBarOpenTime == 0)
-         continue;
-
-      double baselineAvgVol = 0.0;
-      if(!H4TryAvgVolLast4FullBodyBarsBefore(timeframe, shiftStartOlder, shiftEndNewer,
-                                              extremeShift, barShift, baselineAvgVol))
-         continue;
-      if((double)barVol <= baselineAvgVol * H4_LIQ_VOL_SPIKE_MULTIPLIER)
-         continue;
-
-      if(leg.swingDirection == 1)
-      {
-         if(closePrice <= openPrice || prevClose <= prevOpen)
-            continue;
-
-         RememberH4LegVolumeBreachRecord(leg.legStartTime, leg.legEndTime, leg.swingDirection,
-                                          LQ_INTERNAL_BULL, openPrice, volumeBarOpenTime);
-      }
-      else if(leg.swingDirection == -1)
-      {
-         if(closePrice >= openPrice || prevClose >= prevOpen)
-            continue;
-
-         RememberH4LegVolumeBreachRecord(leg.legStartTime, leg.legEndTime, leg.swingDirection,
-                                          LQ_INTERNAL_BEAR, openPrice, volumeBarOpenTime);
-      }
-   }
-}
-
-//+------------------------------------------------------------------+
-void H4ScanLegForLiquidityBreaches(const Swing &leg, const datetime progressEndOpen)
-{
-   if(leg.swingDirection == 0 || leg.legStartTime == 0)
-      return;
-   if(leg.legEndTime == 0 && progressEndOpen == 0)
-      return;
-
-   if(leg.legEndTime > 0)
-      H4RememberExternalBreachForCompletedLeg(leg);
-
-   H4ScanLegInternalLiquidityBreaches(leg, progressEndOpen);
-}
-
-//+------------------------------------------------------------------+
-void H4RemoveVolumeBreachRecordsForLeg(const datetime legStartTime)
-{
-   if(legStartTime == 0)
-      return;
-
-   int writeIndex = 0;
-   for(int readIndex = 0; readIndex < g_h4LegVolumeBreachCount; readIndex++)
-   {
-      const H4LegVolumeBreachRecord rec = g_h4LegVolumeBreaches[readIndex];
-      if(rec.legStartTime == legStartTime)
-      {
-         DeleteH4VolumeBreachLevelRay(rec.legStartTime, rec.lqType, rec.volumeBarOpenTime);
-         continue;
-      }
-
-      if(writeIndex != readIndex)
-         g_h4LegVolumeBreaches[writeIndex] = rec;
-      writeIndex++;
-   }
-   g_h4LegVolumeBreachCount = writeIndex;
-}
-
-//+------------------------------------------------------------------+
-void H4ResetActiveLegVolumeBreachTrack()
-{
-   ZeroMemory(g_h4ActiveLegVolumeTrack);
-   g_h4ActiveLegVolumeTrack.maxTickVolume = -1;
-}
-
-//+------------------------------------------------------------------+
-void H4RemoveInternalVolumeBreachRecordsForLeg(const datetime legStartTime)
-{
-   if(legStartTime == 0)
-      return;
-
-   int writeIndex = 0;
-   for(int readIndex = 0; readIndex < g_h4LegVolumeBreachCount; readIndex++)
-   {
-      const H4LegVolumeBreachRecord rec = g_h4LegVolumeBreaches[readIndex];
-      if(rec.legStartTime == legStartTime &&
-         (rec.lqType == LQ_INTERNAL_BULL || rec.lqType == LQ_INTERNAL_BEAR))
-      {
-         DeleteH4VolumeBreachLevelRay(rec.legStartTime, rec.lqType, rec.volumeBarOpenTime);
-         continue;
-      }
-
-      if(writeIndex != readIndex)
-         g_h4LegVolumeBreaches[writeIndex] = rec;
-      writeIndex++;
-   }
-   g_h4LegVolumeBreachCount = writeIndex;
-}
-
-//+------------------------------------------------------------------+
-void RememberH4LegVolumeBreachRecord(const datetime legStartTime, const datetime legEndTime,
-                                      const int swingDirection, const ENUM_LIQUIDITY_TYPE lqType,
-                                      const double breachLevel, const datetime volumeBarOpenTime)
-{
-   if(legStartTime == 0 || swingDirection == 0 || breachLevel <= 0.0 || volumeBarOpenTime == 0)
-      return;
-
-   const bool isExternal = (lqType == LQ_EXTERNAL_TOP || lqType == LQ_EXTERNAL_BOTTOM);
-
-   for(int i = 0; i < g_h4LegVolumeBreachCount; i++)
-   {
-      if(g_h4LegVolumeBreaches[i].legStartTime != legStartTime || g_h4LegVolumeBreaches[i].lqType != lqType)
-         continue;
-
-      if(isExternal || g_h4LegVolumeBreaches[i].volumeBarOpenTime == volumeBarOpenTime)
-      {
-         if(g_h4LegVolumeBreaches[i].volumeBarOpenTime != volumeBarOpenTime)
-         {
-            DeleteH4VolumeBreachLevelRay(legStartTime, lqType,
-                                         g_h4LegVolumeBreaches[i].volumeBarOpenTime);
-         }
-         if(!H4VolumeBreachLevelsMatch(g_h4LegVolumeBreaches[i].breachLevelPrice, breachLevel))
-         {
-            g_h4LegVolumeBreaches[i].swept     = false;
-            g_h4LegVolumeBreaches[i].huntArmed = false;
-         }
-         g_h4LegVolumeBreaches[i].swingDirection   = swingDirection;
-         g_h4LegVolumeBreaches[i].breachLevelPrice = breachLevel;
-         g_h4LegVolumeBreaches[i].volumeBarOpenTime = volumeBarOpenTime;
-         if(legEndTime > 0)
-            g_h4LegVolumeBreaches[i].legEndTime = legEndTime;
-         return;
-      }
-   }
-
-   for(int i = 0; i < g_h4LegVolumeBreachCount; i++)
-   {
-      if(g_h4LegVolumeBreaches[i].legStartTime == legStartTime &&
-         g_h4LegVolumeBreaches[i].lqType == lqType &&
-         g_h4LegVolumeBreaches[i].volumeBarOpenTime == volumeBarOpenTime)
-      {
-         if(!H4VolumeBreachLevelsMatch(g_h4LegVolumeBreaches[i].breachLevelPrice, breachLevel))
-         {
-            g_h4LegVolumeBreaches[i].swept     = false;
-            g_h4LegVolumeBreaches[i].huntArmed = false;
-         }
-         g_h4LegVolumeBreaches[i].swingDirection   = swingDirection;
-         g_h4LegVolumeBreaches[i].breachLevelPrice = breachLevel;
-         if(legEndTime > 0)
-            g_h4LegVolumeBreaches[i].legEndTime = legEndTime;
-         return;
-      }
-   }
-
-   if(g_h4LegVolumeBreachCount < H4_LEG_VOLUME_BREACH_CAPACITY)
-   {
-      const int index = g_h4LegVolumeBreachCount;
-      g_h4LegVolumeBreaches[index].legStartTime        = legStartTime;
-      g_h4LegVolumeBreaches[index].legEndTime          = legEndTime;
-      g_h4LegVolumeBreaches[index].swingDirection      = swingDirection;
-      g_h4LegVolumeBreaches[index].lqType              = lqType;
-      g_h4LegVolumeBreaches[index].breachLevelPrice    = breachLevel;
-      g_h4LegVolumeBreaches[index].volumeBarOpenTime   = volumeBarOpenTime;
-      g_h4LegVolumeBreaches[index].swept               = false;
-      g_h4LegVolumeBreaches[index].huntArmed           = false;
-      g_h4LegVolumeBreachCount++;
-      return;
-   }
-
-   const H4LegVolumeBreachRecord evicted = g_h4LegVolumeBreaches[0];
-   DeleteH4VolumeBreachLevelRay(evicted.legStartTime, evicted.lqType, evicted.volumeBarOpenTime);
-   for(int shiftIndex = 1; shiftIndex < H4_LEG_VOLUME_BREACH_CAPACITY; shiftIndex++)
-      g_h4LegVolumeBreaches[shiftIndex - 1] = g_h4LegVolumeBreaches[shiftIndex];
-
-   const int lastIndex = H4_LEG_VOLUME_BREACH_CAPACITY - 1;
-   g_h4LegVolumeBreaches[lastIndex].legStartTime        = legStartTime;
-   g_h4LegVolumeBreaches[lastIndex].legEndTime          = legEndTime;
-   g_h4LegVolumeBreaches[lastIndex].swingDirection      = swingDirection;
-   g_h4LegVolumeBreaches[lastIndex].lqType              = lqType;
-   g_h4LegVolumeBreaches[lastIndex].breachLevelPrice    = breachLevel;
-   g_h4LegVolumeBreaches[lastIndex].volumeBarOpenTime   = volumeBarOpenTime;
-   g_h4LegVolumeBreaches[lastIndex].swept               = false;
-   g_h4LegVolumeBreaches[lastIndex].huntArmed           = false;
-}
-
-//+------------------------------------------------------------------+
-bool TryGetH4VolumeBreachWindowStartFromLastCompletedLeg(const SwingState &swingState,
-                                                          datetime &outWindowStartOpen)
-{
-   outWindowStartOpen = 0;
-   if(swingState.swingHistoryCount < 1)
-      return false;
-
-   const Swing leg = swingState.swingHistory[swingState.swingHistoryCount - 1];
-   if(leg.legEndTime == 0 || leg.legStartTime == 0 || leg.swingDirection == 0)
-      return false;
-
-   if(H4TryGetLegVolumeBreachWindowStartForScan(leg.legStartTime, leg.legEndTime, leg.swingDirection,
-                                                 outWindowStartOpen))
-      return true;
-
-   outWindowStartOpen = leg.legStartTime;
-   return outWindowStartOpen > 0;
-}
-
-//+------------------------------------------------------------------+
-void H4UpdateActiveLegExternalVolumeBreach(const SwingState &swingState, const int lastClosedBarShift)
-{
-   if(swingState.currentSwingLeg.swingDirection == 0 || swingState.currentSwingLeg.legStartTime == 0)
-      return;
-   if(g_h4ActiveLegVolumeTrack.legStartTime != swingState.currentSwingLeg.legStartTime)
-      return;
-
-   g_h4ActiveLegVolumeTrack.swingDirection = swingState.currentSwingLeg.swingDirection;
-
-   if(lastClosedBarShift < 1)
-      return;
-
-   const datetime lastClosedOpen = iTime(_Symbol, InputH4NarrativeTimeframe, lastClosedBarShift);
-   if(lastClosedOpen == 0)
-      return;
-
-   datetime windowEndInclusive = 0;
-   if(!H4TryResolveLegVolumeBreachWindowEnd(swingState.currentSwingLeg.legStartTime,
-                                             lastClosedOpen,
-                                             swingState.currentSwingLeg.swingDirection,
-                                             g_h4ActiveLegVolumeTrack.windowStartOpenTime,
-                                             lastClosedBarShift,
-                                             windowEndInclusive))
-      return;
-
-   H4ScanExternalVolumeWindowMonotonic(g_h4ActiveLegVolumeTrack.swingDirection,
-                                        g_h4ActiveLegVolumeTrack.windowStartOpenTime,
-                                        windowEndInclusive,
-                                        g_h4ActiveLegVolumeTrack.maxTickVolume,
-                                        g_h4ActiveLegVolumeTrack.maxVolumeBarOpenTime,
-                                        g_h4ActiveLegVolumeTrack.breachLevelPrice);
-
-   if(g_h4ActiveLegVolumeTrack.maxVolumeBarOpenTime == 0 ||
-      g_h4ActiveLegVolumeTrack.breachLevelPrice <= 0.0)
-      return;
-
-   RememberH4LegVolumeBreachRecord(swingState.currentSwingLeg.legStartTime, 0,
-                                    g_h4ActiveLegVolumeTrack.swingDirection,
-                                    H4ExternalLqTypeForSwingDirection(g_h4ActiveLegVolumeTrack.swingDirection),
-                                    g_h4ActiveLegVolumeTrack.breachLevelPrice,
-                                    g_h4ActiveLegVolumeTrack.maxVolumeBarOpenTime);
-}
-
-//+------------------------------------------------------------------+
-void H4RescanLiquidityBreachesForActiveLeg(const SwingState &swingState, const int lastClosedBarShift)
-{
-   if(swingState.currentSwingLeg.swingDirection == 0 || swingState.currentSwingLeg.legStartTime == 0)
-      return;
-   if(lastClosedBarShift < 1)
-      return;
-
-   const ENUM_TIMEFRAMES timeframe = InputH4NarrativeTimeframe;
-   const datetime progressEnd = iTime(_Symbol, timeframe, lastClosedBarShift);
-   if(progressEnd == 0 || progressEnd < swingState.currentSwingLeg.legStartTime)
-      return;
-
-   H4UpdateActiveLegExternalVolumeBreach(swingState, lastClosedBarShift);
-
-   H4RemoveInternalVolumeBreachRecordsForLeg(swingState.currentSwingLeg.legStartTime);
-
-   Swing scanLeg = swingState.currentSwingLeg;
-   scanLeg.legEndTime = 0;
-   H4ScanLegInternalLiquidityBreaches(scanLeg, progressEnd);
-}
-
-//+------------------------------------------------------------------+
-void H4OnH4ActiveLegStarted(SwingState &swingState, const int lastClosedBarShift)
-{
-   H4ResetActiveLegVolumeBreachTrack();
-
-   if(swingState.currentSwingLeg.swingDirection == 0 || swingState.currentSwingLeg.legStartTime == 0)
-      return;
-
-   g_h4ActiveLegVolumeTrack.legStartTime         = swingState.currentSwingLeg.legStartTime;
-   g_h4ActiveLegVolumeTrack.swingDirection      = swingState.currentSwingLeg.swingDirection;
-   g_h4ActiveLegVolumeTrack.windowStartOpenTime = swingState.currentSwingLeg.legStartTime;
-
-   if(!TryGetH4VolumeBreachWindowStartFromLastCompletedLeg(swingState,
-                                                           g_h4ActiveLegVolumeTrack.windowStartOpenTime))
-      g_h4ActiveLegVolumeTrack.windowStartOpenTime = swingState.currentSwingLeg.legStartTime;
-
-   H4PurgeStaleActiveLegVolumeBreachRecords(swingState.currentSwingLeg.legStartTime);
-   H4OnH4ActiveLegBarClosed(swingState, lastClosedBarShift);
-}
-
-//+------------------------------------------------------------------+
-void H4OnH4ActiveLegBarClosed(SwingState &swingState, const int lastClosedBarShift)
-{
-   H4RescanLiquidityBreachesForActiveLeg(swingState, lastClosedBarShift);
-
-   if(H4LqChartDrawEnabled(InputDrawH4SwingLegVisuals))
-      RebuildAllH4VolumeBreachMarkers();
-}
-
-//+------------------------------------------------------------------+
-void H4PurgeStaleActiveLegVolumeBreachRecords(const datetime keepLegStartTime)
-{
-   int writeIndex = 0;
-   for(int readIndex = 0; readIndex < g_h4LegVolumeBreachCount; readIndex++)
-   {
-      const H4LegVolumeBreachRecord rec = g_h4LegVolumeBreaches[readIndex];
-      if(rec.legEndTime == 0 && rec.legStartTime != keepLegStartTime)
-      {
-         DeleteH4VolumeBreachLevelRay(rec.legStartTime, rec.lqType, rec.volumeBarOpenTime);
-         continue;
-      }
-
-      if(writeIndex != readIndex)
-         g_h4LegVolumeBreaches[writeIndex] = rec;
-      writeIndex++;
-   }
-   g_h4LegVolumeBreachCount = writeIndex;
-}
-
-//+------------------------------------------------------------------+
-void H4FinalizeActiveLegVolumeBreach(const Swing &closedLeg)
-{
-   if(closedLeg.legStartTime == 0 || closedLeg.legEndTime == 0 || closedLeg.swingDirection == 0)
-      return;
-
-   if(g_h4ActiveLegVolumeTrack.legStartTime == closedLeg.legStartTime &&
-      g_h4ActiveLegVolumeTrack.swingDirection == closedLeg.swingDirection)
-   {
-      datetime finalizeWindowEndInclusive = 0;
-      if(H4TryGetLegVolumeBreachWindowEndForScan(closedLeg.legStartTime, closedLeg.legEndTime,
-                                                   closedLeg.swingDirection, finalizeWindowEndInclusive))
-      {
-         H4ScanExternalVolumeWindowMonotonic(closedLeg.swingDirection,
-                                              g_h4ActiveLegVolumeTrack.windowStartOpenTime,
-                                              finalizeWindowEndInclusive,
-                                              g_h4ActiveLegVolumeTrack.maxTickVolume,
-                                              g_h4ActiveLegVolumeTrack.maxVolumeBarOpenTime,
-                                              g_h4ActiveLegVolumeTrack.breachLevelPrice);
-      }
-
-      if(g_h4ActiveLegVolumeTrack.maxVolumeBarOpenTime > 0 &&
-         g_h4ActiveLegVolumeTrack.breachLevelPrice > 0.0)
-      {
-         RememberH4LegVolumeBreachRecord(closedLeg.legStartTime, closedLeg.legEndTime,
-                                          closedLeg.swingDirection,
-                                          H4ExternalLqTypeForSwingDirection(closedLeg.swingDirection),
-                                          g_h4ActiveLegVolumeTrack.breachLevelPrice,
-                                          g_h4ActiveLegVolumeTrack.maxVolumeBarOpenTime);
-      }
-   }
-   else
-   {
-      H4RememberExternalBreachForCompletedLeg(closedLeg);
-   }
-
-   H4RemoveInternalVolumeBreachRecordsForLeg(closedLeg.legStartTime);
-   H4ScanLegInternalLiquidityBreaches(closedLeg, 0);
-
-   H4PurgeStaleActiveLegVolumeBreachRecords(0);
-   H4ResetActiveLegVolumeBreachTrack();
-
-   if(H4LqChartDrawEnabled(InputDrawH4SwingLegVisuals))
-      RebuildAllH4VolumeBreachMarkers();
-}
-
-//+------------------------------------------------------------------+
-void H4RestoreActiveLegVolumeBreachTrackFromSwing()
-{
-   if(g_h4Swing.currentSwingLeg.swingDirection == 0 || g_h4Swing.currentSwingLeg.legStartTime == 0)
-   {
-      H4ResetActiveLegVolumeBreachTrack();
-      return;
-   }
-   H4OnH4ActiveLegStarted(g_h4Swing);
-}
-
-//+------------------------------------------------------------------+
-bool IsH4BreachRecordActiveInBufferWindow(const H4LegVolumeBreachRecord &rec)
-{
-   if(rec.swingDirection == 0 || rec.breachLevelPrice <= 0.0)
-      return false;
-
-   if(rec.volumeBarOpenTime > 0 && IsH4BarWithinBreachBufferChartWindow(rec.volumeBarOpenTime))
-      return true;
-
-   const datetime legKey = (rec.legEndTime > 0) ? rec.legEndTime : rec.legStartTime;
-   return IsH4BarWithinBreachBufferChartWindow(legKey);
-}
-
-//+------------------------------------------------------------------+
-bool IsH4LegVolumeBreachActiveInBufferWindow(const datetime legEndTime, const int swingDirection)
-{
-   if(legEndTime == 0 || swingDirection == 0)
-      return false;
-
-   for(int i = 0; i < g_h4LegVolumeBreachCount; i++)
-   {
-      if(g_h4LegVolumeBreaches[i].legEndTime != legEndTime ||
-         g_h4LegVolumeBreaches[i].swingDirection != swingDirection)
-         continue;
-
-      if(IsH4BreachRecordActiveInBufferWindow(g_h4LegVolumeBreaches[i]))
-         return true;
-   }
-
-   return IsH4BarWithinBreachBufferChartWindow(legEndTime);
-}
-
-//+------------------------------------------------------------------+
-bool IsH4BarWithinBreachBufferChartWindow(const datetime barOpenTime)
-{
-   const int barCount = InputH4BreachBufferChartBarCount;
-   if(barCount < 1 || barOpenTime <= 0)
-      return false;
-
-   const int barShift = iBarShift(_Symbol, InputH4NarrativeTimeframe, barOpenTime, false);
-   if(barShift < 0)
-      return false;
-
-   return barShift >= 1 && barShift <= barCount;
-}
-
-//+------------------------------------------------------------------+
-void H4ClearVolumeBreachMemoryAndChart()
-{
-   g_h4LegVolumeBreachCount = 0;
-   H4ResetActiveLegVolumeBreachTrack();
-   ObjectsDeleteAll(0, ChartObjectNamePrefixH4VolumeBreachRay, -1, -1);
-}
-
-//+------------------------------------------------------------------+
-void RebuildH4LegVolumeBreachLevelsFromSwingHistory()
-{
-   g_h4LegVolumeBreachCount = 0;
-
-   for(int legIndex = 0; legIndex < g_h4Swing.swingHistoryCount; legIndex++)
-   {
-      const Swing lastLeg = g_h4Swing.swingHistory[legIndex];
-      if(lastLeg.swingDirection == 0 || lastLeg.legStartTime == 0 || lastLeg.legEndTime == 0)
-         continue;
-
-      H4ScanLegForLiquidityBreaches(lastLeg, 0);
-   }
-}
-
-//+------------------------------------------------------------------+
-void DeleteH4VolumeBreachLevelRay(const datetime legStartTime, const ENUM_LIQUIDITY_TYPE lqType,
-                                   const datetime volumeBarOpenTime)
-{
-   if(legStartTime == 0 || volumeBarOpenTime == 0)
-      return;
-
-   const string objName = H4VolumeBreachRayObjectName(legStartTime, lqType, volumeBarOpenTime);
-   ObjectDelete(0, objName);
-}
-
-//+------------------------------------------------------------------+
-//| Green breach ray -> bull hunt; pink breach ray -> bear hunt.       |
-//+------------------------------------------------------------------+
-bool H4LqTypeExpectsBullishHunt(const ENUM_LIQUIDITY_TYPE lqType)
-{
-   return lqType == LQ_EXTERNAL_BOTTOM || lqType == LQ_INTERNAL_BULL;
-}
-
-//+------------------------------------------------------------------+
-void DrawH4VolumeBreachLevelRay(const datetime legStartTime, const datetime legEndTime,
-                                 const int swingDirection, const ENUM_LIQUIDITY_TYPE lqType,
-                                 const datetime volumeBarOpenTime, const double breachLevel)
-{
-   if(!H4LqChartDrawEnabled(InputDrawH4SwingLegVisuals) || legStartTime == 0 || swingDirection == 0 ||
-      volumeBarOpenTime == 0 || breachLevel <= 0.0)
-      return;
-
-   color rayColor = H4_VOLUME_BREACH_RAY_COLOR_UP;
-   if(lqType == LQ_EXTERNAL_TOP || lqType == LQ_INTERNAL_BEAR)
-      rayColor = H4_VOLUME_BREACH_RAY_COLOR_DOWN;
-   else if(lqType == LQ_EXTERNAL_BOTTOM || lqType == LQ_INTERNAL_BULL)
-      rayColor = H4_VOLUME_BREACH_RAY_COLOR_UP;
-
-   const string objName = H4VolumeBreachRayObjectName(legStartTime, lqType, volumeBarOpenTime);
-
-   const int h4PeriodSec = (int)PeriodSeconds(InputH4NarrativeTimeframe);
-   if(h4PeriodSec < 1)
-      return;
-
-   const int bufferBars = InputH4BreachBufferChartBarCount;
-   if(bufferBars < 1)
-      return;
-
-   const datetime timeEnd =
-      volumeBarOpenTime + (datetime)((long)bufferBars * (long)h4PeriodSec);
-
-   if(ObjectFind(0, objName) < 0)
-   {
-      if(!ObjectCreate(0, objName, OBJ_TREND, 0, volumeBarOpenTime, breachLevel, timeEnd, breachLevel))
-         return;
-   }
-   else
-   {
-      ObjectSetInteger(0, objName, OBJPROP_TIME, 0, volumeBarOpenTime);
-      ObjectSetDouble(0, objName, OBJPROP_PRICE, 0, breachLevel);
-      ObjectSetInteger(0, objName, OBJPROP_TIME, 1, timeEnd);
-      ObjectSetDouble(0, objName, OBJPROP_PRICE, 1, breachLevel);
-   }
-
-   ObjectSetInteger(0, objName, OBJPROP_COLOR, rayColor);
-   ObjectSetInteger(0, objName, OBJPROP_STYLE, STYLE_SOLID);
-   ObjectSetInteger(0, objName, OBJPROP_WIDTH, 1);
-   ObjectSetInteger(0, objName, OBJPROP_RAY_RIGHT, false);
-   ObjectSetInteger(0, objName, OBJPROP_RAY_LEFT, false);
-   ObjectSetInteger(0, objName, OBJPROP_BACK, false);
-   ObjectSetInteger(0, objName, OBJPROP_ZORDER, H4_VOLUME_BREACH_RAY_ZORDER);
-   ObjectSetInteger(0, objName, OBJPROP_SELECTABLE, false);
-   ObjectSetInteger(0, objName, OBJPROP_HIDDEN, false);
-   ObjectSetInteger(0, objName, OBJPROP_TIMEFRAMES, OBJ_ALL_PERIODS);
-}
-
-//+------------------------------------------------------------------+
-void RebuildAllH4VolumeBreachMarkers()
-{
-   if(!H4LqChartDrawEnabled(InputDrawH4SwingLegVisuals))
-   {
-      ObjectsDeleteAll(0, ChartObjectNamePrefixH4VolumeBreachRay, -1, -1);
-      return;
-   }
-
-   ObjectsDeleteAll(0, ChartObjectNamePrefixH4VolumeBreachRay, -1, -1);
-
-   for(int i = 0; i < g_h4LegVolumeBreachCount; i++)
-   {
-      const H4LegVolumeBreachRecord rec = g_h4LegVolumeBreaches[i];
-      if(rec.legStartTime == 0 || rec.swingDirection == 0 || rec.breachLevelPrice <= 0.0)
-         continue;
-
-      if(rec.legEndTime == 0 &&
-         (g_h4Swing.currentSwingLeg.legStartTime != rec.legStartTime ||
-          g_h4Swing.currentSwingLeg.swingDirection != rec.swingDirection))
-         continue;
-
-      if(rec.swept)
-         continue;
-
-      if(!IsH4BreachRecordActiveInBufferWindow(rec))
-         continue;
-
-      DrawH4VolumeBreachLevelRay(rec.legStartTime, rec.legEndTime, rec.swingDirection, rec.lqType,
-                                  rec.volumeBarOpenTime, rec.breachLevelPrice);
-   }
-}
-
-//+------------------------------------------------------------------+
-bool H4VolumeBreachLevelsMatch(const double levelA, const double levelB)
-{
-   if(levelA <= 0.0 || levelB <= 0.0)
-      return false;
-
-   const double pointSize = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-   const double eps       = (pointSize > 0.0 ? pointSize : 0.00001);
-   return MathAbs(levelA - levelB) <= eps;
-}
-
-//+------------------------------------------------------------------+
-datetime H4LookupBreachVolumeBarOpenTime(const int swingDirection, const ENUM_LIQUIDITY_TYPE lqType,
-                                          const double breachLevel, const datetime legKey)
-{
-   if(swingDirection == 0 || breachLevel <= 0.0)
-      return 0;
-
-   for(int i = g_h4LegVolumeBreachCount - 1; i >= 0; i--)
-   {
-      const H4LegVolumeBreachRecord rec = g_h4LegVolumeBreaches[i];
-      if(rec.swingDirection != swingDirection || rec.lqType != lqType)
-         continue;
-      if(!H4VolumeBreachLevelsMatch(rec.breachLevelPrice, breachLevel))
-         continue;
-      if(legKey != 0 && legKey != rec.legStartTime && legKey != rec.legEndTime)
-         continue;
-      return rec.volumeBarOpenTime;
-   }
-   return 0;
-}
-
-//+------------------------------------------------------------------+
-bool H4IsVolumeBreachRecordSwept(const datetime legKey, const int swingDirection,
-                                  const ENUM_LIQUIDITY_TYPE lqType, const double breachLevel)
-{
-   if(swingDirection == 0 || breachLevel <= 0.0)
-      return false;
-
-   for(int i = 0; i < g_h4LegVolumeBreachCount; i++)
-   {
-      const H4LegVolumeBreachRecord rec = g_h4LegVolumeBreaches[i];
-      if(rec.swingDirection != swingDirection || rec.lqType != lqType)
-         continue;
-      if(!H4VolumeBreachLevelsMatch(rec.breachLevelPrice, breachLevel))
-         continue;
-      if(legKey != 0 && legKey != rec.legStartTime && legKey != rec.legEndTime)
-         continue;
-      return rec.swept;
-   }
-   return false;
-}
-
-//+------------------------------------------------------------------+
-bool H4IsBreachHuntArmed(const datetime legKey, const int swingDirection,
-                          const ENUM_LIQUIDITY_TYPE lqType, const double breachLevel)
-{
-   if(swingDirection == 0 || breachLevel <= 0.0)
-      return false;
-
-   for(int i = 0; i < g_h4LegVolumeBreachCount; i++)
-   {
-      const H4LegVolumeBreachRecord rec = g_h4LegVolumeBreaches[i];
-      if(rec.swingDirection != swingDirection || rec.lqType != lqType)
-         continue;
-      if(!H4VolumeBreachLevelsMatch(rec.breachLevelPrice, breachLevel))
-         continue;
-      if(legKey != 0 && legKey != rec.legStartTime && legKey != rec.legEndTime)
-         continue;
-      return rec.huntArmed;
-   }
-   return false;
-}
-
-//+------------------------------------------------------------------+
-void H4MarkBreachHuntArmed(const datetime legKey, const int swingDirection,
-                            const ENUM_LIQUIDITY_TYPE lqType, const double breachLevel)
-{
-   if(swingDirection == 0 || breachLevel <= 0.0)
-      return;
-
-   for(int i = 0; i < g_h4LegVolumeBreachCount; i++)
-   {
-      if(g_h4LegVolumeBreaches[i].swingDirection != swingDirection ||
-         g_h4LegVolumeBreaches[i].lqType != lqType)
-         continue;
-      if(!H4VolumeBreachLevelsMatch(g_h4LegVolumeBreaches[i].breachLevelPrice, breachLevel))
-         continue;
-      if(legKey != 0 && legKey != g_h4LegVolumeBreaches[i].legStartTime &&
-         legKey != g_h4LegVolumeBreaches[i].legEndTime)
-         continue;
-
-      g_h4LegVolumeBreaches[i].huntArmed = true;
-      g_h4LegVolumeBreaches[i].swept      = true;
-      DeleteH4VolumeBreachLevelRay(g_h4LegVolumeBreaches[i].legStartTime,
-                                    g_h4LegVolumeBreaches[i].lqType,
-                                    g_h4LegVolumeBreaches[i].volumeBarOpenTime);
-      return;
-   }
-}
-
-//+------------------------------------------------------------------+
-void H4MarkVolumeBreachRecordSwept(const datetime legKey, const int swingDirection,
-                                    const ENUM_LIQUIDITY_TYPE lqType, const double breachLevel)
-{
-   if(swingDirection == 0 || breachLevel <= 0.0)
-      return;
-
-   for(int i = 0; i < g_h4LegVolumeBreachCount; i++)
-   {
-      if(g_h4LegVolumeBreaches[i].swingDirection != swingDirection ||
-         g_h4LegVolumeBreaches[i].lqType != lqType)
-         continue;
-      if(!H4VolumeBreachLevelsMatch(g_h4LegVolumeBreaches[i].breachLevelPrice, breachLevel))
-         continue;
-      if(legKey != 0 && legKey != g_h4LegVolumeBreaches[i].legStartTime &&
-         legKey != g_h4LegVolumeBreaches[i].legEndTime)
-         continue;
-
-      g_h4LegVolumeBreaches[i].swept = true;
-      DeleteH4VolumeBreachLevelRay(g_h4LegVolumeBreaches[i].legStartTime,
-                                    g_h4LegVolumeBreaches[i].lqType,
-                                    g_h4LegVolumeBreaches[i].volumeBarOpenTime);
-      return;
-   }
-}
-
-//+------------------------------------------------------------------+
-bool WasH4VolumeBreachLevelViolatedSinceFormation(const ENUM_LIQUIDITY_TYPE lqType,
-                                                    const double breachLevel,
-                                                    const datetime levelFormedOpenTime,
-                                                    const double pointSize)
-{
-   if(breachLevel <= 0.0 || levelFormedOpenTime == 0)
-      return false;
-
-   const double eps = (pointSize > 0.0 ? pointSize : 0.00001);
-   const int formationShift =
-      iBarShift(_Symbol, InputH4NarrativeTimeframe, levelFormedOpenTime, false);
-   if(formationShift < 0)
-      return false;
-
-   for(int barShift = formationShift - 1; barShift >= 1; barShift--)
-   {
-      if(lqType == LQ_EXTERNAL_TOP || lqType == LQ_INTERNAL_BEAR)
-      {
-         const double barHigh = iHigh(_Symbol, InputH4NarrativeTimeframe, barShift);
-         if(barHigh > 0.0 && barHigh > breachLevel + eps)
-            return true;
-      }
-      else if(lqType == LQ_EXTERNAL_BOTTOM || lqType == LQ_INTERNAL_BULL)
-      {
-         const double barLow = iLow(_Symbol, InputH4NarrativeTimeframe, barShift);
-         if(barLow > 0.0 && barLow < breachLevel - eps)
-            return true;
-      }
-   }
-   return false;
-}
-
-//+------------------------------------------------------------------+
-//| Mark volume breach levels swept (each M2 close + once on attach). |
-//+------------------------------------------------------------------+
-void UpdateH4LegLiquidityBreachMemoryOnM2Bar()
-{
-   if(InputH4BreachBufferChartBarCount < 1)
-      return;
-
-   const double pointSize = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-
-   for(int i = 0; i < g_h4LegVolumeBreachCount; i++)
-   {
-      if(g_h4LegVolumeBreaches[i].swingDirection == 0 || g_h4LegVolumeBreaches[i].breachLevelPrice <= 0.0)
-         continue;
-
-      if(g_h4LegVolumeBreaches[i].swept)
-         continue;
-
-      if(!IsH4BreachRecordActiveInBufferWindow(g_h4LegVolumeBreaches[i]))
-         continue;
-
-      datetime scanFromOpenTime = g_h4LegVolumeBreaches[i].volumeBarOpenTime;
-      if(scanFromOpenTime == 0)
-         scanFromOpenTime = (g_h4LegVolumeBreaches[i].legEndTime > 0)
-                            ? g_h4LegVolumeBreaches[i].legEndTime
-                            : g_h4LegVolumeBreaches[i].legStartTime;
-
-      if(!WasH4VolumeBreachLevelViolatedSinceFormation(g_h4LegVolumeBreaches[i].lqType,
-                                                        g_h4LegVolumeBreaches[i].breachLevelPrice,
-                                                        scanFromOpenTime, pointSize))
-         continue;
-
-      g_h4LegVolumeBreaches[i].swept = true;
-      DeleteH4VolumeBreachLevelRay(g_h4LegVolumeBreaches[i].legStartTime,
-                                    g_h4LegVolumeBreaches[i].lqType,
-                                    g_h4LegVolumeBreaches[i].volumeBarOpenTime);
-      if(H4LqLoggingEnabled())
-      {
-         const datetime legKey = (g_h4LegVolumeBreaches[i].legEndTime > 0)
-                                 ? g_h4LegVolumeBreaches[i].legEndTime
-                                 : g_h4LegVolumeBreaches[i].legStartTime;
-         LogHuntEvent("BREACH_SWEPT",
-                      StringFormat("H4 %s leg %s level=%.5f volBar=%s price %s level",
-                                   g_h4LegVolumeBreaches[i].swingDirection == 1 ? "up" : "down",
-                                   TimeToString(legKey, TIME_DATE | TIME_MINUTES),
-                                   g_h4LegVolumeBreaches[i].breachLevelPrice,
-                                   TimeToString(scanFromOpenTime, TIME_DATE | TIME_MINUTES),
-                                   g_h4LegVolumeBreaches[i].swingDirection == 1 ? "below" : "above"));
-      }
-   }
-}
-
-//+------------------------------------------------------------------+
-bool TryPushH4ReplayLeg(H4ReplayLeg &replayLegs[], int &replayLegCount, const Swing &closedLeg)
+bool TryPushM15ReplayLeg(M15ReplayLeg &replayLegs[], int &replayLegCount, const Swing &closedLeg)
 {
    if(closedLeg.swingDirection == 0 || closedLeg.legEndTime == 0)
       return false;
-   if(replayLegCount >= H4_REPLAY_LEG_CAPACITY)
+   if(replayLegCount >= M15_REPLAY_LEG_CAPACITY)
       return false;
 
    replayLegs[replayLegCount].legHighPrice    = closedLeg.legHighPrice;
@@ -4423,11 +2970,104 @@ bool TryPushH4ReplayLeg(H4ReplayLeg &replayLegs[], int &replayLegCount, const Sw
 //+------------------------------------------------------------------+
 //| Replay one closed H4 bar into swingState; append completed legs (no hunt side effects). |
 //+------------------------------------------------------------------+
-void ProcessH4SwingStepReplay(SwingState &swingState, const int lastClosedBarShift,
-                               H4ReplayLeg &replayLegs[], int &replayLegCount,
+
+//+------------------------------------------------------------------+
+bool M15BreachRecordActiveInBuffer(const M15LegVolumeBreachRecord &rec)
+{
+   if(rec.swept || rec.swingDirection == 0 || rec.breachLevelPrice <= 0.0)
+      return false;
+
+   if(InputM15BreachBufferChartBarCount < 1)
+      return true;
+
+   const datetime refOpenTime = (rec.volumeBarOpenTime > 0)
+                                 ? rec.volumeBarOpenTime
+                                 : ((rec.legEndTime > 0) ? rec.legEndTime : rec.legStartTime);
+   if(refOpenTime <= 0)
+      return false;
+
+   const int barShift = iBarShift(_Symbol, InputM15NarrativeTimeframe, refOpenTime, false);
+   if(barShift < 0)
+      return false;
+
+   return barShift >= 1 && barShift <= InputM15BreachBufferChartBarCount;
+}
+
+//+------------------------------------------------------------------+
+void M15UpsertExternalLegVolumeBreachRecord(const datetime legStartTime, const datetime legEndTime,
+                                             const int swingDirection, const double breachLevel,
+                                             const datetime volumeBarOpenTime)
+{
+   if(swingDirection == 0 || legStartTime == 0 || breachLevel <= 0.0)
+      return;
+
+   const ENUM_LIQUIDITY_TYPE lqType = M15ExternalLqTypeForSwingDirection(swingDirection);
+   const double pointSize = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   const double eps       = (pointSize > 0.0 ? pointSize : 0.00001);
+
+   for(int i = 0; i < g_m15LegVolumeBreachCount; i++)
+   {
+      if(g_m15LegVolumeBreaches[i].legStartTime != legStartTime || g_m15LegVolumeBreaches[i].lqType != lqType)
+         continue;
+      if(MathAbs(g_m15LegVolumeBreaches[i].breachLevelPrice - breachLevel) > eps)
+         continue;
+
+      g_m15LegVolumeBreaches[i].swingDirection    = swingDirection;
+      g_m15LegVolumeBreaches[i].breachLevelPrice  = breachLevel;
+      g_m15LegVolumeBreaches[i].volumeBarOpenTime = volumeBarOpenTime;
+      if(legEndTime > 0)
+         g_m15LegVolumeBreaches[i].legEndTime = legEndTime;
+      return;
+   }
+
+   if(g_m15LegVolumeBreachCount < M15_LEG_VOLUME_BREACH_CAPACITY)
+   {
+      const int index = g_m15LegVolumeBreachCount++;
+      g_m15LegVolumeBreaches[index].legStartTime        = legStartTime;
+      g_m15LegVolumeBreaches[index].legEndTime          = legEndTime;
+      g_m15LegVolumeBreaches[index].swingDirection      = swingDirection;
+      g_m15LegVolumeBreaches[index].lqType              = lqType;
+      g_m15LegVolumeBreaches[index].breachLevelPrice    = breachLevel;
+      g_m15LegVolumeBreaches[index].volumeBarOpenTime   = volumeBarOpenTime;
+      g_m15LegVolumeBreaches[index].swept               = false;
+      g_m15LegVolumeBreaches[index].huntArmed           = false;
+      return;
+   }
+
+   for(int shiftIndex = 1; shiftIndex < M15_LEG_VOLUME_BREACH_CAPACITY; shiftIndex++)
+      g_m15LegVolumeBreaches[shiftIndex - 1] = g_m15LegVolumeBreaches[shiftIndex];
+
+   const int lastIndex = M15_LEG_VOLUME_BREACH_CAPACITY - 1;
+   g_m15LegVolumeBreaches[lastIndex].legStartTime        = legStartTime;
+   g_m15LegVolumeBreaches[lastIndex].legEndTime          = legEndTime;
+   g_m15LegVolumeBreaches[lastIndex].swingDirection      = swingDirection;
+   g_m15LegVolumeBreaches[lastIndex].lqType              = lqType;
+   g_m15LegVolumeBreaches[lastIndex].breachLevelPrice    = breachLevel;
+   g_m15LegVolumeBreaches[lastIndex].volumeBarOpenTime   = volumeBarOpenTime;
+   g_m15LegVolumeBreaches[lastIndex].swept               = false;
+   g_m15LegVolumeBreaches[lastIndex].huntArmed           = false;
+}
+
+//+------------------------------------------------------------------+
+void M15SyncExternalBreachFromSwingLeg(const Swing &leg)
+{
+   if(leg.swingDirection == 0 || leg.legStartTime == 0)
+      return;
+
+   const double breachLevel = (leg.swingDirection == 1) ? leg.legHighPrice : leg.legLowPrice;
+   if(breachLevel <= 0.0)
+      return;
+
+   const datetime volumeBarOpenTime = (leg.legEndTime > 0) ? leg.legEndTime : leg.legStartTime;
+   M15UpsertExternalLegVolumeBreachRecord(leg.legStartTime, leg.legEndTime, leg.swingDirection,
+                                           breachLevel, volumeBarOpenTime);
+}
+
+void ProcessM15SwingStepReplay(SwingState &swingState, const int lastClosedBarShift,
+                               M15ReplayLeg &replayLegs[], int &replayLegCount,
                                const double anchorMultiplier, const bool useWickAndBodyForDecent)
 {
-   const ENUM_TIMEFRAMES timeframe = InputH4NarrativeTimeframe;
+   const ENUM_TIMEFRAMES timeframe = InputM15NarrativeTimeframe;
    const int         sh            = lastClosedBarShift;
 
    const double lastClosedBarOpen  = iOpen(_Symbol, timeframe, sh);
@@ -4489,7 +3129,7 @@ void ProcessH4SwingStepReplay(SwingState &swingState, const int lastClosedBarShi
 
    Swing closedSwingLeg = swingState.currentSwingLeg;
    closedSwingLeg.legEndTime = iTime(_Symbol, timeframe, sh);
-   TryPushH4ReplayLeg(replayLegs, replayLegCount, closedSwingLeg);
+   TryPushM15ReplayLeg(replayLegs, replayLegCount, closedSwingLeg);
 
    double newSwingLegHigh = lastClosedBarHigh;
    double newSwingLegLow  = lastClosedBarLow;
@@ -4506,31 +3146,31 @@ void ProcessH4SwingStepReplay(SwingState &swingState, const int lastClosedBarShi
 //| Completed H4 swing legs in lookback: up-leg high / down-leg low pivots only.   |
 //| Pivot up high: legHigh beats every newer up-leg high; pivot down low: vice versa. |
 //+------------------------------------------------------------------+
-void RebuildH4LiquidityPivotLevels()
+void RebuildM15LiquidityPivotLevels()
 {
-   g_h4DescHighPivotCount = 0;
-   g_h4AscLowPivotCount   = 0;
+   g_m15DescHighPivotCount = 0;
+   g_m15AscLowPivotCount   = 0;
 
-   if(InputH4LiquidityPivotLookbackBars < 2)
+   if(InputM15LiquidityPivotLookbackBars < 2)
       return;
 
-   const int barsTotal = iBars(_Symbol, InputH4NarrativeTimeframe);
+   const int barsTotal = iBars(_Symbol, InputM15NarrativeTimeframe);
    if(barsTotal < 3)
       return;
 
    const int maxShift =
-      (int)MathMin((double)InputH4LiquidityPivotLookbackBars, (double)(barsTotal - 2));
+      (int)MathMin((double)InputM15LiquidityPivotLookbackBars, (double)(barsTotal - 2));
    if(maxShift < 1)
       return;
 
-   H4ReplayLeg replayLegs[H4_REPLAY_LEG_CAPACITY];
+   M15ReplayLeg replayLegs[M15_REPLAY_LEG_CAPACITY];
    int          replayLegCount = 0;
    SwingState   replaySwing;
    ZeroMemory(replaySwing);
 
    for(int shift = maxShift; shift >= 1; shift--)
-      ProcessH4SwingStepReplay(replaySwing, shift, replayLegs, replayLegCount,
-                                H4_BREACH_ANCHOR_MULTIPLIER, true);
+      ProcessM15SwingStepReplay(replaySwing, shift, replayLegs, replayLegCount,
+                                M15_BREACH_ANCHOR_MULTIPLIER, true);
 
    if(replayLegCount <= 0)
       return;
@@ -4555,27 +3195,27 @@ void RebuildH4LiquidityPivotLevels()
          }
       }
 
-      if(!isPivotHigh || g_h4DescHighPivotCount >= H4_LIQUIDITY_PIVOT_CAPACITY)
+      if(!isPivotHigh || g_m15DescHighPivotCount >= M15_LIQUIDITY_PIVOT_CAPACITY)
          continue;
 
       double breachLevel = replayLegs[legIndex].legHighPrice;
-      for(int breachIndex = 0; breachIndex < g_h4LegVolumeBreachCount; breachIndex++)
+      for(int breachIndex = 0; breachIndex < g_m15LegVolumeBreachCount; breachIndex++)
       {
-         if(g_h4LegVolumeBreaches[breachIndex].legStartTime == replayLegs[legIndex].legStartTime &&
-            g_h4LegVolumeBreaches[breachIndex].lqType == LQ_EXTERNAL_TOP)
+         if(g_m15LegVolumeBreaches[breachIndex].legStartTime == replayLegs[legIndex].legStartTime &&
+            g_m15LegVolumeBreaches[breachIndex].lqType == LQ_EXTERNAL_TOP)
          {
-            breachLevel = g_h4LegVolumeBreaches[breachIndex].breachLevelPrice;
+            breachLevel = g_m15LegVolumeBreaches[breachIndex].breachLevelPrice;
             break;
          }
       }
 
-      const int outIndex = g_h4DescHighPivotCount;
-      g_h4DescHighPivots[outIndex].levelPrice     = breachLevel;
-      g_h4DescHighPivots[outIndex].legEndTime      = replayLegs[legIndex].legEndTime;
-      g_h4DescHighPivots[outIndex].legHighPrice    = replayLegs[legIndex].legHighPrice;
-      g_h4DescHighPivots[outIndex].legLowPrice     = replayLegs[legIndex].legLowPrice;
-      g_h4DescHighPivots[outIndex].swingDirection  = 1;
-      g_h4DescHighPivotCount++;
+      const int outIndex = g_m15DescHighPivotCount;
+      g_m15DescHighPivots[outIndex].levelPrice     = breachLevel;
+      g_m15DescHighPivots[outIndex].legEndTime      = replayLegs[legIndex].legEndTime;
+      g_m15DescHighPivots[outIndex].legHighPrice    = replayLegs[legIndex].legHighPrice;
+      g_m15DescHighPivots[outIndex].legLowPrice     = replayLegs[legIndex].legLowPrice;
+      g_m15DescHighPivots[outIndex].swingDirection  = 1;
+      g_m15DescHighPivotCount++;
    }
 
    for(int legIndex = replayLegCount - 1; legIndex >= 0; legIndex--)
@@ -4595,36 +3235,50 @@ void RebuildH4LiquidityPivotLevels()
          }
       }
 
-      if(!isPivotLow || g_h4AscLowPivotCount >= H4_LIQUIDITY_PIVOT_CAPACITY)
+      if(!isPivotLow || g_m15AscLowPivotCount >= M15_LIQUIDITY_PIVOT_CAPACITY)
          continue;
 
       double breachLevel = replayLegs[legIndex].legLowPrice;
-      for(int breachIndex = 0; breachIndex < g_h4LegVolumeBreachCount; breachIndex++)
+      for(int breachIndex = 0; breachIndex < g_m15LegVolumeBreachCount; breachIndex++)
       {
-         if(g_h4LegVolumeBreaches[breachIndex].legStartTime == replayLegs[legIndex].legStartTime &&
-            g_h4LegVolumeBreaches[breachIndex].lqType == LQ_EXTERNAL_BOTTOM)
+         if(g_m15LegVolumeBreaches[breachIndex].legStartTime == replayLegs[legIndex].legStartTime &&
+            g_m15LegVolumeBreaches[breachIndex].lqType == LQ_EXTERNAL_BOTTOM)
          {
-            breachLevel = g_h4LegVolumeBreaches[breachIndex].breachLevelPrice;
+            breachLevel = g_m15LegVolumeBreaches[breachIndex].breachLevelPrice;
             break;
          }
       }
 
-      const int outIndex = g_h4AscLowPivotCount;
-      g_h4AscLowPivots[outIndex].levelPrice     = breachLevel;
-      g_h4AscLowPivots[outIndex].legEndTime      = replayLegs[legIndex].legEndTime;
-      g_h4AscLowPivots[outIndex].legHighPrice    = replayLegs[legIndex].legHighPrice;
-      g_h4AscLowPivots[outIndex].legLowPrice     = replayLegs[legIndex].legLowPrice;
-      g_h4AscLowPivots[outIndex].swingDirection  = -1;
-      g_h4AscLowPivotCount++;
+      const int outIndex = g_m15AscLowPivotCount;
+      g_m15AscLowPivots[outIndex].levelPrice     = breachLevel;
+      g_m15AscLowPivots[outIndex].legEndTime      = replayLegs[legIndex].legEndTime;
+      g_m15AscLowPivots[outIndex].legHighPrice    = replayLegs[legIndex].legHighPrice;
+      g_m15AscLowPivots[outIndex].legLowPrice     = replayLegs[legIndex].legLowPrice;
+      g_m15AscLowPivots[outIndex].swingDirection  = -1;
+      g_m15AscLowPivotCount++;
    }
+}
+
+//+------------------------------------------------------------------+
+bool M2WickCrossesAboveLevel(const double level, const double barHigh, const double prevHigh,
+                             const double pointSize)
+{
+   return (barHigh > level + pointSize && prevHigh <= level + pointSize);
+}
+
+//+------------------------------------------------------------------+
+bool M2WickCrossesBelowLevel(const double level, const double barLow, const double prevLow,
+                             const double pointSize)
+{
+   return (barLow < level - pointSize && prevLow >= level - pointSize);
 }
 
 //+------------------------------------------------------------------+
 //| Breach buffer band (% of H4 reference height): high 2% below..10% above; low 2% above..10% below. |
 //+------------------------------------------------------------------+
-void H4BreachBufferBandForUpLegHigh(const double breachLevel, double &outBandLow, double &outBandHigh)
+void M15BreachBufferBandForUpLegHigh(const double breachLevel, double &outBandLow, double &outBandHigh)
 {
-   const double referenceHeight = ReferenceChartHeightForH4BreachBuffer();
+   const double referenceHeight = ReferenceChartHeightForM15BreachBuffer();
    if(referenceHeight <= 0.0)
    {
       outBandLow  = breachLevel;
@@ -4632,14 +3286,14 @@ void H4BreachBufferBandForUpLegHigh(const double breachLevel, double &outBandLow
       return;
    }
 
-   outBandLow  = breachLevel - referenceHeight * (H4_BREACH_BUFFER_PERCENT_NEAR / 100.0);
-   outBandHigh = breachLevel + referenceHeight * (H4_BREACH_BUFFER_PERCENT_FAR / 100.0);
+   outBandLow  = breachLevel - referenceHeight * (M15_BREACH_BUFFER_PERCENT_NEAR / 100.0);
+   outBandHigh = breachLevel + referenceHeight * (M15_BREACH_BUFFER_PERCENT_FAR / 100.0);
 }
 
 //+------------------------------------------------------------------+
-void H4BreachBufferBandForDownLegLow(const double breachLevel, double &outBandLow, double &outBandHigh)
+void M15BreachBufferBandForDownLegLow(const double breachLevel, double &outBandLow, double &outBandHigh)
 {
-   const double referenceHeight = ReferenceChartHeightForH4BreachBuffer();
+   const double referenceHeight = ReferenceChartHeightForM15BreachBuffer();
    if(referenceHeight <= 0.0)
    {
       outBandLow  = breachLevel;
@@ -4647,12 +3301,12 @@ void H4BreachBufferBandForDownLegLow(const double breachLevel, double &outBandLo
       return;
    }
 
-   outBandLow  = breachLevel - referenceHeight * (H4_BREACH_BUFFER_PERCENT_FAR / 100.0);
-   outBandHigh = breachLevel + referenceHeight * (H4_BREACH_BUFFER_PERCENT_NEAR / 100.0);
+   outBandLow  = breachLevel - referenceHeight * (M15_BREACH_BUFFER_PERCENT_FAR / 100.0);
+   outBandHigh = breachLevel + referenceHeight * (M15_BREACH_BUFFER_PERCENT_NEAR / 100.0);
 }
 
 //+------------------------------------------------------------------+
-bool H4BreachImpulseCancelZonePrices(const bool expectBullishFvgHunt, const double breachLevel,
+bool M15BreachImpulseCancelZonePrices(const bool expectBullishFvgHunt, const double breachLevel,
                                        double &outZoneLow, double &outZoneHigh,
                                        double &outCancelLimitPrice)
 {
@@ -4660,14 +3314,14 @@ bool H4BreachImpulseCancelZonePrices(const bool expectBullishFvgHunt, const doub
    outZoneHigh = 0.0;
    outCancelLimitPrice = 0.0;
 
-   if(H4_BREACH_BUFFER_PERCENT_FAR <= 0.0 || breachLevel <= 0.0)
+   if(M15_BREACH_BUFFER_PERCENT_FAR <= 0.0 || breachLevel <= 0.0)
       return false;
 
-   const double referenceHeight = ReferenceChartHeightForH4BreachBuffer();
+   const double referenceHeight = ReferenceChartHeightForM15BreachBuffer();
    if(referenceHeight <= 0.0)
       return false;
 
-   const double farOffset = referenceHeight * (H4_BREACH_BUFFER_PERCENT_FAR / 100.0);
+   const double farOffset = referenceHeight * (M15_BREACH_BUFFER_PERCENT_FAR / 100.0);
    if(expectBullishFvgHunt)
    {
       outZoneHigh         = breachLevel;
@@ -4680,6 +3334,40 @@ bool H4BreachImpulseCancelZonePrices(const bool expectBullishFvgHunt, const doub
       outZoneHigh         = breachLevel + farOffset;
       outCancelLimitPrice = outZoneHigh;
    }
+   return true;
+}
+
+//+------------------------------------------------------------------+
+bool M2WickCrossesIntoM15UpBreachBuffer(const double bandLow, const double bandHigh,
+                                        const double barHigh, const double prevHigh,
+                                        const double pointSize)
+{
+   if(prevHigh >= bandLow - pointSize)
+      return false;
+   return barHigh >= bandLow - pointSize;
+}
+
+//+------------------------------------------------------------------+
+bool M2WickCrossesIntoM15DownBreachBuffer(const double bandLow, const double bandHigh,
+                                          const double barLow, const double prevLow,
+                                          const double pointSize)
+{
+   if(prevLow <= bandHigh + pointSize)
+      return false;
+   return barLow <= bandHigh + pointSize;
+}
+
+//+------------------------------------------------------------------+
+bool TryAcceptM15BreachForHunt(const bool h4HighBreached, const double breachLevel,
+                               const datetime legEnd, double &outLevel, bool &outHighBreached,
+                               datetime &outLegEndTime)
+{
+   if(breachLevel <= 0.0 || legEnd == 0)
+      return false;
+
+   outLevel        = breachLevel;
+   outLegEndTime   = legEnd;
+   outHighBreached = h4HighBreached;
    return true;
 }
 
@@ -4731,16 +3419,16 @@ bool TryDetectM2BreakOfStructureOnLastClosedBar(bool &outExpectsBullishFairValue
 //+------------------------------------------------------------------+
 void LogHuntEvent(const string eventName, const string detail = "")
 {
-   if(!H4LqLoggingEnabled())
+   if(!M15LqLoggingEnabled())
       return;
 
    const datetime barTime = iTime(_Symbol, InputM2NarrativeTimeframe, 1);
    const string timeText  = (barTime != 0) ? TimeToString(barTime, TIME_DATE | TIME_MINUTES) : "no-bar";
 
    if(StringLen(detail) > 0)
-      PrintFormat("%s [%s] %s | %s", H4_LQ_LOG_PREFIX, timeText, eventName, detail);
+      PrintFormat("%s [%s] %s | %s", M15_LQ_LOG_PREFIX, timeText, eventName, detail);
    else
-      PrintFormat("%s [%s] %s", H4_LQ_LOG_PREFIX, timeText, eventName);
+      PrintFormat("%s [%s] %s", M15_LQ_LOG_PREFIX, timeText, eventName);
 }
 
 //+------------------------------------------------------------------+
@@ -4827,7 +3515,7 @@ bool ApplyTouchVolMinimumSlDistance(const bool isBuy, const double entryPrice,
 }
 
 //+------------------------------------------------------------------+
-//| Buy hunt: vol bar low + N% chart height. Sell hunt: vol bar high âˆ’ N%. |
+//| Buy hunt: vol bar low + N% chart height. Sell hunt: vol bar high Ã¢Ë†â€™ N%. |
 //+------------------------------------------------------------------+
 double M2TouchVolLimitEntryPrice(const bool isBuy, const int barShift,
                                   const double barLow, const double barHigh)
@@ -6011,7 +4699,7 @@ bool TryGetLatestQualifiedSlExtreme(const bool isBuy, double &outGroupExtreme)
     }
     
     // 3. Draw the Proximity Buffer Visual (Blue Rectangle)
-    if(H4LqChartDrawEnabled(InputDrawTradeSwingGroupTpZones))
+    if(M15LqChartDrawEnabled(InputDrawTradeSwingGroupTpZones))
     {
         double boundLow = 0.0;
         double boundHigh = 0.0;
@@ -6432,7 +5120,7 @@ bool ResolveHuntFvgOrderPlacementGate(const datetime formationTime, const dateti
 
    if(V2HuntHasOpenPositionForSession(huntSessionId))
    {
-      V2LogHuntEvent(huntIndex, "TRADE_SKIP", "hunt position open â€” one trade setup per hunt");
+      V2LogHuntEvent(huntIndex, "TRADE_SKIP", "hunt position open Ã¢â‚¬â€ one trade setup per hunt");
       return false;
    }
 
@@ -6585,12 +5273,12 @@ void CheckHuntPreEntryTp3CancelOnTick()
       {
          if(huntIndex >= 0)
             V2LogHuntEvent(huntIndex, "HUNT_TP3_PREENTRY_BOS_KEEP",
-                           StringFormat("TP3=%.5f touched â€” same-dir M2 BOS between entry=%.5f and TP3 since %s",
+                           StringFormat("TP3=%.5f touched Ã¢â‚¬â€ same-dir M2 BOS between entry=%.5f and TP3 since %s",
                                         tp3Level, entryPrice,
                                         TimeToString(sinceTime, TIME_DATE | TIME_MINUTES)));
          else
             LogHuntEvent("HUNT_TP3_PREENTRY_BOS_KEEP",
-                         StringFormat("HS%lld TP3=%.5f touched â€” same-dir M2 BOS between entry=%.5f and TP3",
+                         StringFormat("HS%lld TP3=%.5f touched Ã¢â‚¬â€ same-dir M2 BOS between entry=%.5f and TP3",
                                       (long)sessionId, tp3Level, entryPrice));
          continue;
       }
@@ -6705,10 +5393,10 @@ void CheckHuntPreEntrySlCancelOnTick()
 }
 
 //+------------------------------------------------------------------+
-//| Bull: bid > top+1% M2 chart rng â†’ BuyLimit @ top+1%; else market buy.          |
-//| Bear: ask < lowâˆ’1% M2 chart rng â†’ SellLimit @ lowâˆ’1%; else market sell.         |
+//| Bull: bid > top+1% M2 chart rng Ã¢â€ â€™ BuyLimit @ top+1%; else market buy.          |
+//| Bear: ask < lowÃ¢Ë†â€™1% M2 chart rng Ã¢â€ â€™ SellLimit @ lowÃ¢Ë†â€™1%; else market sell.         |
 //+------------------------------------------------------------------+
-// Latest completed H4 same-dir leg (g_h4Swing 0.5). TP = 0.9x / 1.4x / 1.9x from entry.
+// Latest completed H4 same-dir leg (g_m15Swing 0.5). TP = 0.9x / 1.4x / 1.9x from entry.
 //+------------------------------------------------------------------+
 int V4TradeLegDirectionForFvg(const bool isBullishFairValueGap)
 {
@@ -6760,7 +5448,7 @@ bool V4ResolveH4SameDirLegRangeForTp(const bool isBullishFairValueGap, double &o
 
    double legHigh = 0.0;
    double legLow  = 0.0;
-   if(!TryNthH4CompletedSwingLeg(tradeLegDir, 1, legHigh, legLow, outLegEndTime))
+   if(!TryNthM15CompletedSwingLeg(tradeLegDir, 1, legHigh, legLow, outLegEndTime))
       return false;
 
    outLegRange = legHigh - legLow;
@@ -6813,7 +5501,7 @@ bool PlaceOneFvgTradeOrderStopThenMarket(const bool isBuy, const double entryPri
       return true;
 
    LogHuntEvent("TRADE_STOP_FAIL",
-                StringFormat("%s ret=%d %s — retry market",
+                StringFormat("%s ret=%d %s â€” retry market",
                              comment, (int)g_trade.ResultRetcode(), g_trade.ResultRetcodeDescription()));
    return PlaceOneFvgTradeOrder(isBuy, true, entryPrice, stopLossPrice, takeProfitPrice, volume, comment);
 }
@@ -6916,18 +5604,18 @@ bool TryPlaceTouchVolumeBarTradeSetup(const int huntIndex, const bool isBuy,
    if(huntIndex < 0 || huntIndex >= V2_MAX_HUNT_SESSIONS || maxVolBarOpenTime == 0)
    {
       if(huntIndex >= 0 && huntIndex < V2_MAX_HUNT_SESSIONS)
-         V2LogHuntEvent(huntIndex, "TRADE_SKIP", "touch vol bar entry â€” maxVolBarOpenTime=0");
+         V2LogHuntEvent(huntIndex, "TRADE_SKIP", "touch vol bar entry Ã¢â‚¬â€ maxVolBarOpenTime=0");
       return false;
    }
 
    if(V2IsHuntSessionStillActive(huntSessionId))
    {
-      V2LogHuntEvent(huntIndex, "TRADE_SKIP", "hunt still ON â€” orders after touch");
+      V2LogHuntEvent(huntIndex, "TRADE_SKIP", "hunt still ON Ã¢â‚¬â€ orders after touch");
       return false;
    }
 
    string bosBiasBlockReason = "";
-   if(!FvgTradeAllowedByH4BosBias(isBuy, bosBiasBlockReason))
+   if(!FvgTradeAllowedByM15BosBias(isBuy, bosBiasBlockReason))
    {
       V2LogHuntEvent(huntIndex, "TRADE_SKIP", bosBiasBlockReason);
       return false;
@@ -6961,7 +5649,7 @@ bool TryPlaceTouchVolumeBarTradeSetup(const int huntIndex, const bool isBuy,
                                           entryFailReason))
    {
       V2LogHuntEvent(huntIndex, "TRADE_SKIP",
-                     StringFormat("touch vol bar entry/SL invalid sh=%d entry=%.5f sl=%.5f buy=%s â€” %s",
+                     StringFormat("touch vol bar entry/SL invalid sh=%d entry=%.5f sl=%.5f buy=%s Ã¢â‚¬â€ %s",
                                   barShift, entryPrice, stopLossOverall, isBuy ? "Y" : "N",
                                   entryFailReason));
       return false;
@@ -7091,12 +5779,12 @@ bool TryPlaceOppositeFvgTradeSetup(const bool isBullishFairValueGap, const doubl
 
    if(V2IsHuntSessionStillActive(huntSessionId))
    {
-      V2LogHuntEvent(huntIndex, "TRADE_SKIP", "hunt still ON â€” orders after touch");
+      V2LogHuntEvent(huntIndex, "TRADE_SKIP", "hunt still ON Ã¢â‚¬â€ orders after touch");
       return false;
    }
 
    string bosBiasBlockReason = "";
-   if(!FvgTradeAllowedByH4BosBias(isBullishFairValueGap, bosBiasBlockReason))
+   if(!FvgTradeAllowedByM15BosBias(isBullishFairValueGap, bosBiasBlockReason))
    {
       V2LogHuntEvent(huntIndex, "TRADE_SKIP", bosBiasBlockReason);
       return false;
@@ -7137,7 +5825,7 @@ bool TryPlaceOppositeFvgTradeSetup(const bool isBullishFairValueGap, const doubl
                                           entryFailReason))
    {
       V2LogHuntEvent(huntIndex, "TRADE_SKIP",
-                     StringFormat("FVG entry/SL via TouchVol invalid sh=%d buy=%s â€” %s",
+                     StringFormat("FVG entry/SL via TouchVol invalid sh=%d buy=%s Ã¢â‚¬â€ %s",
                                   entryBarShift, isBullishFairValueGap ? "Y" : "N",
                                   entryFailReason));
       return false;
@@ -7243,12 +5931,12 @@ bool TryPlaceEngulfAbsorptionTradeSetup(const int huntIndex, const bool isBuy,
 
    if(V2IsHuntSessionStillActive(huntSessionId))
    {
-      V2LogHuntEvent(huntIndex, "TRADE_SKIP", "hunt still ON â€” orders after engulf signal");
+      V2LogHuntEvent(huntIndex, "TRADE_SKIP", "hunt still ON Ã¢â‚¬â€ orders after engulf signal");
       return false;
    }
 
    string bosBiasBlockReason = "";
-   if(!FvgTradeAllowedByH4BosBias(isBuy, bosBiasBlockReason))
+   if(!FvgTradeAllowedByM15BosBias(isBuy, bosBiasBlockReason))
    {
       V2LogHuntEvent(huntIndex, "TRADE_SKIP", bosBiasBlockReason);
       return false;
@@ -7423,7 +6111,7 @@ int V2AllocHuntSlot()
 }
 
 //+------------------------------------------------------------------+
-int V2FindActiveHuntByH4Leg(const datetime legEndTime, const bool h4HighBreached)
+int V2FindActiveHuntByM15Leg(const datetime legEndTime, const bool h4HighBreached)
 {
    if(legEndTime == 0)
       return -1;
@@ -7535,7 +6223,7 @@ struct V3EngulfVolSpikeContext
 //+------------------------------------------------------------------+
 void V2LogHuntEvent(const int huntIndex, const string eventName, const string detail = "")
 {
-   if(!H4LqLoggingEnabled())
+   if(!M15LqLoggingEnabled())
       return;
    string prefix = "";
    if(huntIndex >= 0 && huntIndex < V2_MAX_HUNT_SESSIONS && g_v2Hunts[huntIndex].sessionId != 0)
@@ -7662,7 +6350,7 @@ void V2ClearImpulseBufferZone(const int huntIndex)
 //+------------------------------------------------------------------+
 void V2UpdateImpulseBufferZone(const int huntIndex)
 {
-   if(!H4LqChartDrawEnabled(InputDrawImpulseCancelBufferZone) || !g_v2Hunts[huntIndex].active)
+   if(!M15LqChartDrawEnabled(InputDrawImpulseCancelBufferZone) || !g_v2Hunts[huntIndex].active)
    {
       V2ClearImpulseBufferZone(huntIndex);
       return;
@@ -7671,7 +6359,7 @@ void V2UpdateImpulseBufferZone(const int huntIndex)
    double zoneLow = 0.0;
    double zoneHigh = 0.0;
    double cancelLimitPrice = 0.0;
-   if(!H4BreachImpulseCancelZonePrices(V2HuntExpectsBullishFvg(huntIndex),
+   if(!M15BreachImpulseCancelZonePrices(V2HuntExpectsBullishFvg(huntIndex),
                                         g_v2Hunts[huntIndex].h4BreachedLegLevelPrice,
                                         zoneLow, zoneHigh, cancelLimitPrice) ||
       g_v2Hunts[huntIndex].sessionId == 0)
@@ -7720,13 +6408,13 @@ void V2UpdateAllImpulseBufferZones()
 }
 
 //+------------------------------------------------------------------+
-int V2OppositeH4LegDirectionForHunt(const int huntIndex)
+int V2OppositeM15LegDirectionForHunt(const int huntIndex)
 {
    return g_v2Hunts[huntIndex].h4HighWasBreached ? -1 : 1;
 }
 
 //+------------------------------------------------------------------+
-void V2OnH4LegClosedForHunts(const int closedLegDirection, const datetime closedLegEndTime)
+void V2OnM15LegClosedForHunts(const int closedLegDirection, const datetime closedLegEndTime)
 {
    // v3: no touch-level hunt cancel on opposite H4 leg close
 }
@@ -7782,7 +6470,7 @@ bool M2TryGetLegBarOpenFromEnd(const datetime legStartTime, const datetime legEn
 }
 
 //+------------------------------------------------------------------+
-//| v3 — Engulfing Volume Absorption model                             |
+//| v3 â€” Engulfing Volume Absorption model                             |
 //+------------------------------------------------------------------+
 bool M2BarIsBullishAtShift(const int barShift)
 {
@@ -7900,17 +6588,6 @@ datetime V3GetHuntBreachVolumeBarTime(const int huntIndex)
    if(huntIndex < 0 || huntIndex >= V2_MAX_HUNT_SESSIONS || !g_v2Hunts[huntIndex].active)
       return 0;
 
-   const datetime lookedUp =
-      H4LookupBreachVolumeBarOpenTime(g_v2Hunts[huntIndex].h4BreachSwingDirection,
-                                       g_v2Hunts[huntIndex].h4BreachLqType,
-                                       g_v2Hunts[huntIndex].h4BreachedLegLevelPrice,
-                                       g_v2Hunts[huntIndex].h4BreachedLegEndTime);
-   if(lookedUp > 0)
-   {
-      g_v2Hunts[huntIndex].h4BreachVolumeBarOpenTime = lookedUp;
-      return lookedUp;
-   }
-
    return g_v2Hunts[huntIndex].h4BreachVolumeBarOpenTime;
 }
 
@@ -8022,7 +6699,7 @@ void V3UpdateEngulfVolSpikeBufferDraw(const int huntIndex, const bool isBuy,
    if(huntIndex < 0 || huntIndex >= V2_MAX_HUNT_SESSIONS)
       return;
 
-   if(!H4LqChartDrawEnabled(InputDrawEngulfVolSpikeBufferZone) || !g_v2Hunts[huntIndex].active ||
+   if(!M15LqChartDrawEnabled(InputDrawEngulfVolSpikeBufferZone) || !g_v2Hunts[huntIndex].active ||
       !ctx.hasZone || g_v2Hunts[huntIndex].sessionId == 0)
    {
       V3ClearEngulfVolSpikeBufferDraw(huntIndex);
@@ -8266,7 +6943,7 @@ bool V3EngulfPairIsHuntPathExtreme(const int huntIndex, const bool isBuy, const 
       }
       if(pathMinLow < pairExtreme - eps)
       {
-         outDetail = StringFormat("pair low %.5f not hunt low — pathMin=%.5f since HS%lld",
+         outDetail = StringFormat("pair low %.5f not hunt low â€” pathMin=%.5f since HS%lld",
                                   pairExtreme, pathMinLow,
                                   (long)g_v2Hunts[huntIndex].sessionId);
          return false;
@@ -8282,7 +6959,7 @@ bool V3EngulfPairIsHuntPathExtreme(const int huntIndex, const bool isBuy, const 
    }
    if(pathMaxHigh > pairExtreme + eps)
    {
-      outDetail = StringFormat("pair high %.5f not hunt high — pathMax=%.5f since HS%lld",
+      outDetail = StringFormat("pair high %.5f not hunt high â€” pathMax=%.5f since HS%lld",
                                pairExtreme, pathMaxHigh,
                                (long)g_v2Hunts[huntIndex].sessionId);
       return false;
@@ -8362,7 +7039,7 @@ void V3TryScanEngulfAbsorptionOnM2Close(const int huntIndex, const double barClo
    if(!V3EngulfVolumeSpikeValid(huntIndex, isBuy, c1Shift, c2Shift, volSpikeDetail))
    {
       V2LogHuntEvent(huntIndex, "ENGULF_SKIP",
-                     StringFormat("vol spike fail — %s", volSpikeDetail));
+                     StringFormat("vol spike fail â€” %s", volSpikeDetail));
       return;
    }
 
@@ -8391,14 +7068,14 @@ void V3TryScanEngulfAbsorptionOnM2Close(const int huntIndex, const double barClo
 }
 
 //+------------------------------------------------------------------+
-int V2ArmOppositeFvgHuntAfterH4Breach(const double h4Level, const bool h4HighBreached,
+int V2ArmOppositeFvgHuntAfterM15Breach(const double h4Level, const bool h4HighBreached,
                                          const datetime breachedLegEndTime,
                                          const int swingDirection, const ENUM_LIQUIDITY_TYPE lqType,
                                          const datetime breachedVolumeBarOpenTime,
                                          const double barClose, const double barLow,
                                          const double barHigh)
 {
-   const int existing = V2FindActiveHuntByH4Leg(breachedLegEndTime, h4HighBreached);
+   const int existing = V2FindActiveHuntByM15Leg(breachedLegEndTime, h4HighBreached);
    if(existing >= 0)
       return existing;
 
@@ -8406,18 +7083,31 @@ int V2ArmOppositeFvgHuntAfterH4Breach(const double h4Level, const bool h4HighBre
    if(huntIndex < 0)
       return -1;
 
-   H4MarkBreachHuntArmed(breachedLegEndTime, swingDirection, lqType, h4Level);
+   {
+      const double pointSizeMatch = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+      const double epsMatch = (pointSizeMatch > 0.0 ? pointSizeMatch : 0.00001);
+      for(int breachIndex = 0; breachIndex < g_m15LegVolumeBreachCount; breachIndex++)
+      {
+         if(g_m15LegVolumeBreaches[breachIndex].swingDirection != swingDirection ||
+            g_m15LegVolumeBreaches[breachIndex].lqType != lqType)
+            continue;
+         if(breachedLegEndTime != 0 && breachedLegEndTime != g_m15LegVolumeBreaches[breachIndex].legStartTime &&
+            breachedLegEndTime != g_m15LegVolumeBreaches[breachIndex].legEndTime)
+            continue;
+         if(MathAbs(g_m15LegVolumeBreaches[breachIndex].breachLevelPrice - h4Level) > epsMatch)
+            continue;
+         g_m15LegVolumeBreaches[breachIndex].huntArmed = true;
+         g_m15LegVolumeBreaches[breachIndex].swept     = true;
+      }
+   }
 
    g_v2Hunts[huntIndex].active                         = true;
-   g_v2Hunts[huntIndex].h4HighWasBreached             = H4LqTypeExpectsBullishHunt(lqType);
+   g_v2Hunts[huntIndex].h4HighWasBreached             = M15LqTypeExpectsBullishHunt(lqType);
    g_v2Hunts[huntIndex].h4BreachedLegLevelPrice       = h4Level;
    g_v2Hunts[huntIndex].h4BreachedLegEndTime          = breachedLegEndTime;
    g_v2Hunts[huntIndex].h4BreachSwingDirection        = swingDirection;
    g_v2Hunts[huntIndex].h4BreachLqType               = lqType;
-   g_v2Hunts[huntIndex].h4BreachVolumeBarOpenTime     =
-      (breachedVolumeBarOpenTime > 0)
-         ? breachedVolumeBarOpenTime
-         : H4LookupBreachVolumeBarOpenTime(swingDirection, lqType, h4Level, breachedLegEndTime);
+   g_v2Hunts[huntIndex].h4BreachVolumeBarOpenTime = breachedVolumeBarOpenTime;
    g_v2Hunts[huntIndex].closeWhenH4LiquidityBreached  = barClose;
    g_v2Hunts[huntIndex].pathMinLowSinceH4Breach       = barLow;
    g_v2Hunts[huntIndex].pathMaxHighSinceH4Breach      = barHigh;
@@ -8433,12 +7123,12 @@ int V2ArmOppositeFvgHuntAfterH4Breach(const double h4Level, const bool h4HighBre
    g_v2Hunts[huntIndex].sessionId                      = iTime(_Symbol, InputM2NarrativeTimeframe, 1);
    V2ResetHuntSlotSessionCounters(huntIndex);
 
-   const bool huntIsBull = H4LqTypeExpectsBullishHunt(lqType);
+   const bool huntIsBull = M15LqTypeExpectsBullishHunt(lqType);
    if(huntIsBull)
    {
       double bandLow = 0.0;
       double bandHigh = 0.0;
-      H4BreachBufferBandForDownLegLow(h4Level, bandLow, bandHigh);
+      M15BreachBufferBandForDownLegLow(h4Level, bandLow, bandHigh);
       V2LogHuntEvent(huntIndex, "HUNT_ON",
                      StringFormat("green lvl=%.5f band %.5f..%.5f leg=%s lq=%d T1=%s",
                                   h4Level, bandLow, bandHigh,
@@ -8451,7 +7141,7 @@ int V2ArmOppositeFvgHuntAfterH4Breach(const double h4Level, const bool h4HighBre
    {
       double bandLow = 0.0;
       double bandHigh = 0.0;
-      H4BreachBufferBandForUpLegHigh(h4Level, bandLow, bandHigh);
+      M15BreachBufferBandForUpLegHigh(h4Level, bandLow, bandHigh);
       V2LogHuntEvent(huntIndex, "HUNT_ON",
                      StringFormat("pink lvl=%.5f band %.5f..%.5f leg=%s lq=%d T1=%s",
                                   h4Level, bandLow, bandHigh,
@@ -8478,10 +7168,37 @@ void V2ProcessOneActiveHuntOnM2Bar(const int huntIndex, const double pointSize,
    g_v2Hunts[huntIndex].pathMaxHighSinceH4Breach =
       MathMax(g_v2Hunts[huntIndex].pathMaxHighSinceH4Breach, barHigh);
 
+   const bool isBuy = V2HuntExpectsBullishFvg(huntIndex);
+   double sameDirBosLevel = 0.0;
+   if(isBuy)
+   {
+      if(TryDetectM2PriceBreakAboveLatestUpLegHigh(sameDirBosLevel))
+      {
+         LogHuntEvent("HUNT_CANCEL_BOS",
+                      StringFormat("BOS_CANCEL_BULLISH lvl=%.5f session=%s",
+                                   sameDirBosLevel,
+                                   TimeToString(g_v2Hunts[huntIndex].sessionId, TIME_DATE | TIME_MINUTES)));
+         V2EndOppositeFvgHuntSession(huntIndex, "BOS_CANCEL_BULLISH", false);
+         return;
+      }
+   }
+   else
+   {
+      if(TryDetectM2PriceBreakBelowLatestDownLegLow(sameDirBosLevel))
+      {
+         LogHuntEvent("HUNT_CANCEL_BOS",
+                      StringFormat("BOS_CANCEL_BEARISH lvl=%.5f session=%s",
+                                   sameDirBosLevel,
+                                   TimeToString(g_v2Hunts[huntIndex].sessionId, TIME_DATE | TIME_MINUTES)));
+         V2EndOppositeFvgHuntSession(huntIndex, "BOS_CANCEL_BEARISH", false);
+         return;
+      }
+   }
+
    double impulseZoneLow = 0.0;
    double impulseZoneHigh = 0.0;
    double impulseCancelLimitPrice = 0.0;
-   if(H4BreachImpulseCancelZonePrices(V2HuntExpectsBullishFvg(huntIndex),
+   if(M15BreachImpulseCancelZonePrices(V2HuntExpectsBullishFvg(huntIndex),
                                        g_v2Hunts[huntIndex].h4BreachedLegLevelPrice,
                                        impulseZoneLow, impulseZoneHigh, impulseCancelLimitPrice))
    {
@@ -8505,7 +7222,7 @@ void V2ProcessOneActiveHuntOnM2Bar(const int huntIndex, const double pointSize,
          V2EndOppositeFvgHuntSession(huntIndex,
                                      StringFormat("impulse cancel close=%.5f limit=%.5f (H4 FAR %.1f%%)",
                                                   barClose, impulseCancelLimitPrice,
-                                                  H4_BREACH_BUFFER_PERCENT_FAR),
+                                                  M15_BREACH_BUFFER_PERCENT_FAR),
                                      false);
          return;
       }
@@ -8521,9 +7238,176 @@ void OnM2SwingLegDirectionChange(const int closingLegDirection, const int nextLe
 }
 
 //+------------------------------------------------------------------+
+bool TryDetectM15WickLiquidityBreachForLeg(const ENUM_LIQUIDITY_TYPE lqType,
+                                            const int swingDirection, const double breachLevel,
+                                            const datetime huntLegKey, const double barHigh,
+                                            const double barLow, const double prevHigh,
+                                            const double prevLow, const double pointSize,
+                                            double &outLevel, bool &outHighBreached,
+                                            datetime &outLegEndTime)
+{
+   if(swingDirection == 0 || breachLevel <= 0.0 || huntLegKey == 0)
+      return false;
+
+   // Hunt polarity follows breach ray color: green=bull, pink=bear.
+   const bool huntExpectsBull = M15LqTypeExpectsBullishHunt(lqType);
+
+   switch(lqType)
+   {
+      case LQ_EXTERNAL_TOP:
+         if(!M2WickCrossesAboveLevel(breachLevel, barHigh, prevHigh, pointSize))
+            return false;
+         return TryAcceptM15BreachForHunt(huntExpectsBull, breachLevel, huntLegKey,
+                                         outLevel, outHighBreached, outLegEndTime);
+
+      case LQ_EXTERNAL_BOTTOM:
+         if(!M2WickCrossesBelowLevel(breachLevel, barLow, prevLow, pointSize))
+            return false;
+         return TryAcceptM15BreachForHunt(huntExpectsBull, breachLevel, huntLegKey,
+                                         outLevel, outHighBreached, outLegEndTime);
+
+      case LQ_INTERNAL_BULL:
+         if(!M2WickCrossesBelowLevel(breachLevel, barLow, prevLow, pointSize))
+            return false;
+         return TryAcceptM15BreachForHunt(huntExpectsBull, breachLevel, huntLegKey,
+                                         outLevel, outHighBreached, outLegEndTime);
+
+      case LQ_INTERNAL_BEAR:
+         if(!M2WickCrossesAboveLevel(breachLevel, barHigh, prevHigh, pointSize))
+            return false;
+         return TryAcceptM15BreachForHunt(huntExpectsBull, breachLevel, huntLegKey,
+                                         outLevel, outHighBreached, outLegEndTime);
+   }
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
+bool TryDetectM15WickLiquidityBreachFromRecords(const double barHigh, const double barLow,
+                                                 const double prevHigh, const double prevLow,
+                                                 const double pointSize, const bool externalOnly,
+                                                 double &outLevel, bool &outHighBreached,
+                                                 datetime &outLegEndTime,
+                                                 ENUM_LIQUIDITY_TYPE &outLqType,
+                                                 int &outSwingDirection,
+                                                 datetime &outVolumeBarOpenTime)
+{
+   for(int i = g_m15LegVolumeBreachCount - 1; i >= 0; i--)
+   {
+      const M15LegVolumeBreachRecord rec = g_m15LegVolumeBreaches[i];
+      if(rec.swingDirection == 0 || rec.breachLevelPrice <= 0.0 || rec.huntArmed)
+         continue;
+
+      const bool recIsExternal = (rec.lqType == LQ_EXTERNAL_TOP || rec.lqType == LQ_EXTERNAL_BOTTOM);
+      if(externalOnly != recIsExternal)
+         continue;
+
+      if(rec.legEndTime == 0)
+      {
+         if(g_m15Swing.currentSwingLeg.legStartTime != rec.legStartTime ||
+            g_m15Swing.currentSwingLeg.swingDirection != rec.swingDirection)
+            continue;
+      }
+
+      if(!M15BreachRecordActiveInBuffer(rec))
+         continue;
+
+      const datetime huntLegKey = (rec.legEndTime > 0) ? rec.legEndTime : rec.legStartTime;
+      if(TryDetectM15WickLiquidityBreachForLeg(rec.lqType, rec.swingDirection, rec.breachLevelPrice,
+                                               huntLegKey, barHigh, barLow, prevHigh, prevLow,
+                                               pointSize, outLevel, outHighBreached, outLegEndTime))
+      {
+         outLqType            = rec.lqType;
+         outSwingDirection    = rec.swingDirection;
+         outVolumeBarOpenTime = rec.volumeBarOpenTime;
+         return true;
+      }
+   }
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
+bool TryDetectM15WickLiquidityBreach(const double barHigh, const double barLow,
+                                     const double prevHigh, const double prevLow,
+                                     const double pointSize, double &outLevel,
+                                     bool &outHighBreached, datetime &outLegEndTime,
+                                     ENUM_LIQUIDITY_TYPE &outLqType, int &outSwingDirection,
+                                     datetime &outVolumeBarOpenTime)
+{
+   outLevel              = 0.0;
+   outHighBreached       = false;
+   outLegEndTime         = 0;
+   outLqType             = LQ_EXTERNAL_TOP;
+   outSwingDirection     = 0;
+   outVolumeBarOpenTime  = 0;
+
+   if(InputM15BreachBufferChartBarCount < 1)
+      return false;
+
+   if(TryDetectM15WickLiquidityBreachFromRecords(barHigh, barLow, prevHigh, prevLow, pointSize, true,
+                                                 outLevel, outHighBreached, outLegEndTime,
+                                                 outLqType, outSwingDirection, outVolumeBarOpenTime))
+      return true;
+
+   return TryDetectM15WickLiquidityBreachFromRecords(barHigh, barLow, prevHigh, prevLow, pointSize,
+                                                     false, outLevel, outHighBreached, outLegEndTime,
+                                                     outLqType, outSwingDirection, outVolumeBarOpenTime);
+}
+
+//+------------------------------------------------------------------+
+//| Wick-cross breach hunt arm â€” only on closed primary narrative bar. |
+//+------------------------------------------------------------------+
+void ProcessHuntBreachOnM15BarClose()
+{
+   if(!InputEnableEngulfHuntAfterM15Breach)
+      return;
+
+   const ENUM_TIMEFRAMES h4Tf = InputM15NarrativeTimeframe;
+   const double pointSize     = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   const double barClose      = iClose(_Symbol, h4Tf, 1);
+   const double barHigh       = iHigh(_Symbol, h4Tf, 1);
+   const double barLow        = iLow(_Symbol, h4Tf, 1);
+   const double prevHigh      = iHigh(_Symbol, h4Tf, 2);
+   const double prevLow       = iLow(_Symbol, h4Tf, 2);
+
+   double h4Level = 0.0;
+   bool h4HighBreached = false;
+   datetime breachedLegEndTime = 0;
+   ENUM_LIQUIDITY_TYPE breachedLqType = LQ_EXTERNAL_TOP;
+   int breachedSwingDirection = 0;
+   datetime breachedVolumeBarOpenTime = 0;
+   if(!TryDetectM15WickLiquidityBreach(barHigh, barLow, prevHigh, prevLow, pointSize,
+                                       h4Level, h4HighBreached, breachedLegEndTime,
+                                       breachedLqType, breachedSwingDirection,
+                                       breachedVolumeBarOpenTime))
+      return;
+
+   const int sameLegHunt = V2FindActiveHuntByM15Leg(breachedLegEndTime, h4HighBreached);
+   if(sameLegHunt >= 0)
+      return;
+
+   const int samePolarityHunt = V2FindActiveHuntByBreachPolarity(h4HighBreached);
+   if(samePolarityHunt >= 0)
+   {
+      V2LogHuntEvent(samePolarityHunt, "HUNT_RESTART",
+                     StringFormat("%s breach new leg=%s (replaces prior %s hunt)",
+                                  h4HighBreached ? "H4 high" : "H4 low",
+                                  TimeToString(breachedLegEndTime, TIME_DATE | TIME_MINUTES),
+                                  h4HighBreached ? "high" : "low"));
+      V2AbortHuntSessionForRestart(samePolarityHunt);
+   }
+
+   V2ArmOppositeFvgHuntAfterM15Breach(h4Level, h4HighBreached, breachedLegEndTime,
+                                        breachedSwingDirection, breachedLqType,
+                                        breachedVolumeBarOpenTime,
+                                        barClose, barLow, barHigh);
+}
+
+//+------------------------------------------------------------------+
 void ProcessHuntEngulfingOnM2BarClose()
 {
-   if(!InputEnableEngulfHuntAfterH4Breach)
+   if(!InputEnableEngulfHuntAfterM15Breach)
       return;
 
    const double pointSize = SymbolInfoDouble(_Symbol, SYMBOL_POINT);

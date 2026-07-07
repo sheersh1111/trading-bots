@@ -3,16 +3,18 @@
 //| M2 BOS-opposite FVG + M15 BOS gate + H4 demand/supply path OR       |
 //+------------------------------------------------------------------+
 #property copyright ""
-#property version   "1.39"
+#property version   "1.40"
 
 #include <Trade\Trade.mqh>
 
 CTrade tradeLayer;
 
-const ENUM_TIMEFRAMES SwingTimeframe = PERIOD_M2;
+input group "Narrative timeframes"
+input ENUM_TIMEFRAMES InputM2NarrativeTimeframe = PERIOD_M1; // secondary: FVG, swing legs, BOS entry (was M2)
 
-input bool InputSwitchChartToMinuteTwo = true;   // Set chart period to M2 on attach
-input bool InputDrawSwingLegVisuals = false;      // Swing leg OBJ_TREND + High/Low labels (off)
+input bool InputSwitchChartToMinuteTwo = true;   // Set chart period to narrative TF on attach
+input bool InputDrawSwingLegVisuals = false;      // Narrative-TF swing leg OBJ_TREND + High/Low labels (off)
+input color InputM2SwingTrendLineColor = clrYellow; // Narrative-TF (M1) swing leg line color
 
 input group "BOS opposite FVG (M2: bar 1 vs bar 3)"
 input bool InputDrawBosOppositeFairValueGapZones = true; // Rectangles for BOS-qualified FVG only
@@ -110,7 +112,7 @@ SwingState     globalSwingState;
 LiquidityPool  globalLiquidityPools[LiquidityPoolCapacity];
 int            globalLiquidityPoolCount = 0;
 
-datetime globalLastSwingTimeframeBarOpenTime = 0;
+datetime globalLastInputM2NarrativeTimeframeBarOpenTime = 0;
 int      globalBosMarkedFairValueGapRectangleSequence = 0;
 
 BosOppositeFvgWatch globalBosOppositeFvgWatchList[BosOppositeFvgWatchCapacity];
@@ -291,7 +293,7 @@ int OnInit()
 
    if(InputSwitchChartToMinuteTwo)
    {
-      ChartSetSymbolPeriod(0, _Symbol, SwingTimeframe);
+      ChartSetSymbolPeriod(0, _Symbol, InputM2NarrativeTimeframe);
       ChartRedraw(0);
    }
 
@@ -475,13 +477,13 @@ void OnTick()
 
    UpdateHtfDirectionHud();
 
-   const datetime currentBarOpenTime = iTime(_Symbol, SwingTimeframe, 0);
-   if(currentBarOpenTime == globalLastSwingTimeframeBarOpenTime)
+   const datetime currentBarOpenTime = iTime(_Symbol, InputM2NarrativeTimeframe, 0);
+   if(currentBarOpenTime == globalLastInputM2NarrativeTimeframeBarOpenTime)
       return;
 
-   globalLastSwingTimeframeBarOpenTime = currentBarOpenTime;
+   globalLastInputM2NarrativeTimeframeBarOpenTime = currentBarOpenTime;
    UpdateBosOppositeFvgWatchPathExtremes();
-   ProcessSwingStep(globalSwingState, SwingTimeframe);
+   ProcessSwingStep(globalSwingState, InputM2NarrativeTimeframe);
    ProcessBosOppositeFairValueGapWindow();
    TryExecuteFairValueGapTradePlan();
 }
@@ -552,7 +554,7 @@ void ProcessSwingStep(SwingState &swingState, const ENUM_TIMEFRAMES timeframe)
    }
    else
    {
-      const color  swingLineColor = clrYellow;
+      const color  swingLineColor = InputM2SwingTrendLineColor;
       const string chartObjectNamePrefix = ChartObjectNamePrefixSwingTrendLine;
       SwingClose(swingState, timeframe, swingLineColor, chartObjectNamePrefix);
 
@@ -1436,8 +1438,8 @@ void DrawH4DemandSupplyZones()
 //+------------------------------------------------------------------+
 void UpdateBosOppositeFvgWatchPathExtremes()
 {
-   const double h1 = iHigh(_Symbol, SwingTimeframe, 1);
-   const double l1 = iLow(_Symbol, SwingTimeframe, 1);
+   const double h1 = iHigh(_Symbol, InputM2NarrativeTimeframe, 1);
+   const double l1 = iLow(_Symbol, InputM2NarrativeTimeframe, 1);
 
    for(int i = 0; i < globalBosOppositeFvgWatchCount; i++)
    {
@@ -1493,7 +1495,7 @@ bool FairValueGapGapMeetsMinimumPercentOfRange(const ENUM_TIMEFRAMES timeframe,
 bool DetectFairValueGapOnLastClosedBar(bool &isBullishFairValueGap, double &fairValueGapZoneLowPrice,
                                        double &fairValueGapZoneHighPrice)
 {
-   return DetectFairValueGapOnLastClosedBarForTf(SwingTimeframe, isBullishFairValueGap,
+   return DetectFairValueGapOnLastClosedBarForTf(InputM2NarrativeTimeframe, isBullishFairValueGap,
                                                  fairValueGapZoneLowPrice, fairValueGapZoneHighPrice);
 }
 
@@ -1547,8 +1549,8 @@ bool TryDetectBreakOfStructureOnLastClosedBar(bool &outExpectsBullishFairValueGa
    if(globalSwingState.swingHistoryCount < 1)
       return false;
 
-   const double closePrice = iClose(_Symbol, SwingTimeframe, 1);
-   const double prevClose  = iClose(_Symbol, SwingTimeframe, 2);
+   const double closePrice = iClose(_Symbol, InputM2NarrativeTimeframe, 1);
+   const double prevClose  = iClose(_Symbol, InputM2NarrativeTimeframe, 2);
    const double pointSize  = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
 
    for(int historyIndex = globalSwingState.swingHistoryCount - 1; historyIndex >= 0; historyIndex--)
@@ -1733,16 +1735,16 @@ void PushBosOppositeFvgWatch(const bool expectsBullishFairValueGap, const double
    if(globalBosOppositeFvgWatchCount >= BosOppositeFvgWatchCapacity)
       RemoveBosOppositeFvgWatchAt(0);
 
-   const double barClose = iClose(_Symbol, SwingTimeframe, 1);
-   const double barHigh  = iHigh(_Symbol, SwingTimeframe, 1);
-   const double barLow   = iLow(_Symbol, SwingTimeframe, 1);
+   const double barClose = iClose(_Symbol, InputM2NarrativeTimeframe, 1);
+   const double barHigh  = iHigh(_Symbol, InputM2NarrativeTimeframe, 1);
+   const double barLow   = iLow(_Symbol, InputM2NarrativeTimeframe, 1);
 
    const int index = globalBosOppositeFvgWatchCount;
    globalBosOppositeFvgWatchList[index].counter                    = 4;
    globalBosOppositeFvgWatchList[index].expectsBullishFairValueGap = expectsBullishFairValueGap;
    globalBosOppositeFvgWatchList[index].skipDecrementOnce          = true;
    globalBosOppositeFvgWatchList[index].bosLegLevelPrice           = bosLegLevelPrice;
-   globalBosOppositeFvgWatchList[index].bosM2BarOpenTime           = iTime(_Symbol, SwingTimeframe, 1);
+   globalBosOppositeFvgWatchList[index].bosM2BarOpenTime           = iTime(_Symbol, InputM2NarrativeTimeframe, 1);
    globalBosOppositeFvgWatchList[index].bosBarClosePrice           = barClose;
    globalBosOppositeFvgWatchList[index].pathMinLowSinceBos         = barLow;
    globalBosOppositeFvgWatchList[index].pathMaxHighSinceBos        = barHigh;
@@ -1815,13 +1817,13 @@ void ProcessBosOppositeFvgWatchImpulseInvalidation()
    if(InputBosMaxImpulsePercentOfChartRangeBeforeOppositeFvg <= 0.0)
       return;
 
-   const double referenceHeight = ReferenceChartHeightForFairValueGapFilter(SwingTimeframe);
+   const double referenceHeight = ReferenceChartHeightForFairValueGapFilter(InputM2NarrativeTimeframe);
    if(referenceHeight <= 0.0)
       return;
 
    const double limitPrice =
       referenceHeight * (InputBosMaxImpulsePercentOfChartRangeBeforeOppositeFvg / 100.0);
-   const double barClose = iClose(_Symbol, SwingTimeframe, 1);
+   const double barClose = iClose(_Symbol, InputM2NarrativeTimeframe, 1);
 
    for(int i = 0; i < globalBosOppositeFvgWatchCount; i++)
    {
@@ -1977,8 +1979,8 @@ void ProcessBosOppositeFairValueGapWindow()
       const int matchingWatchIndex = FindFirstMatchingBosFvgWatchIndex(isBullishFairValueGap);
       if(matchingWatchIndex >= 0)
       {
-         const datetime lastClosedBarOpenTime = iTime(_Symbol, SwingTimeframe, 1);
-         const datetime thirdBarOpenTime      = iTime(_Symbol, SwingTimeframe, 3);
+         const datetime lastClosedBarOpenTime = iTime(_Symbol, InputM2NarrativeTimeframe, 1);
+         const datetime thirdBarOpenTime      = iTime(_Symbol, InputM2NarrativeTimeframe, 3);
 
          const BosOppositeFvgWatch snapWatch = globalBosOppositeFvgWatchList[matchingWatchIndex];
          PushBosOppositeFairValueGapMemory(isBullishFairValueGap, fairValueGapZoneLowPrice,
@@ -2089,7 +2091,7 @@ bool StopsDistanceAllowed(const bool isBuy, const double entryPrice, const doubl
 //+------------------------------------------------------------------+
 double M2FairValueGapStopBufferPrice()
 {
-   const double h = ReferenceChartHeightForFairValueGapFilter(SwingTimeframe);
+   const double h = ReferenceChartHeightForFairValueGapFilter(InputM2NarrativeTimeframe);
    if(h <= 0.0)
       return 0.0;
    return h * (InputFvgStopBufferPercentOfM2Range / 100.0);
@@ -2589,12 +2591,12 @@ void TryExecuteFairValueGapTradePlan()
    if(HasOurFvgOpenPositionOnSymbol())
       return;
 
-   const datetime lastClosedM2Open = iTime(_Symbol, SwingTimeframe, 1);
+   const datetime lastClosedM2Open = iTime(_Symbol, InputM2NarrativeTimeframe, 1);
 
    for(int memoryIndex = globalBosOppositeFairValueGapMemoryCount - 1; memoryIndex >= 0; memoryIndex--)
    {
       const datetime formationTime = globalBosOppositeFairValueGapMemory[memoryIndex].fairValueGapBarOpenTime;
-      const int      barShift      = iBarShift(_Symbol, SwingTimeframe, formationTime);
+      const int      barShift      = iBarShift(_Symbol, InputM2NarrativeTimeframe, formationTime);
       if(barShift < 0)
          continue;
       if(barShift > InputFvgTradeMaxM2BarShift)
