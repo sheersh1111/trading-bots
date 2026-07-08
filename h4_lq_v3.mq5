@@ -120,7 +120,7 @@
 //| v3.01: exhaustion leg filter — min leg range % of M2 chart height (replaces min bar count) |
 //| v3.00: replace M2 touch/FVG with engulfing vol absorption + exhaustion gate |
 //+------------------------------------------------------------------+
-#define H4_LQ_V3_VERSION "3.125"
+#define H4_LQ_V3_VERSION "3.130"
 // Breach record array + hunt arming: uncomment next line to re-enable.
 // #define H4_LQ_VOLUME_BREACH_ENABLED
 #property copyright ""
@@ -145,6 +145,7 @@ input color  InputM2SwingLineColor       = clrMediumPurple;
 input bool   InputDrawM2SwingAnchorLevel = true;  // realtime horizontal line at M2 leg flip anchor (priceAnchorLevel)
 input color  InputM2SwingAnchorColor     = clrYellow;
 input int    InputM2SwingWarmupBars      = 500; // 0 = off: replay M2 on attach (plot_swing_h1_m5_copy)
+input double InputM2SwingAnchorMultiplier = 0.2; // M2 swing: bar body must exceed N× avg(5 prior bar ranges)
 
 input group "H4 breach â†’ M2 engulfing absorption"
 input bool   InputEnableEngulfHuntAfterH4Breach = true;
@@ -209,6 +210,7 @@ input double InputSmcFvgMinGapPercentChart           = 1.0; // min registered FV
 input double InputSmcBrokenLevelBufferPercentChart = 10.0; // SMC zone extension = N% of TF chart height above highs / below lows
 input int    InputSmcMtfWarmupBars             = 300; // 0=off: replay MTF swings on attach
 input int    InputSmcZoneExpiryBars            = 292; // zone expires when older than N bars on its TF
+input double InputSmcSwingAnchorMultiplier      = 1.0; // MTF swing engine: bar range must exceed N× avg(5 prior bar ranges)
 
 input group "MTF swing leg chart visuals"
 input bool   InputDrawMtfSwingLegsW1   = false; // W1 swing legs + SMC zone rectangles

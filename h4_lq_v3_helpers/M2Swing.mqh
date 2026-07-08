@@ -458,7 +458,8 @@ void ProcessSwingStepAtShift(SwingState &swingState, const ENUM_TIMEFRAMES timef
    }
    const double averageRangeFiveBars = (rangeBarCount > 0) ? sumRangeFivePriorBars / (double)rangeBarCount : 0.0;
 
-   const double anchorDecentMovementMultiplier = 0.2; // M2 body vs prior 5-bar avg
+   const double anchorDecentMovementMultiplier =
+      (timeframe == InputM2NarrativeTimeframe) ? InputM2SwingAnchorMultiplier : 0.2;
    const double minDecentRange = averageRangeFiveBars * anchorDecentMovementMultiplier;
    const bool isDecentMovement =
       (timeframe == InputM2NarrativeTimeframe)

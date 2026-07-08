@@ -31,7 +31,7 @@ void MtfSwingStepReplayAtShift(SwingState &swingState, const ENUM_TIMEFRAMES tim
 {
    bool unusedLegClosed = false;
    ProcessMTFSwingStepAtShiftCollect(swingState, timeframe, lastClosedBarShift,
-                                      H4_BOS_ANCHOR_MULTIPLIER, false,
+                                      InputSmcSwingAnchorMultiplier, false,
                                       replayLegs, replayLegCount, true, unusedLegClosed);
 }
 
@@ -268,7 +268,7 @@ void SMCUpdateTrackerOnBarClose(MTFSwingTracker &tracker, const ENUM_TIMEFRAMES 
       tracker.timeframe = timeframe;
 
    bool legClosedThisBar = false;
-   ProcessMTFSwingStepAtShift(tracker.swing, timeframe, 1, H4_BOS_ANCHOR_MULTIPLIER, false,
+   ProcessMTFSwingStepAtShift(tracker.swing, timeframe, 1, InputSmcSwingAnchorMultiplier, false,
                               legClosedThisBar);
 
    SMCRefreshZonesForTimeframe(timeframe, tracker, legClosedThisBar);
@@ -328,7 +328,7 @@ void WarmupMTFSwingTracker(MTFSwingTracker &tracker, const ENUM_TIMEFRAMES timef
       for(int k = n; k >= 1; k--)
       {
          bool unusedLegClosed = false;
-         ProcessMTFSwingStepAtShift(tracker.swing, timeframe, k, H4_BOS_ANCHOR_MULTIPLIER, false,
+         ProcessMTFSwingStepAtShift(tracker.swing, timeframe, k, InputSmcSwingAnchorMultiplier, false,
                                     unusedLegClosed);
          SMCUpdateTrackerBosOnBar(tracker, k);
       }
