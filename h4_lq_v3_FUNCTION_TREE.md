@@ -1,6 +1,6 @@
 # h4_lq_v3 — Function Tree & Vibe-Coding Guide
 
-**Version:** 3.131 (`h4_lq_v3.mq5`)  
+**Version:** 3.132 (`h4_lq_v3.mq5`)  
 **Purpose:** MTF SMC confluence scoring + M2 swing-sweep / engulf absorption entry + swing-group take profits.
 
 **Related files (read these too):**

@@ -872,7 +872,9 @@ void SMCApplyZoneExitBiasAndMitigationForTimeframe(const ENUM_TIMEFRAMES timefra
       if(mitigatedNow)
       {
          SMCMitigateOverlappingMtfFvgPeers(f);
-         g_mtfFvgInstances[f].inUse = false;
+         // Keep the slot in use (isMitigated=true) so the per-bar FVG rescan
+         // (SMCMapUnmitigatedFvgsForTimeframe) finds it by type+origin and will
+         // NOT re-register this swept gap. Slot is freed later on expiry.
          SMCDeleteMtfFvgRectangleForInstance(g_mtfFvgInstances[f].type,
                                              g_mtfFvgInstances[f].zoneOriginBarTime);
       }
@@ -1174,8 +1176,9 @@ void SMCMitigateOverlappingMtfFvgPeers(const int sourceIndex)
                                 g_mtfFvgInstances[f].topPrice, g_mtfFvgInstances[f].bottomPrice, eps))
          continue;
 
+      // Keep the slot in use (isMitigated=true) so the per-bar rescan won't
+      // re-register this overlapping swept gap; freed later on expiry.
       g_mtfFvgInstances[f].isMitigated = true;
-      g_mtfFvgInstances[f].inUse       = false;
       SMCDeleteMtfFvgRectangleForInstance(g_mtfFvgInstances[f].type,
                                           g_mtfFvgInstances[f].zoneOriginBarTime);
    }
@@ -1198,7 +1201,14 @@ void SMCExpireMtfFvgInstancesForTimeframe(const ENUM_TIMEFRAMES timeframe)
          continue;
 
       if(SMCZonePastExpiryBarLimit(g_mtfFvgInstances[i].type, g_mtfFvgInstances[i].zoneOriginBarTime))
+      {
+         // Free the slot on expiry. Expiry (InputSmcZoneExpiryBars) far exceeds
+         // the FVG rescan window (InputSmcFvgLookbackBars), so a freed expired
+         // gap is already out of scan range and cannot be re-detected. This
+         // reclaims slots held by mitigated gaps and prevents capacity leak.
          g_mtfFvgInstances[i].isExpired = true;
+         g_mtfFvgInstances[i].inUse     = false;
+      }
    }
 }
 

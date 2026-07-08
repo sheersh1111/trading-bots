@@ -1,6 +1,7 @@
 //+------------------------------------------------------------------+
 //| h4_lq_v3.mq5                                                      |
 //| H4 breach hunt + M2 Engulfing Volume Absorption entry model       |
+//| v3.132: fix MTF FVG re-registration — keep mitigated gap slot (isMitigated) so per-bar rescan won't re-add a swept zone; free slot on expiry |
 //| v3.131: high-impact news blackout (MT5 calendar) — block entries in +/-window; optional flatten 1 min before window opens |
 //| v3.125: M15 TP move no longer requires a prior TP hit — moves all open OV_TP legs |
 //| v3.124: M15 TP watch arms at entry — bull waits for entry up-leg or first up-leg after entry bear-leg |
@@ -121,7 +122,7 @@
 //| v3.01: exhaustion leg filter — min leg range % of M2 chart height (replaces min bar count) |
 //| v3.00: replace M2 touch/FVG with engulfing vol absorption + exhaustion gate |
 //+------------------------------------------------------------------+
-#define H4_LQ_V3_VERSION "3.131"
+#define H4_LQ_V3_VERSION "3.132"
 // Breach record array + hunt arming: uncomment next line to re-enable.
 // #define H4_LQ_VOLUME_BREACH_ENABLED
 #property copyright ""

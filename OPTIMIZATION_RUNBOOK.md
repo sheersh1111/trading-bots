@@ -1,6 +1,6 @@
 # h4_lq_v3 — Optimization Runbook
 
-Current versions: **EA v3.131** · **ScoreLogger v2.9** · **optimize_score_adaptive.cpp v2.7**
+Current versions: **EA v3.132** · **ScoreLogger v2.9** · **optimize_score_adaptive.cpp v2.7**
 
 This document describes the two-phase score optimization workflow: **write mode** captures frozen setup state; **read mode** replays that state with different weight permutations during genetic optimization.
 
