@@ -46,6 +46,85 @@ datetime MidnightBlackoutDayKey(const datetime when)
 }
 
 //+------------------------------------------------------------------+
+//| High-impact news blackout via the MT5 economic calendar.          |
+//| Returns true when 'when' falls inside [event - (before+lead),      |
+//| event + after] for any qualifying event. 'extraLeadMinutesBefore'  |
+//| widens only the pre-event side (used to flatten 1 min ahead of the |
+//| entry-block window). Live/forward only unless the tester has       |
+//| calendar data for the symbol currencies + date range. On success,  |
+//| outEventTime/outEventName describe the nearest such in-window event |
+//| (first match in query order).                                      |
+//+------------------------------------------------------------------+
+bool IsHighImpactNewsBlackout(const datetime when, datetime &outEventTime, string &outEventName,
+                              const int extraLeadMinutesBefore = 0)
+{
+   outEventTime = 0;
+   outEventName = "";
+
+   if(!InputEnableNewsBlackout)
+      return false;
+
+   const datetime nowT      = (when == 0 ? TimeCurrent() : when);
+   int            beforeMin  = InputNewsBlackoutMinutesBefore + extraLeadMinutesBefore;
+   if(beforeMin < 0)
+      beforeMin = 0;
+   const int      beforeSec = beforeMin * 60;
+   const int      afterSec  = (InputNewsBlackoutMinutesAfter  > 0 ? InputNewsBlackoutMinutesAfter  : 0) * 60;
+
+   // now in [T-before, T+after]  <=>  T in [now-after, now+before]
+   const datetime from = nowT - afterSec;
+   const datetime to   = nowT + beforeSec;
+
+   const string base  = SymbolInfoString(_Symbol, SYMBOL_CURRENCY_BASE);
+   const string quote = SymbolInfoString(_Symbol, SYMBOL_CURRENCY_PROFIT);
+
+   MqlCalendarValue values[];
+   const int total = CalendarValueHistory(values, from, to, NULL, NULL);
+   if(total <= 0)
+      return false;
+
+   for(int i = 0; i < total; i++)
+   {
+      const datetime evtTime = values[i].time;
+      if(evtTime == 0)
+         continue;
+      if(nowT < evtTime - beforeSec || nowT > evtTime + afterSec)
+         continue;
+
+      MqlCalendarEvent evt;
+      if(!CalendarEventById(values[i].event_id, evt))
+         continue;
+
+      if(InputNewsBlackoutHighImpactOnly)
+      {
+         if(evt.importance != CALENDAR_IMPORTANCE_HIGH)
+            continue;
+      }
+      else
+      {
+         if(evt.importance != CALENDAR_IMPORTANCE_HIGH &&
+            evt.importance != CALENDAR_IMPORTANCE_MODERATE)
+            continue;
+      }
+
+      if(InputNewsBlackoutSymbolCurrenciesOnly)
+      {
+         MqlCalendarCountry country;
+         if(!CalendarCountryById(evt.country_id, country))
+            continue;
+         if(country.currency != base && country.currency != quote)
+            continue;
+      }
+
+      outEventTime = evtTime;
+      outEventName = evt.name;
+      return true;
+   }
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
 int TradeSwingTpTargetCount()
 {
    return (InputTradeSwingTpCount == TRADE_SWING_TP_TWO) ? 2 : 3;

@@ -1,6 +1,6 @@
 # h4_lq_v3 — Function Tree & Vibe-Coding Guide
 
-**Version:** 3.130 (`h4_lq_v3.mq5`)  
+**Version:** 3.131 (`h4_lq_v3.mq5`)  
 **Purpose:** MTF SMC confluence scoring + M2 swing-sweep / engulf absorption entry + swing-group take profits.
 
 **Related files (read these too):**
@@ -24,6 +24,7 @@
 ```
 OnTick (every tick)
 ├── ProcessMidnightHourBlackout()  → once/day 00:00 server: cancel pendings + flatten hunt exposure
+├── ProcessNewsBlackout()          → MT5 calendar: when high-impact window opens, cancel pendings + flatten once
 ├── UpdateMTFSwings()              → W1/D1/H4/M15 bar close: swing step, zones, BOS, H4 pivots
 ├── ProcessHuntM15LegCloseTpIfReady() → M15 leg-close snapshot TP management (if enabled)
 └── optional M2 live swing visuals
@@ -328,6 +329,8 @@ TryPlaceEngulfAbsorptionTradeSetup
 | `CancelOurHuntPendingOrders` | Delete pending orders for session (or all `LQ2_HS`). |
 | `HasOurHuntPendingEntryOrders` | Detect unfilled limit/stop pendings for expiry logic. |
 | `ProcessMidnightHourBlackout` | **Enabled by `InputEnableMidnightHourBlackout`**. Once/day at 00:00 server: cancel pendings + close open hunt positions. |
+| `ProcessNewsBlackout` | **Enabled by `InputEnableNewsBlackout` + `InputNewsBlackoutClosePositions`**. Once per high-impact calendar event: when the `±window` opens, cancel pendings + flatten hunt positions (dedup by event time). |
+| `IsHighImpactNewsBlackout` | (runtime) MT5 calendar query (`CalendarValueHistory`/`CalendarEventById`/`CalendarCountryById`): true when now ∈ [event−before, event+after] for a qualifying (importance + currency) event. |
 
 ---
 
@@ -395,6 +398,7 @@ OnDeinit → FlushScoreLogToFile
 |-------|---------|
 | `InputFastTesterMode` | All logging + chart objects |
 | `InputEnableMidnightHourBlackout` | Trade gate blocks entries 00:00–01:00 server; 00:00 flatten in `ProcessMidnightHourBlackout()` |
+| `InputEnableNewsBlackout` (+ `MinutesBefore`/`MinutesAfter`/`HighImpactOnly`/`SymbolCurrenciesOnly`/`ClosePositions`) | Trade gate blocks entries inside `±window` around MT5 calendar events; optional flatten in `ProcessNewsBlackout()` |
 | `InputEnableEngulfHuntAfterH4Breach` | Entire M2 entry + score init + HUD text |
 | `InputScoreLogWriteCsv` | Write P100 vs read P100; **skips trading** when true |
 | `InputEnableAutomatedTrading` | Order send vs `TRADE_PLAN` log only |

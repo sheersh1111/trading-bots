@@ -748,6 +748,21 @@ bool IsFvgAutomatedTradingAllowed(string &outBlockReason)
       outBlockReason = "midnight hour blackout (00:00-01:00 server)";
       return false;
    }
+   if(InputEnableNewsBlackout)
+   {
+      datetime newsEvtTime = 0;
+      string   newsEvtName = "";
+      // When flattening is on we close 1 min before the window; block entries
+      // from that same point too, so nothing re-enters during the lead minute.
+      const int newsEntryLeadMinutes = (InputNewsBlackoutClosePositions ? 1 : 0);
+      if(IsHighImpactNewsBlackout(0, newsEvtTime, newsEvtName, newsEntryLeadMinutes))
+      {
+         outBlockReason = StringFormat("news blackout (%s @ %s)",
+                                       newsEvtName,
+                                       TimeToString(newsEvtTime, TIME_DATE | TIME_MINUTES));
+         return false;
+      }
+   }
    return true;
 }
 

@@ -992,6 +992,43 @@ void ProcessMidnightHourBlackout()
    ResetHuntTradePlacementGateOnly();
 }
 
+//+------------------------------------------------------------------+
+//| High-impact news blackout: flatten hunt exposure once per event.   |
+//| Closing fires 1 minute BEFORE the entry-block window opens, i.e.   |
+//| (InputNewsBlackoutMinutesBefore + 1) minutes ahead of the event,   |
+//| so the close lands safely outside the prop-firm restricted zone    |
+//| (keep MinutesBefore >= the strictest firm restricted-before).      |
+//+------------------------------------------------------------------+
+#define NEWS_BLACKOUT_FLATTEN_LEAD_MINUTES 1
+void ProcessNewsBlackout()
+{
+   if(!InputEnableNewsBlackout || !InputNewsBlackoutClosePositions)
+      return;
+
+   datetime newsEvtTime = 0;
+   string   newsEvtName = "";
+   if(!IsHighImpactNewsBlackout(0, newsEvtTime, newsEvtName, NEWS_BLACKOUT_FLATTEN_LEAD_MINUTES))
+      return;
+
+   if(newsEvtTime == 0 || newsEvtTime == g_lastNewsBlackoutFlattenEventTime)
+      return;
+
+   g_lastNewsBlackoutFlattenEventTime = newsEvtTime;
+
+   CancelOurHuntPendingOrders(0);
+   const int closedCount = CloseAllOurHuntPositionsAtMarket();
+
+   LogHuntEvent("NEWS_BLACKOUT",
+                StringFormat("pre-news flatten (%d min lead) for '%s' @ %s — cancel pendings + closed=%d",
+                             InputNewsBlackoutMinutesBefore + NEWS_BLACKOUT_FLATTEN_LEAD_MINUTES,
+                             newsEvtName,
+                             TimeToString(newsEvtTime, TIME_DATE | TIME_MINUTES),
+                             closedCount));
+
+   ClearHuntTradeSessionIfNoOpenPositions();
+   ResetHuntTradePlacementGateOnly();
+}
+
 //| huntSessionId=0: all LQ2_HS pendings; else that session only (TP3 / chart-range cancel). |
 //+------------------------------------------------------------------+
 void V2InitHuntSlot(const int huntIndex)

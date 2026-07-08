@@ -1,6 +1,7 @@
 //+------------------------------------------------------------------+
 //| h4_lq_v3.mq5                                                      |
 //| H4 breach hunt + M2 Engulfing Volume Absorption entry model       |
+//| v3.131: high-impact news blackout (MT5 calendar) — block entries in +/-window; optional flatten 1 min before window opens |
 //| v3.125: M15 TP move no longer requires a prior TP hit — moves all open OV_TP legs |
 //| v3.124: M15 TP watch arms at entry — bull waits for entry up-leg or first up-leg after entry bear-leg |
 //| v3.123: fix M15 leg-close TP move — run on M15 snapshot tick; keep snapshot until modify succeeds |
@@ -120,7 +121,7 @@
 //| v3.01: exhaustion leg filter — min leg range % of M2 chart height (replaces min bar count) |
 //| v3.00: replace M2 touch/FVG with engulfing vol absorption + exhaustion gate |
 //+------------------------------------------------------------------+
-#define H4_LQ_V3_VERSION "3.130"
+#define H4_LQ_V3_VERSION "3.131"
 // Breach record array + hunt arming: uncomment next line to re-enable.
 // #define H4_LQ_VOLUME_BREACH_ENABLED
 #property copyright ""
@@ -134,6 +135,14 @@ input bool   InputFastTesterMode = false; // true: no hunt logs, no chart object
 
 input group "Midnight hour blackout"
 input bool   InputEnableMidnightHourBlackout = true; // 00:00-01:00 server time: block new entries; close open hunt positions once at 00:00
+
+input group "High-impact news blackout (MT5 calendar)"
+input bool   InputEnableNewsBlackout                = false; // MT5 economic calendar: block new entries around news (live/forward; tester needs calendar data)
+input int    InputNewsBlackoutMinutesBefore         = 10;    // minutes BEFORE an event to start the blackout window
+input int    InputNewsBlackoutMinutesAfter          = 10;    // minutes AFTER an event to end the blackout window
+input bool   InputNewsBlackoutHighImpactOnly        = true;  // true: only CALENDAR_IMPORTANCE_HIGH events; false: moderate+high
+input bool   InputNewsBlackoutSymbolCurrenciesOnly  = true;  // true: only events for symbol base/quote currency; false: any currency
+input bool   InputNewsBlackoutClosePositions        = true;  // when window opens: cancel pendings + close open hunt positions once (flatten before restricted zone)
 
 input group "Narrative timeframes"
 input ENUM_TIMEFRAMES InputM2NarrativeTimeframe  = PERIOD_M2;  // FVG, hunt, entry management (H4 via MTF SMC)
@@ -308,6 +317,7 @@ int                  g_huntM15TpEntryLegDirection     = 0;
 datetime             g_huntM15TpEntryLegStartTime     = 0;
 bool                 g_huntM15TpWatchArmed            = false;
 datetime             g_lastMidnightBlackoutCloseDay    = 0;
+datetime             g_lastNewsBlackoutFlattenEventTime = 0;
 SMCZoneRecord   g_activeZones[SMC_ZONE_LEDGER_CAPACITY];
 SMCZoneMitigationLedgerEntry g_zoneMitigationLedger[SMC_ZONE_MITIGATION_LEDGER_CAPACITY];
 SMCMtfFvgInstance g_mtfFvgInstances[SMC_MTF_FVG_INSTANCE_CAPACITY];
@@ -396,6 +406,7 @@ void OnTimer()
 void OnTick()
 {
    ProcessMidnightHourBlackout();
+   ProcessNewsBlackout();
 
    const datetime tM2 = iTime(_Symbol, InputM2NarrativeTimeframe, 0);
    const bool newM2Bar = (tM2 != g_lastM2BarOpen);
