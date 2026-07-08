@@ -1,4 +1,4 @@
-// optimize_score_adaptive.cpp v2.6
+// optimize_score_adaptive.cpp v2.7
 // Score percentile calculator for setup_zone_types.json (no P/L optimization).
 //
 // Flow: compute all results -> print to stdout -> then write CSV/xlsx.
@@ -33,8 +33,8 @@ namespace {
 
 constexpr int kWeightCount = 12;
 constexpr int kZoneSlotCount = 8;
-constexpr int kSheetPercentiles[] = {0, 10, 20, 30, 80, 90, 100};
-constexpr int kSheetPercentileCount = 7;
+constexpr int kSheetPercentiles[] = {0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100};
+constexpr int kSheetPercentileCount = 11;
 
 const int kDefaultWeights[kWeightCount] = {10, 8, 5, 2, 10, 8, 5, 2, 16, 8, 4, 2};
 

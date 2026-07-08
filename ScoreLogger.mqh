@@ -1,5 +1,6 @@
 //+------------------------------------------------------------------+
 //| ScoreLogger.mqh - setup_zone_types.json write + manual thresholds |
+//| v2.9: write mode also emits setup_zone_types.bin (weight-slot mask); read mode loads bin + computes only the 2 active percentiles |
 //| v2.8: deinit verify dump gated by InputVerifyPermutationScores (read-mode) |
 //| v2.7: log Setups/PositiveScores/TheoreticalMax + P0..P100 (matches optimize_score_adaptive.exe for verification) |
 //| v2.6: merge ScoreLogApplyThresholdPercentileValues into ScoreLogApplyThresholdPercentiles |
@@ -10,23 +11,36 @@
 //+------------------------------------------------------------------+
 
 #define SCORE_LOG_SETUP_ZONES_JSON  "setup_zone_types.json"
+#define SCORE_LOG_SETUP_ZONES_BIN   "setup_zone_types.bin"
 #define SCORE_LOG_VERIFY_SCORES_JSON "setup_zone_scores.json"
 
-double g_scoreThreshP0      = 0.0;
-double g_scoreThreshP10     = 0.0;
-double g_scoreThreshP20     = 0.0;
-double g_scoreThreshP30     = 0.0;
-double g_scoreThreshP80     = 0.0;
-double g_scoreThreshP90     = 0.0;
-double g_scoreThreshP100    = 0.0;
-bool   g_scoreThresholdsLoaded = false;
+// Binary replay file: header {magic,version,count} + packed POD records.
+// MQL5-only (the C++ verifier reads JSON); no cross-language byte layout needed.
+#define SCORE_BIN_MAGIC    0x5A4C4231  // 'ZLB1'
+#define SCORE_BIN_VERSION  1
+
+// Weight-slot mask + bias record. No strings → fast bulk FileReadArray/FileWriteArray.
+struct ScoreBinSetupRecord
+{
+   uchar zoneMask;   // bits 0..7 = weight slots (GetZoneWeightSlotIndex)
+   uchar bull;       // 0/1
+   char  biasW1;     // -1/0/1
+   char  biasD1;
+   char  biasH4;
+   char  biasM15;
+};
+
+// Read mode stores only the two percentiles the inputs actually select.
+double g_scoreActiveMinThreshold = 0.0;  // value at InputMinScorePercentile (P0/P10/P20/P30)
+double g_scoreActiveDenomScore   = 0.0;  // value at InputScoreDenominatorPercentile (P80/P90/P100)
+bool   g_scoreThresholdsLoaded   = false;
 
 //+------------------------------------------------------------------+
 void ScoreLogClearThresholdGlobals()
 {
-   g_scoreThresholdsLoaded = false;
-   g_scoreThreshP0 = g_scoreThreshP10 = g_scoreThreshP20 = g_scoreThreshP30 = 0.0;
-   g_scoreThreshP80 = g_scoreThreshP90 = g_scoreThreshP100 = 0.0;
+   g_scoreThresholdsLoaded  = false;
+   g_scoreActiveMinThreshold = 0.0;
+   g_scoreActiveDenomScore   = 0.0;
 }
 
 struct ScoreLogSetupJsonRecord
@@ -104,6 +118,67 @@ string ScoreLogBuildSetupJsonObject(const ScoreLogSetupJsonRecord &record)
 }
 
 //+------------------------------------------------------------------+
+//| Collapse zone types → weight-slot bitmask (each slot counts once). |
+//+------------------------------------------------------------------+
+uchar ScoreLogBuildZoneMaskFromTypes(const ENUM_SMC_ZONE_TYPE &zoneTypes[])
+{
+   uchar mask = 0;
+   bool used[SMC_ZONE_WEIGHT_SLOT_COUNT];
+   ArrayInitialize(used, false);
+
+   const int typeCount = ArraySize(zoneTypes);
+   for(int i = 0; i < typeCount; i++)
+   {
+      const int slot = GetZoneWeightSlotIndex(zoneTypes[i]);
+      if(slot < 0 || slot >= SMC_ZONE_WEIGHT_SLOT_COUNT || used[slot])
+         continue;
+      used[slot] = true;
+      mask |= (uchar)(1 << slot);
+   }
+   return mask;
+}
+
+//+------------------------------------------------------------------+
+//| Write setup_zone_types.bin from the accumulated write-mode buffer. |
+//+------------------------------------------------------------------+
+void ScoreLogFlushSetupBinToFile()
+{
+   if(!InputScoreLogWriteCsv)
+      return;
+
+   const int entryCount = ArraySize(g_scoreLogSetupRecords);
+   if(entryCount <= 0)
+      return;
+
+   ScoreBinSetupRecord recs[];
+   ArrayResize(recs, entryCount);
+   for(int i = 0; i < entryCount; i++)
+   {
+      recs[i].zoneMask = ScoreLogBuildZoneMaskFromTypes(g_scoreLogSetupRecords[i].zoneTypes);
+      recs[i].bull     = (uchar)(g_scoreLogSetupRecords[i].bull ? 1 : 0);
+      recs[i].biasW1   = (char)g_scoreLogSetupRecords[i].biasW1;
+      recs[i].biasD1   = (char)g_scoreLogSetupRecords[i].biasD1;
+      recs[i].biasH4   = (char)g_scoreLogSetupRecords[i].biasH4;
+      recs[i].biasM15  = (char)g_scoreLogSetupRecords[i].biasM15;
+   }
+
+   const int writeFlags = FILE_WRITE | FILE_BIN | FILE_SHARE_WRITE;
+   int fileHandle = FileOpen(SCORE_LOG_SETUP_ZONES_BIN, writeFlags);
+   if(fileHandle == INVALID_HANDLE)
+   {
+      Print("Score bin: cannot create ", SCORE_LOG_SETUP_ZONES_BIN);
+      return;
+   }
+
+   FileWriteInteger(fileHandle, SCORE_BIN_MAGIC,   INT_VALUE);
+   FileWriteInteger(fileHandle, SCORE_BIN_VERSION, INT_VALUE);
+   FileWriteInteger(fileHandle, entryCount,        INT_VALUE);
+   FileWriteArray(fileHandle, recs, 0, entryCount);
+   FileClose(fileHandle);
+   PrintFormat("Score bin: wrote %d setups to %s", entryCount, SCORE_LOG_SETUP_ZONES_BIN);
+}
+
+//+------------------------------------------------------------------+
 void ScoreLogFlushSetupJsonToFile()
 {
    if(!InputScoreLogWriteCsv)
@@ -173,7 +248,8 @@ int LogSetupZoneTypesJsonEntry(const bool isBullishTrade,
 //+------------------------------------------------------------------+
 void FlushSetupZoneTypesJsonToFile()
 {
-   ScoreLogFlushSetupJsonToFile();
+   ScoreLogFlushSetupJsonToFile();  // JSON: consumed by optimize_score_adaptive verifier
+   ScoreLogFlushSetupBinToFile();   // BIN: consumed by read-mode InitScoreThresholds
 }
 
 //+------------------------------------------------------------------+
@@ -347,21 +423,139 @@ double ScoreLogPercentileFromSorted(const double &sorted[], const double percent
 }
 
 //+------------------------------------------------------------------+
-bool ScoreLogApplyThresholdPercentiles(const double &positiveScores[])
+//| Sort positives and keep only the two percentiles the inputs use.  |
+//+------------------------------------------------------------------+
+bool ScoreLogApplyActiveThresholds(double &positiveScores[], const int positiveCount,
+                                    const int totalSetups, const uint startedMs,
+                                    const string sourceLabel)
 {
-   double sorted[];
-   ArrayResize(sorted, ArraySize(positiveScores));
-   ArrayCopy(sorted, positiveScores);
-   ArraySort(sorted);
+   if(positiveCount <= 0)
+   {
+      Print("Score thresholds [", sourceLabel, "]: no positive scores (",
+            totalSetups, " setups parsed).");
+      return false;
+   }
 
-   g_scoreThreshP0   = ScoreLogPercentileFromSorted(sorted, 0.0);
-   g_scoreThreshP10  = ScoreLogPercentileFromSorted(sorted, 10.0);
-   g_scoreThreshP20  = ScoreLogPercentileFromSorted(sorted, 20.0);
-   g_scoreThreshP30  = ScoreLogPercentileFromSorted(sorted, 30.0);
-   g_scoreThreshP80  = ScoreLogPercentileFromSorted(sorted, 80.0);
-   g_scoreThreshP90  = ScoreLogPercentileFromSorted(sorted, 90.0);
-   g_scoreThreshP100 = ScoreLogPercentileFromSorted(sorted, 100.0);
-   return (g_scoreThreshP80 > 0.0 || g_scoreThreshP100 > 0.0);
+   ArrayResize(positiveScores, positiveCount);
+   ArraySort(positiveScores);
+
+   // Enum underlying values ARE the percentiles: P0/P10/P20/P30 and P80/P90/P100.
+   const double minPct   = (double)((int)InputMinScorePercentile);
+   const double denomPct = (double)((int)InputScoreDenominatorPercentile);
+   g_scoreActiveMinThreshold = ScoreLogPercentileFromSorted(positiveScores, minPct);
+   g_scoreActiveDenomScore   = ScoreLogPercentileFromSorted(positiveScores, denomPct);
+
+   const bool ok = (g_scoreActiveDenomScore > 0.0);
+   if(ok)
+   {
+      PrintFormat("Score thresholds [%s]: Setups=%d PositiveScores=%d TheoreticalMax=%.0f (in %u ms)",
+                  sourceLabel, totalSetups, positiveCount, GetMaxPossibleScore(),
+                  (uint)(GetTickCount() - startedMs));
+      PrintFormat("Score thresholds [%s]: gate P%d=%.2f (score >) | risk denom P%d=%.2f",
+                  sourceLabel, (int)InputMinScorePercentile, g_scoreActiveMinThreshold,
+                  (int)InputScoreDenominatorPercentile, g_scoreActiveDenomScore);
+   }
+   return ok;
+}
+
+//+------------------------------------------------------------------+
+//| Read setup_zone_types.bin (header-validated) into a record array. |
+//+------------------------------------------------------------------+
+bool ScoreLogLoadSetupBin(ScoreBinSetupRecord &recs[], int &outCount)
+{
+   outCount = 0;
+
+   const int readFlags = FILE_READ | FILE_BIN | FILE_SHARE_READ;
+   int fileHandle = FileOpen(SCORE_LOG_SETUP_ZONES_BIN, readFlags);
+   if(fileHandle == INVALID_HANDLE)
+      fileHandle = FileOpen(SCORE_LOG_SETUP_ZONES_BIN, readFlags | FILE_COMMON);
+   if(fileHandle == INVALID_HANDLE)
+      return false;
+
+   const int magic = FileReadInteger(fileHandle, INT_VALUE);
+   const int ver   = FileReadInteger(fileHandle, INT_VALUE);
+   const int count = FileReadInteger(fileHandle, INT_VALUE);
+   if(magic != SCORE_BIN_MAGIC || ver != SCORE_BIN_VERSION || count <= 0)
+   {
+      FileClose(fileHandle);
+      Print("Score bin: header invalid/empty in ", SCORE_LOG_SETUP_ZONES_BIN);
+      return false;
+   }
+
+   ArrayResize(recs, count);
+   const int readCount = (int)FileReadArray(fileHandle, recs, 0, count);
+   FileClose(fileHandle);
+   if(readCount != count)
+   {
+      Print("Score bin: expected ", count, " records, read ", readCount);
+      return false;
+   }
+   outCount = count;
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Map a weight slot index → its current input weight.               |
+//+------------------------------------------------------------------+
+int ScoreLogZoneWeightBySlot(const int slot)
+{
+   switch(slot)
+   {
+      case 0: return InputWeight_WeeklyFVG;
+      case 1: return InputWeight_DailyFVG;
+      case 2: return InputWeight_H4FVG;
+      case 3: return InputWeight_M15FVG;
+      case 4: return InputWeight_W1_HighLowZones;
+      case 5: return InputWeight_D1_HighLowZones;
+      case 6: return InputWeight_H4_HighLowZones;
+      case 7: return InputWeight_M15_HighLowZones;
+   }
+   return 0;
+}
+
+//+------------------------------------------------------------------+
+//| Score a bin record with the current weight inputs (no strings).   |
+//+------------------------------------------------------------------+
+double ScoreLogScoreBinRecord(const ScoreBinSetupRecord &r)
+{
+   double score = 0.0;
+   for(int slot = 0; slot < SMC_ZONE_WEIGHT_SLOT_COUNT; slot++)
+   {
+      if((r.zoneMask & (1 << slot)) != 0)
+         score += (double)ScoreLogZoneWeightBySlot(slot);
+   }
+
+   const int tradeDir = (r.bull != 0 ? 1 : -1);
+   score += SMCAlignmentContribution((int)r.biasW1,  InputWeight_W1_BOS,  tradeDir);
+   score += SMCAlignmentContribution((int)r.biasD1,  InputWeight_D1_BOS,  tradeDir);
+   score += SMCAlignmentContribution((int)r.biasH4,  InputWeight_H4_BOS,  tradeDir);
+   score += SMCAlignmentContribution((int)r.biasM15, InputWeight_M15_BOS, tradeDir);
+   return score;
+}
+
+//+------------------------------------------------------------------+
+//| Primary read path: load bin, score every record, keep 2 pctiles. |
+//+------------------------------------------------------------------+
+bool InitScoreThresholdsFromSetupBin()
+{
+   ScoreBinSetupRecord recs[];
+   int count = 0;
+   if(!ScoreLogLoadSetupBin(recs, count))
+      return false;
+
+   const uint startedMs = GetTickCount();
+
+   double positiveScores[];
+   ArrayResize(positiveScores, count);
+   int positiveCount = 0;
+   for(int i = 0; i < count; i++)
+   {
+      const double score = ScoreLogScoreBinRecord(recs[i]);
+      if(score > 0.0)
+         positiveScores[positiveCount++] = score;
+   }
+
+   return ScoreLogApplyActiveThresholds(positiveScores, positiveCount, count, startedMs, "bin");
 }
 
 //+------------------------------------------------------------------+
@@ -411,26 +605,7 @@ bool InitScoreThresholdsFromSetupZoneJson()
    }
    FileClose(fileHandle);
 
-   if(positiveCount <= 0)
-   {
-      Print("Score thresholds: no positive replay scores in ", SCORE_LOG_SETUP_ZONES_JSON,
-            " (", totalSetups, " setups parsed).");
-      return false;
-   }
-
-   ArrayResize(positiveScores, positiveCount);
-   g_scoreThresholdsLoaded = ScoreLogApplyThresholdPercentiles(positiveScores);
-   if(g_scoreThresholdsLoaded)
-   {
-      // Same fields/format as optimize_score_adaptive.exe for direct comparison.
-      PrintFormat("Score thresholds: Setups=%d PositiveScores=%d TheoreticalMax=%.0f (in %u ms)",
-                  totalSetups, positiveCount, GetMaxPossibleScore(),
-                  (uint)(GetTickCount() - startedMs));
-      PrintFormat("Score thresholds: P0=%.2f P10=%.2f P20=%.2f P30=%.2f P80=%.2f P90=%.2f P100=%.2f",
-                  g_scoreThreshP0, g_scoreThreshP10, g_scoreThreshP20, g_scoreThreshP30,
-                  g_scoreThreshP80, g_scoreThreshP90, g_scoreThreshP100);
-   }
-   return g_scoreThresholdsLoaded;
+   return ScoreLogApplyActiveThresholds(positiveScores, positiveCount, totalSetups, startedMs, "json");
 }
 
 //+------------------------------------------------------------------+
@@ -449,10 +624,17 @@ bool InitScoreThresholds()
 
    ScoreLogClearThresholdGlobals();
 
-   // Primary (tester-safe): compute P0..P100 in-process directly from
-   // setup_zone_types.json using the current weight inputs. No external .exe
-   // (ShellExecute is unreliable inside Strategy Tester agents) and no CSV/xlsx
-   // row-matching, so every optimization pass gets its own correct percentiles.
+   // Primary (fast): load setup_zone_types.bin — weight-slot bitmask, no string
+   // parsing — score each record with the current weight inputs, keep only the
+   // two percentiles the inputs select. Best path for genetic optimization.
+   if(InitScoreThresholdsFromSetupBin())
+   {
+      g_scoreThresholdsLoaded = true;
+      ScoreLogPrintActiveThresholds();
+      return true;
+   }
+
+   // Fallback: parse setup_zone_types.json directly (e.g. bin not yet generated).
    if(InitScoreThresholdsFromSetupZoneJson())
    {
       g_scoreThresholdsLoaded = true;
@@ -460,7 +642,7 @@ bool InitScoreThresholds()
       return true;
    }
 
-   Print("Score thresholds: in-process compute from ", SCORE_LOG_SETUP_ZONES_JSON, " failed.");
+   Print("Score thresholds: bin + JSON load both failed.");
    return false;
 }
 
@@ -471,15 +653,7 @@ double GetMinScoreThreshold()
       return 0.0;
    if(!g_scoreThresholdsLoaded)
       return 0.0;
-
-   switch((int)InputMinScorePercentile)
-   {
-      case SCORE_PERCENTILE_MIN_P0:  return g_scoreThreshP0;
-      case SCORE_PERCENTILE_MIN_P10: return g_scoreThreshP10;
-      case SCORE_PERCENTILE_MIN_P20: return g_scoreThreshP20;
-      case SCORE_PERCENTILE_MIN_P30: return g_scoreThreshP30;
-   }
-   return g_scoreThreshP30;
+   return g_scoreActiveMinThreshold;
 }
 
 //+------------------------------------------------------------------+
@@ -497,12 +671,5 @@ double GetRiskNormalizationScore()
       return GetMaxPossibleScore();
    if(!g_scoreThresholdsLoaded)
       return GetMaxPossibleScore();
-
-   switch((int)InputScoreDenominatorPercentile)
-   {
-      case SCORE_PERCENTILE_DENOM_P80:  return g_scoreThreshP80;
-      case SCORE_PERCENTILE_DENOM_P90:  return g_scoreThreshP90;
-      case SCORE_PERCENTILE_DENOM_P100: return g_scoreThreshP100;
-   }
-   return g_scoreThreshP80;
+   return g_scoreActiveDenomScore;
 }

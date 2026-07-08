@@ -1,6 +1,10 @@
 //+------------------------------------------------------------------+
 //| h4_lq_v3.mq5                                                      |
 //| H4 breach hunt + M2 Engulfing Volume Absorption entry model       |
+//| v3.120: InputMinScorePercentile extended to P0..P90 (tighter entry gate for large no-SMC trade sets) |
+//| v3.119: fast tester mode skips OnDeinit chart-object cleanup (nothing was drawn) |
+//| v3.118: fast tester mode gates OnTick on new-M2-bar iTime check (skips intra-bar ticks) |
+//| v3.117: write mode emits setup_zone_types.bin; read mode loads bin (weight-slot mask) → 2 active percentiles |
 //| v3.116: InputVerifyPermutationScores gates read-mode deinit replay → setup_zone_scores.json |
 //| v3.115: OnInit computes P0..P100 in-process from setup_zone_types.json (tester-safe; no .exe spawn) |
 //| v3.113: percentile dropdowns + OnInit runs optimize_score_adaptive.exe for thresholds |
@@ -111,7 +115,7 @@
 //| v3.01: exhaustion leg filter — min leg range % of M2 chart height (replaces min bar count) |
 //| v3.00: replace M2 touch/FVG with engulfing vol absorption + exhaustion gate |
 //+------------------------------------------------------------------+
-#define H4_LQ_V3_VERSION "3.116"
+#define H4_LQ_V3_VERSION "3.120"
 // Breach record array + hunt arming: uncomment next line to re-enable.
 // #define H4_LQ_VOLUME_BREACH_ENABLED
 #property copyright ""
@@ -225,7 +229,13 @@ enum ENUM_SCORE_PERCENTILE_MIN
    SCORE_PERCENTILE_MIN_P0  = 0,   // entry gate: score > P0 of positive setup scores
    SCORE_PERCENTILE_MIN_P10 = 10,  // entry gate: score > P10 of positive setup scores
    SCORE_PERCENTILE_MIN_P20 = 20,  // entry gate: score > P20 of positive setup scores
-   SCORE_PERCENTILE_MIN_P30 = 30   // entry gate: score > P30 of positive setup scores
+   SCORE_PERCENTILE_MIN_P30 = 30,  // entry gate: score > P30 of positive setup scores
+   SCORE_PERCENTILE_MIN_P40 = 40,  // entry gate: score > P40 of positive setup scores
+   SCORE_PERCENTILE_MIN_P50 = 50,  // entry gate: score > P50 of positive setup scores
+   SCORE_PERCENTILE_MIN_P60 = 60,  // entry gate: score > P60 of positive setup scores
+   SCORE_PERCENTILE_MIN_P70 = 70,  // entry gate: score > P70 of positive setup scores
+   SCORE_PERCENTILE_MIN_P80 = 80,  // entry gate: score > P80 of positive setup scores
+   SCORE_PERCENTILE_MIN_P90 = 90   // entry gate: score > P90 of positive setup scores
 };
 
 enum ENUM_SCORE_PERCENTILE_DENOM
@@ -317,7 +327,7 @@ int OnInit()
       ScoreLogResetBuffer();
    else if(!InitScoreThresholds())
    {
-      Print("Score thresholds: init failed — trades blocked until setup_zone_types.json is available in MQL5/Files.");
+      Print("Score thresholds: init failed — trades blocked until setup_zone_types.bin (or .json) is available in MQL5/Files.");
       return INIT_FAILED;
    }
    return INIT_SUCCEEDED;
@@ -330,21 +340,25 @@ void OnDeinit(const int reason)
    else if(!InputScoreLogWriteCsv && InputVerifyPermutationScores)
       ScoreLogWriteVerifyScoresFromSetupJson();
 
-   DeleteMtfSwingLegChartObjects();
-   ObjectsDeleteAll(0, ChartObjectNamePrefixH4VolumeBreachRay, -1, -1);
-   ObjectsDeleteAll(0, PFX_M2_TREND, -1, -1);
-   ObjectsDeleteAll(0, PFX_M2_LBL, -1, -1);
-   ObjectsDeleteAll(0, PFX_M2_ANCHOR, -1, -1);
-   ObjectsDeleteAll(0, LQ_OBJ_PREFIX_FVG_RECT, -1, -1);
-   ObjectsDeleteAll(0, LQ_OBJ_PREFIX_FVG_LBL, -1, -1);
-   ObjectsDeleteAll(0, LQ_OBJ_PREFIX_SMC_ZONE_RECT, -1, -1);
-   ObjectDelete(0, LQ_OBJ_HUNT_HUD);
-   DeleteMtfDirectionHudObjects();
-   ObjectsDeleteAll(0, LQ_OBJ_IMPULSE_PREFIX, -1, -1);
-   ObjectsDeleteAll(0, LQ_OBJ_TOUCH_RECALC_PREFIX, -1, -1);
-   ObjectsDeleteAll(0, LQ_OBJ_TOUCH_POINT, -1, -1);
-   ObjectsDeleteAll(0, LQ_OBJ_TRADE_SWGRP_RECT_PREFIX, -1, -1);
-   ObjectsDeleteAll(0, LQ_OBJ_TRADE_SWGRP_LINE_PREFIX, -1, -1);
+   // Fast tester mode never draws chart objects, so there is nothing to clean up.
+   if(!InputFastTesterMode)
+   {
+      DeleteMtfSwingLegChartObjects();
+      ObjectsDeleteAll(0, ChartObjectNamePrefixH4VolumeBreachRay, -1, -1);
+      ObjectsDeleteAll(0, PFX_M2_TREND, -1, -1);
+      ObjectsDeleteAll(0, PFX_M2_LBL, -1, -1);
+      ObjectsDeleteAll(0, PFX_M2_ANCHOR, -1, -1);
+      ObjectsDeleteAll(0, LQ_OBJ_PREFIX_FVG_RECT, -1, -1);
+      ObjectsDeleteAll(0, LQ_OBJ_PREFIX_FVG_LBL, -1, -1);
+      ObjectsDeleteAll(0, LQ_OBJ_PREFIX_SMC_ZONE_RECT, -1, -1);
+      ObjectDelete(0, LQ_OBJ_HUNT_HUD);
+      DeleteMtfDirectionHudObjects();
+      ObjectsDeleteAll(0, LQ_OBJ_IMPULSE_PREFIX, -1, -1);
+      ObjectsDeleteAll(0, LQ_OBJ_TOUCH_RECALC_PREFIX, -1, -1);
+      ObjectsDeleteAll(0, LQ_OBJ_TOUCH_POINT, -1, -1);
+      ObjectsDeleteAll(0, LQ_OBJ_TRADE_SWGRP_RECT_PREFIX, -1, -1);
+      ObjectsDeleteAll(0, LQ_OBJ_TRADE_SWGRP_LINE_PREFIX, -1, -1);
+   }
 
    if(g_pendingEntryOrderExpiryTimerOn)
    {
@@ -363,6 +377,15 @@ void OnTimer()
 //+------------------------------------------------------------------+
 void OnTick()
 {
+   const datetime tM2 = iTime(_Symbol, InputM2NarrativeTimeframe, 0);
+   const bool newM2Bar = (tM2 != g_lastM2BarOpen);
+
+   // Fast tester mode: skip every intra-bar tick. The EA only acts on the M2
+   // bar close, chart/HUD work is already off, and W1/D1/H4 boundaries align to
+   // M2 (M15 boundaries resolve on the next M2 close). One iTime compare/tick.
+   if(InputFastTesterMode && !newM2Bar)
+      return;
+
    UpdateMTFSwings();
    if(H4LqChartDrawEnabled())
    {
@@ -370,8 +393,7 @@ void OnTick()
       UpdateM2LiveSwingLegVisualOnTick();
    }
 
-   const datetime tM2 = iTime(_Symbol, InputM2NarrativeTimeframe, 0);
-   if(tM2 != g_lastM2BarOpen)
+   if(newM2Bar)
    {
       g_lastM2BarOpen = tM2;
       if(InputEnableEngulfHuntAfterH4Breach)
