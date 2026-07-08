@@ -1,6 +1,6 @@
 # h4_lq_v3 — Function Tree & Vibe-Coding Guide
 
-**Version:** 3.84 (`h4_lq_v3.mq5`, ~8,480 lines)  
+**Version:** 3.130 (`h4_lq_v3.mq5`)  
 **Purpose:** MTF SMC confluence scoring + M2 swing-sweep / engulf absorption entry + swing-group take profits.
 
 **Related files (read these too):**
@@ -23,7 +23,9 @@
 
 ```
 OnTick (every tick)
-├── UpdateMTFSwings()          → W1/D1/H4/M15 bar close: swing step, zones, BOS, H4 pivots
+├── ProcessMidnightHourBlackout()  → once/day 00:00 server: cancel pendings + flatten hunt exposure
+├── UpdateMTFSwings()              → W1/D1/H4/M15 bar close: swing step, zones, BOS, H4 pivots
+├── ProcessHuntM15LegCloseTpIfReady() → M15 leg-close snapshot TP management (if enabled)
 └── optional M2 live swing visuals
 
 OnTick (new M2 bar)
@@ -84,7 +86,7 @@ OnTimer (1 sec, when limit/stop pendings armed)
 |----------|-----------|
 | `H4LqLoggingEnabled()` | `!InputFastTesterMode && InputLogHuntEvents` — gates `PrintFormat` / hunt logs. |
 | `H4LqChartDrawEnabled(flag)` | `!InputFastTesterMode && flag` — gates all `ObjectCreate` / HUD. |
-| `ScoreLogWriteModeSkipsTrading()` | `InputScoreLogWriteCsv` — **skips** sweep scan, TP calc, orders (score-only pass). |
+| `ScoreLogWriteModeSkipsTrading()` | **Current code returns `false`** (no skip). If you want write-mode to be score-only, this helper must reflect `InputScoreLogWriteCsv`. |
 | `InputFastTesterMode` | Disables logs + chart objects; **does not** disable zone engine or scoring. |
 
 | Function | Description |
@@ -100,7 +102,7 @@ OnTimer (1 sec, when limit/stop pendings armed)
 
 ```
 SMCUpdateTrackerOnBarClose(tracker, TF, lastBarOpen)
-├── ProcessMTFSwingStepAtShift(tracker.swing, TF, shift=1, H4_BOS_ANCHOR_MULTIPLIER)
+├── ProcessMTFSwingStepAtShift(tracker.swing, TF, shift=1, InputSmcSwingAnchorMultiplier)
 ├── SMCRefreshZonesForTimeframe(TF, tracker, legClosedThisBar)
 ├── SMCUpdateTrackerBosOnBar(tracker, 1)
 └── if H4: RebuildH4LiquidityPivotLevels(), LogH4TradeDirectionBiasIfChanged()
@@ -318,11 +320,14 @@ TryPlaceEngulfAbsorptionTradeSetup
 | Function | Description |
 |----------|-------------|
 | `ManageHuntOpenPositionsOnM2BarClose()` | Once per M2 bar: tiered SL + first opposite BOS mgmt. |
-| `ManageHuntTradeTieredStopLoss` | Trail/adjust SL on open hunt trades. |
+| `ManageHuntTradeTieredStopLoss` | **Enabled by `InputEnableBosMoveSl`**. TP1 hit → BE; TP1+TP2 hit → structural (M2 BOS+FVG) zone-based SL. |
+| `ManageHuntTradeM15LegCloseTp` | **Enabled by `InputEnableBosMoveTp`**. On relevant M15 same-dir leg close, move all open `OV_TP*` legs’ TP to offset from M15 leg extreme (`InputBosMoveTpM15OffsetPercentChart`). |
+| `ProcessHuntM15LegCloseTpIfReady` | Runs TP move on tick as soon as M15 leg-close snapshot is ready. |
 | `HasOurHuntTradeOpenPosition` | Magic + `LQ2_HS` comment prefix check. |
 | `HuntTradeCommentIsOvTpIndex` | Match `OV_TP1..3` in order comment. |
 | `CancelOurHuntPendingOrders` | Delete pending orders for session (or all `LQ2_HS`). |
 | `HasOurHuntPendingEntryOrders` | Detect unfilled limit/stop pendings for expiry logic. |
+| `ProcessMidnightHourBlackout` | **Enabled by `InputEnableMidnightHourBlackout`**. Once/day at 00:00 server: cancel pendings + close open hunt positions. |
 
 ---
 
@@ -389,6 +394,7 @@ OnDeinit → FlushScoreLogToFile
 | Input | Affects |
 |-------|---------|
 | `InputFastTesterMode` | All logging + chart objects |
+| `InputEnableMidnightHourBlackout` | Trade gate blocks entries 00:00–01:00 server; 00:00 flatten in `ProcessMidnightHourBlackout()` |
 | `InputEnableEngulfHuntAfterH4Breach` | Entire M2 entry + score init + HUD text |
 | `InputScoreLogWriteCsv` | Write P100 vs read P100; **skips trading** when true |
 | `InputEnableAutomatedTrading` | Order send vs `TRADE_PLAN` log only |
@@ -405,7 +411,9 @@ OnDeinit → FlushScoreLogToFile
 | `InputEngulfExhaustionMinLegRangePercentChart` | Exhaustion leg size filter |
 | `InputEngulfSlBufferPercentChart` / `InputEngulfMinSlPoints` | SL distance (via `ApplyTouchVolMinimumSlDistance`) |
 | `InputSmcZoneExpiryBars` | Zone scoring expiry (292 on zone TF) |
+| `InputSmcSwingAnchorMultiplier` | MTF SMC swing decent-movement multiplier |
 | `InputEnableH4BosTradeDirectionBias` | H4 bias trade filter |
+| `InputM2SwingAnchorMultiplier` | M2 narrative swing decent-movement multiplier |
 | `InputDraw*` / `InputShow*` | Individual chart layers |
 
 ---
