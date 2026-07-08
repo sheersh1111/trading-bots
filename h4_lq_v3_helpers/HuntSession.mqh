@@ -327,6 +327,87 @@ bool StopLossModifyAllowed(const bool isBuy, const double newStopLoss, const dou
 }
 
 //+------------------------------------------------------------------+
+bool TakeProfitModifyAllowed(const bool isBuy, const double stopLossPrice,
+                              const double newTakeProfit)
+{
+   const int    stopsLevelPoints = (int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+   const double pointSize        = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   const double minDistance      = (double)stopsLevelPoints * pointSize;
+   const double bid              = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   const double ask              = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+
+   if(isBuy)
+   {
+      if(ask <= 0.0)
+         return false;
+      if(minDistance > 0.0 && newTakeProfit <= ask + minDistance)
+         return false;
+      if(stopLossPrice > 0.0 && minDistance > 0.0 && stopLossPrice >= bid - minDistance)
+         return false;
+   }
+   else
+   {
+      if(bid <= 0.0)
+         return false;
+      if(minDistance > 0.0 && newTakeProfit >= bid - minDistance)
+         return false;
+      if(stopLossPrice > 0.0 && minDistance > 0.0 && stopLossPrice <= ask + minDistance)
+         return false;
+   }
+   return true;
+}
+
+//+------------------------------------------------------------------+
+bool HuntTradeCommentIsOvSwingTp(const string orderComment)
+{
+   if(!HuntTradeCommentIsOurs(orderComment))
+      return false;
+   for(int tpIndex = 1; tpIndex <= TradeSwingTpTargetCount(); tpIndex++)
+   {
+      if(HuntTradeCommentIsOvTpIndex(orderComment, tpIndex))
+         return true;
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+int HuntTradeCountOpenOvTpLegs(const int targetTpCount)
+{
+   bool hasTp1 = false;
+   bool hasTp2 = false;
+   bool hasTp3 = false;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      if(PositionGetSymbol(i) != _Symbol)
+         continue;
+      const ulong ticket = PositionGetTicket(i);
+      if(ticket == 0 || !PositionSelectByTicket(ticket))
+         continue;
+      if((ulong)PositionGetInteger(POSITION_MAGIC) != LQ_EXPERT_MAGIC)
+         continue;
+
+      const string comment = PositionGetString(POSITION_COMMENT);
+      if(!HuntTradeCommentIsOurs(comment))
+         continue;
+      if(HuntTradeCommentIsOvTpIndex(comment, 1))
+         hasTp1 = true;
+      if(HuntTradeCommentIsOvTpIndex(comment, 2))
+         hasTp2 = true;
+      if(targetTpCount >= 3 && HuntTradeCommentIsOvTpIndex(comment, 3))
+         hasTp3 = true;
+   }
+
+   int remaining = 0;
+   if(hasTp1)
+      remaining++;
+   if(hasTp2)
+      remaining++;
+   if(targetTpCount >= 3 && hasTp3)
+      remaining++;
+   return remaining;
+}
+
+//+------------------------------------------------------------------+
 bool HuntTradeCommentIsCloseQuarter(const string orderComment)
 {
    return (StringFind(orderComment, "_CQ_") >= 0);
@@ -343,7 +424,20 @@ bool HuntTradeCommentIsOvTpIndex(const string orderComment, const int tpIndex)
 {
    if(tpIndex < 1 || tpIndex > TradeSwingTpTargetCount())
       return false;
-   return (StringFind(orderComment, "_OV_TP" + IntegerToString(tpIndex) + "_") >= 0);
+
+   const string token = "OV_TP" + IntegerToString(tpIndex);
+   const int    pos   = StringFind(orderComment, token);
+   if(pos < 0)
+      return false;
+
+   const int after = pos + StringLen(token);
+   if(after < StringLen(orderComment))
+   {
+      const ushort nextChar = StringGetCharacter(orderComment, after);
+      if(nextChar >= '0' && nextChar <= '9')
+         return false;
+   }
+   return true;
 }
 
 //+------------------------------------------------------------------+
@@ -354,6 +448,74 @@ void ClearHuntTradeSessionIfNoOpenPositions()
    g_huntTradeSessionCommentPrefix = "";
    g_huntFirstOppBosMgmtDone       = false;
    g_lastHuntPosMgmtM2BarTime      = 0;
+   g_m15ClosedLegForTpMgmt.ready   = false;
+   g_lastM15TpMgmtAppliedLegEndTime = 0;
+   g_huntM15TpEntryLegDirection     = 0;
+   g_huntM15TpEntryLegStartTime     = 0;
+   g_huntM15TpWatchArmed            = false;
+}
+
+//+------------------------------------------------------------------+
+//| Arm M15 TP watch at trade entry.                                  |
+//| Bull: entry on M15 up leg → move TP when that leg closes;         |
+//|       entry on M15 down leg → wait for flip to up, then that close.|
+//| Bear: symmetric (down leg / wait for down after up entry).        |
+//+------------------------------------------------------------------+
+void ArmHuntM15TpWatchAtTradeEntry(const bool isBuy)
+{
+   if(!InputEnableBosMoveTp || !InputEnableMtfSmcEngine)
+   {
+      g_huntM15TpWatchArmed = false;
+      return;
+   }
+
+   g_huntM15TpEntryLegDirection = g_mtfSwingM15.swing.currentSwingLeg.swingDirection;
+   g_huntM15TpEntryLegStartTime = g_mtfSwingM15.swing.currentSwingLeg.legStartTime;
+   g_huntM15TpWatchArmed        = true;
+   g_lastM15TpMgmtAppliedLegEndTime = 0;
+   g_m15ClosedLegForTpMgmt.ready    = false;
+
+   if(H4LqLoggingEnabled())
+   {
+      LogHuntEvent("TRADE_TP_M15_ARM",
+                   StringFormat("%s entryM15Dir=%d entryLegStart=%s",
+                                isBuy ? "bull" : "bear",
+                                g_huntM15TpEntryLegDirection,
+                                TimeToString(g_huntM15TpEntryLegStartTime,
+                                             TIME_DATE | TIME_MINUTES)));
+   }
+}
+
+//+------------------------------------------------------------------+
+bool IsRelevantM15LegCloseForHuntTp(const bool isBuy)
+{
+   if(!g_huntM15TpWatchArmed)
+      return false;
+
+   const int closedDir = g_m15ClosedLegForTpMgmt.direction;
+   const int targetDir = isBuy ? 1 : -1;
+   if(closedDir != targetDir)
+      return false;
+
+   const int      entryDir    = g_huntM15TpEntryLegDirection;
+   const datetime closedStart = g_m15ClosedLegForTpMgmt.legStartTime;
+   if(closedStart == 0)
+      return false;
+
+   if(isBuy)
+   {
+      if(entryDir == 1)
+         return (closedStart == g_huntM15TpEntryLegStartTime);
+      if(entryDir == -1)
+         return (closedStart > g_huntM15TpEntryLegStartTime);
+      return true;
+   }
+
+   if(entryDir == -1)
+      return (closedStart == g_huntM15TpEntryLegStartTime);
+   if(entryDir == 1)
+      return (closedStart > g_huntM15TpEntryLegStartTime);
+   return true;
 }
 
 //+------------------------------------------------------------------+
@@ -532,7 +694,8 @@ bool TryGetLatestQualifiedSlExtreme(const bool isBuy, double &outGroupExtreme)
 //+------------------------------------------------------------------+
 void ManageHuntTradeTieredStopLoss(const bool isBuy)
 {
-   if(!InputEnableBosMoveSlAndTp) return;
+   if(!InputEnableBosMoveSl)
+      return;
 
    bool hasTp1 = false, hasTp2 = false, hasTp3 = false;
    double entryPrice = 0.0;
@@ -626,6 +789,131 @@ void ManageHuntTradeTieredStopLoss(const bool isBuy)
 }
 
 //+------------------------------------------------------------------+
+//| M15 leg close: move remaining swing-TP legs to offset from extreme. |
+//+------------------------------------------------------------------+
+void ManageHuntTradeM15LegCloseTp(const bool isBuy)
+{
+   if(!InputEnableBosMoveTp || !InputEnableMtfSmcEngine)
+      return;
+   if(!g_m15ClosedLegForTpMgmt.ready)
+      return;
+   if(g_m15ClosedLegForTpMgmt.legEndTime == 0)
+      return;
+   if(g_m15ClosedLegForTpMgmt.legEndTime == g_lastM15TpMgmtAppliedLegEndTime)
+   {
+      g_m15ClosedLegForTpMgmt.ready = false;
+      return;
+   }
+
+   // Bull: target M15 up-leg close (entry-aware). Bear: target M15 down-leg close.
+   if(!IsRelevantM15LegCloseForHuntTp(isBuy))
+      return;
+
+   const int remainingTp = HuntTradeCountOpenOvTpLegs(TradeSwingTpTargetCount());
+   if(remainingTp <= 0)
+      return;
+
+   const double chartHeight = ReferenceChartHeightForTimeframeBarCount(PERIOD_M15,
+                                                                       InputChartRangeBarCount);
+   if(chartHeight <= 0.0 || InputBosMoveTpM15OffsetPercentChart <= 0.0)
+      return;
+
+   const double offset = chartHeight * (InputBosMoveTpM15OffsetPercentChart / 100.0);
+   double newTakeProfit = 0.0;
+   if(isBuy)
+      newTakeProfit = NormalizeDouble(g_m15ClosedLegForTpMgmt.legHigh - offset, _Digits);
+   else
+      newTakeProfit = NormalizeDouble(g_m15ClosedLegForTpMgmt.legLow + offset, _Digits);
+   if(newTakeProfit <= 0.0)
+      return;
+
+   g_trade.SetExpertMagicNumber(LQ_EXPERT_MAGIC);
+   ApplyTradeFillingModeFromSymbol();
+
+   int modifiedCount = 0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      if(PositionGetSymbol(i) != _Symbol)
+         continue;
+      const ulong ticket = PositionGetTicket(i);
+      if(ticket == 0 || !PositionSelectByTicket(ticket))
+         continue;
+      if((ulong)PositionGetInteger(POSITION_MAGIC) != LQ_EXPERT_MAGIC)
+         continue;
+
+      const string comment = PositionGetString(POSITION_COMMENT);
+      if(!HuntTradeCommentIsOurs(comment) || !HuntTradeCommentIsOvSwingTp(comment))
+         continue;
+
+      const bool posIsBuy = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY);
+      if(posIsBuy != isBuy)
+         continue;
+
+      const double currentSl = PositionGetDouble(POSITION_SL);
+      const double currentTp = PositionGetDouble(POSITION_TP);
+
+      if(!TakeProfitModifyAllowed(posIsBuy, currentSl, newTakeProfit))
+         continue;
+
+      if(g_trade.PositionModify(ticket, currentSl, newTakeProfit))
+         modifiedCount++;
+   }
+
+   if(modifiedCount > 0)
+   {
+      g_lastM15TpMgmtAppliedLegEndTime = g_m15ClosedLegForTpMgmt.legEndTime;
+      g_m15ClosedLegForTpMgmt.ready    = false;
+      g_huntM15TpWatchArmed            = false;
+      LogHuntEvent("TRADE_TP_M15",
+                     StringFormat("%s leg close → TP=%.5f (%d legs, offset %.1f%% M15 chart, entryM15Dir=%d)",
+                                  isBuy ? "M15 up" : "M15 down",
+                                  newTakeProfit, modifiedCount,
+                                  InputBosMoveTpM15OffsetPercentChart,
+                                  g_huntM15TpEntryLegDirection));
+   }
+}
+
+//+------------------------------------------------------------------+
+bool TryResolveHuntTradeSide(bool &outIsBuy)
+{
+   outIsBuy = g_huntTradeIsBuy;
+   for(int positionIndex = PositionsTotal() - 1; positionIndex >= 0; positionIndex--)
+   {
+      if(PositionGetSymbol(positionIndex) != _Symbol)
+         continue;
+      const ulong ticket = PositionGetTicket(positionIndex);
+      if(ticket == 0 || !PositionSelectByTicket(ticket))
+         continue;
+      if((ulong)PositionGetInteger(POSITION_MAGIC) != LQ_EXPERT_MAGIC)
+         continue;
+      if(!HuntTradeCommentIsOurs(PositionGetString(POSITION_COMMENT)))
+         continue;
+      outIsBuy = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY);
+      return true;
+   }
+   return g_huntTradeOrdersActive;
+}
+
+//+------------------------------------------------------------------+
+//| Run M15 leg-close TP move as soon as the snapshot is ready (not only on M2 close). |
+//+------------------------------------------------------------------+
+void ProcessHuntM15LegCloseTpIfReady()
+{
+   if(!InputEnableBosMoveTp || !InputEnableMtfSmcEngine)
+      return;
+   if(!g_m15ClosedLegForTpMgmt.ready)
+      return;
+   if(!HasOurHuntTradeOpenPosition())
+      return;
+
+   bool isBuy = g_huntTradeIsBuy;
+   if(!TryResolveHuntTradeSide(isBuy))
+      return;
+
+   ManageHuntTradeM15LegCloseTp(isBuy);
+}
+
+//+------------------------------------------------------------------+
 void ManageHuntOpenPositionsOnM2BarClose()
 {
    if(!HasOurHuntTradeOpenPosition())
@@ -641,25 +929,67 @@ void ManageHuntOpenPositionsOnM2BarClose()
       return;
    g_lastHuntPosMgmtM2BarTime = closedM2BarTime;
 
-   bool isBuy         = g_huntTradeIsBuy;
-   bool haveTradeSide = false;
-   for(int positionIndex = PositionsTotal() - 1; positionIndex >= 0; positionIndex--)
-   {
-      if(PositionGetSymbol(positionIndex) != _Symbol)
-         continue;
-      const ulong ticket = PositionGetTicket(positionIndex);
-      if(ticket == 0 || !PositionSelectByTicket(ticket))
-         continue;
-      if(!HuntTradeCommentIsOurs(PositionGetString(POSITION_COMMENT)))
-         continue;
-      isBuy         = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY);
-      haveTradeSide = true;
-      break;
-   }
-   if(!haveTradeSide && !g_huntTradeOrdersActive)
+   bool isBuy = g_huntTradeIsBuy;
+   if(!TryResolveHuntTradeSide(isBuy))
       return;
 
    ManageHuntTradeTieredStopLoss(isBuy);
+   ManageHuntTradeM15LegCloseTp(isBuy);
+}
+
+//+------------------------------------------------------------------+
+int CloseAllOurHuntPositionsAtMarket()
+{
+   g_trade.SetExpertMagicNumber(LQ_EXPERT_MAGIC);
+   ApplyTradeFillingModeFromSymbol();
+
+   int closedCount = 0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      if(PositionGetSymbol(i) != _Symbol)
+         continue;
+      const ulong ticket = PositionGetTicket(i);
+      if(ticket == 0 || !PositionSelectByTicket(ticket))
+         continue;
+      if((ulong)PositionGetInteger(POSITION_MAGIC) != LQ_EXPERT_MAGIC)
+         continue;
+      if(!HuntTradeCommentIsOurs(PositionGetString(POSITION_COMMENT)))
+         continue;
+      if(g_trade.PositionClose(ticket))
+         closedCount++;
+   }
+   return closedCount;
+}
+
+//+------------------------------------------------------------------+
+//| Once per calendar day at 00:00 server: flatten hunt exposure.       |
+//+------------------------------------------------------------------+
+void ProcessMidnightHourBlackout()
+{
+   if(!InputEnableMidnightHourBlackout)
+      return;
+
+   const datetime now = TimeCurrent();
+   if(!IsMidnightBlackoutHour(now))
+      return;
+
+   const datetime dayKey = MidnightBlackoutDayKey(now);
+   if(dayKey == 0 || dayKey == g_lastMidnightBlackoutCloseDay)
+      return;
+
+   g_lastMidnightBlackoutCloseDay = dayKey;
+
+   CancelOurHuntPendingOrders(0);
+   const int closedCount = CloseAllOurHuntPositionsAtMarket();
+
+   if(closedCount > 0)
+   {
+      LogHuntEvent("MIDNIGHT_BLACKOUT",
+                   StringFormat("00:00 server flatten closed=%d", closedCount));
+   }
+
+   ClearHuntTradeSessionIfNoOpenPositions();
+   ResetHuntTradePlacementGateOnly();
 }
 
 //| huntSessionId=0: all LQ2_HS pendings; else that session only (TP3 / chart-range cancel). |

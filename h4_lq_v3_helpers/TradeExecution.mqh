@@ -361,6 +361,7 @@ void RegisterHuntTradeAfterSuccessfulPlace(const bool isBuy, const double entryP
    g_huntPreEntryCancelTpLevel       = preEntryCancelTpLevel;
    g_huntTradeSessionCommentPrefix   = V2HuntTradeCommentPrefix(huntSessionId);
    g_huntFirstOppBosMgmtDone         = false;
+   ArmHuntM15TpWatchAtTradeEntry(isBuy);
 }
 
 //+------------------------------------------------------------------+
@@ -740,6 +741,11 @@ bool IsFvgAutomatedTradingAllowed(string &outBlockReason)
    if(tradeMode == SYMBOL_TRADE_MODE_DISABLED)
    {
       outBlockReason = "symbol trading disabled";
+      return false;
+   }
+   if(IsMidnightBlackoutHour())
+   {
+      outBlockReason = "midnight hour blackout (00:00-01:00 server)";
       return false;
    }
    return true;

@@ -274,6 +274,24 @@ void SMCUpdateTrackerOnBarClose(MTFSwingTracker &tracker, const ENUM_TIMEFRAMES 
    SMCRefreshZonesForTimeframe(timeframe, tracker, legClosedThisBar);
    SMCUpdateTrackerBosOnBar(tracker, 1);
 
+   if(timeframe == PERIOD_M15 && legClosedThisBar)
+   {
+      const int histCount = tracker.swing.swingHistoryCount;
+      if(histCount > 0)
+      {
+         const Swing closedLeg = tracker.swing.swingHistory[histCount - 1];
+         if(closedLeg.swingDirection != 0 && closedLeg.legEndTime != 0)
+         {
+            g_m15ClosedLegForTpMgmt.ready       = true;
+            g_m15ClosedLegForTpMgmt.direction   = closedLeg.swingDirection;
+            g_m15ClosedLegForTpMgmt.legHigh     = closedLeg.legHighPrice;
+            g_m15ClosedLegForTpMgmt.legLow      = closedLeg.legLowPrice;
+            g_m15ClosedLegForTpMgmt.legStartTime = closedLeg.legStartTime;
+            g_m15ClosedLegForTpMgmt.legEndTime  = closedLeg.legEndTime;
+         }
+      }
+   }
+
    if(timeframe == PERIOD_H4)
    {
       RebuildH4LiquidityPivotLevels();

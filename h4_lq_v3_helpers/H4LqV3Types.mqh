@@ -154,6 +154,17 @@ struct V2HuntSession
 #define H4_LIQUIDITY_PIVOT_CAPACITY 600
 #define H4_REPLAY_LEG_CAPACITY      512
 
+// M15 leg-close event captured for open-trade TP management (see ManageHuntTradeM15LegCloseTp).
+struct M15ClosedLegSnapshot
+{
+   bool     ready;
+   int      direction;   // closed leg: 1 = up, -1 = down
+   double   legHigh;
+   double   legLow;
+   datetime legStartTime;
+   datetime legEndTime;
+};
+
 struct H4LiquidityPivot
 {
    double   levelPrice;

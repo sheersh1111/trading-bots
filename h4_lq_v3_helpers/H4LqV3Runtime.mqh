@@ -24,6 +24,28 @@ bool ScoreLogWriteModeSkipsTrading()
 }
 
 //+------------------------------------------------------------------+
+//| 00:00-01:00 server time (12am-1am).                              |
+//+------------------------------------------------------------------+
+bool IsMidnightBlackoutHour(const datetime when = 0)
+{
+   if(!InputEnableMidnightHourBlackout)
+      return false;
+
+   const datetime t = (when == 0 ? TimeCurrent() : when);
+   MqlDateTime dt;
+   TimeToStruct(t, dt);
+   return (dt.hour >= 0 && dt.hour < 1);
+}
+
+//+------------------------------------------------------------------+
+datetime MidnightBlackoutDayKey(const datetime when)
+{
+   MqlDateTime dt;
+   TimeToStruct(when, dt);
+   return StringToTime(StringFormat("%04d.%02d.%02d", dt.year, dt.mon, dt.day));
+}
+
+//+------------------------------------------------------------------+
 int TradeSwingTpTargetCount()
 {
    return (InputTradeSwingTpCount == TRADE_SWING_TP_TWO) ? 2 : 3;

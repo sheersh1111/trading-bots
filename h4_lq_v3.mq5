@@ -1,6 +1,11 @@
 //+------------------------------------------------------------------+
 //| h4_lq_v3.mq5                                                      |
 //| H4 breach hunt + M2 Engulfing Volume Absorption entry model       |
+//| v3.125: M15 TP move no longer requires a prior TP hit — moves all open OV_TP legs |
+//| v3.124: M15 TP watch arms at entry — bull waits for entry up-leg or first up-leg after entry bear-leg |
+//| v3.123: fix M15 leg-close TP move — run on M15 snapshot tick; keep snapshot until modify succeeds |
+//| v3.122: midnight hour blackout (00:00-01:00 server) — block entries; close open hunt positions at 00:00 |
+//| v3.121: split BOS SL/TP inputs; M15 leg-close TP move (3% below/above closed leg extreme) |
 //| v3.120: InputMinScorePercentile extended to P0..P90 (tighter entry gate for large no-SMC trade sets) |
 //| v3.119: fast tester mode skips OnDeinit chart-object cleanup (nothing was drawn) |
 //| v3.118: fast tester mode gates OnTick on new-M2-bar iTime check (skips intra-bar ticks) |
@@ -115,7 +120,7 @@
 //| v3.01: exhaustion leg filter — min leg range % of M2 chart height (replaces min bar count) |
 //| v3.00: replace M2 touch/FVG with engulfing vol absorption + exhaustion gate |
 //+------------------------------------------------------------------+
-#define H4_LQ_V3_VERSION "3.120"
+#define H4_LQ_V3_VERSION "3.125"
 // Breach record array + hunt arming: uncomment next line to re-enable.
 // #define H4_LQ_VOLUME_BREACH_ENABLED
 #property copyright ""
@@ -126,6 +131,9 @@
 
 input group "Tester performance"
 input bool   InputFastTesterMode = false; // true: no hunt logs, no chart objects/HUDs (faster backtest)
+
+input group "Midnight hour blackout"
+input bool   InputEnableMidnightHourBlackout = true; // 00:00-01:00 server time: block new entries; close open hunt positions once at 00:00
 
 input group "Narrative timeframes"
 input ENUM_TIMEFRAMES InputM2NarrativeTimeframe  = PERIOD_M2;  // FVG, hunt, entry management (H4 via MTF SMC)
@@ -263,7 +271,9 @@ input int    InputWeight_M15_BOS               = 2;
 #define InputTouchVolMinSlPoints             InputEngulfMinSlPoints
 
 input group "BOS SL/TP management"
-input bool   InputEnableBosMoveSlAndTp = false; // disable trailing/moving SL & TP on BOS for now
+input bool   InputEnableBosMoveSl                  = false; // tiered SL: TP1 hit→BE, TP1+TP2 hit→structural (M2 BOS+FVG)
+input bool   InputEnableBosMoveTp                  = false; // M15 leg close: move remaining swing-TP legs to offset from leg extreme
+input double InputBosMoveTpM15OffsetPercentChart   = 3.0;  // bull: TP = M15 up-leg high − N% M15 chart height; bear: low + N%
 
 CTrade         g_trade;
 
@@ -290,6 +300,12 @@ datetime        g_lastMtfBarOpenW1  = 0;
 datetime        g_lastMtfBarOpenD1  = 0;
 datetime        g_lastMtfBarOpenH4  = 0;
 datetime        g_lastMtfBarOpenM15 = 0;
+M15ClosedLegSnapshot g_m15ClosedLegForTpMgmt;
+datetime             g_lastM15TpMgmtAppliedLegEndTime = 0;
+int                  g_huntM15TpEntryLegDirection     = 0;
+datetime             g_huntM15TpEntryLegStartTime     = 0;
+bool                 g_huntM15TpWatchArmed            = false;
+datetime             g_lastMidnightBlackoutCloseDay    = 0;
 SMCZoneRecord   g_activeZones[SMC_ZONE_LEDGER_CAPACITY];
 SMCZoneMitigationLedgerEntry g_zoneMitigationLedger[SMC_ZONE_MITIGATION_LEDGER_CAPACITY];
 SMCMtfFvgInstance g_mtfFvgInstances[SMC_MTF_FVG_INSTANCE_CAPACITY];
@@ -377,6 +393,8 @@ void OnTimer()
 //+------------------------------------------------------------------+
 void OnTick()
 {
+   ProcessMidnightHourBlackout();
+
    const datetime tM2 = iTime(_Symbol, InputM2NarrativeTimeframe, 0);
    const bool newM2Bar = (tM2 != g_lastM2BarOpen);
 
@@ -387,6 +405,7 @@ void OnTick()
       return;
 
    UpdateMTFSwings();
+   ProcessHuntM15LegCloseTpIfReady();
    if(H4LqChartDrawEnabled())
    {
       UpdateM2SwingAnchorVisualRealtime(g_m2Swing);
